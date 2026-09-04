@@ -1,0 +1,23 @@
+# PlatformIO
+.pio/
+
+# VS Code local workspace
+.vscode/
+
+# macOS
+.DS_Store
+
+# Device / local secrets
+include/secrets.h
+.env
+.env.*
+!.env.example
+
+# Python local runtime/cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log

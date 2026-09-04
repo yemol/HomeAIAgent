@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "provider": "manual",
+  "items": [
+    {
+      "id": "game_demo",
+      "category": "游戏",
+      "headline": "这里填写希望显示在 Glass2 上的游戏资讯标题",
+      "summary": "说“这个讲讲”时，OpenClaw 会收到这里的摘要。",
+      "source": "来源名称"
+    },
+    {
+      "id": "finance_demo",
+      "category": "金融",
+      "headline": "这里填写金融资讯标题",
+      "summary": "这里填写可供语音展开说明的背景。",
+      "source": "来源名称"
+    }
+  ]
+}

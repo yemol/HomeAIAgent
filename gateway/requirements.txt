@@ -1,0 +1,4 @@
+websockets>=15,<17
+httpx>=0.28,<1
+python-dotenv>=1.0,<2
+Pillow>=10.0
