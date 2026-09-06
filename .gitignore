@@ -1,23 +1,62 @@
-# PlatformIO
-.pio/
+# ==============================
+# macOS
+# ==============================
+.DS_Store
+.AppleDouble
+.LSOverride
 
+# ==============================
 # VS Code local workspace
+# ==============================
 .vscode/
 
-# macOS
-.DS_Store
+# ==============================
+# PlatformIO
+# ==============================
+.pio/
+.pio-local/
 
-# Device / local secrets
-include/secrets.h
+# ==============================
+# ESP-SR local cache
+# ==============================
+.srmodels_cache/
+
+# ==============================
+# Python cache / virtual env
+# ==============================
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# ==============================
+# Local secrets
+# ==============================
 .env
 .env.*
 !.env.example
 
-# Python local runtime/cache
-.venv/
-venv/
-__pycache__/
-*.py[cod]
+gateway/.env
+include/secrets.h
 
-# Logs
-*.log
+# ==============================
+# Gateway runtime artifacts
+# ==============================
+gateway/latest_input.wav
+gateway/latest_tts.wav
+gateway/latest_transcript.txt
+gateway/latest_answer.txt
+gateway/*.pid
+gateway/*.log
+
+# ==============================
+# Generic build / cache
+# ==============================
+build/
+dist/
+.cache/
+*.tmp
+*.bak
+*.swp

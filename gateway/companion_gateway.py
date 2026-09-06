@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HomeAIAgent P0-A4.2 gateway: 3-line Glass2 + night screen protection.
+"""HomeAIAgent local Gateway for voice, OpenClaw, Info feed and display policy.
 
 Default speech path:
   Doubao Streaming ASR 2.0 -> remote OpenClaw -> Doubao TTS 2.0.
@@ -27,16 +27,19 @@ import io
 import json
 import math
 import os
+import shutil
 import array
 import struct
+import sys
 import time
 import traceback
 import uuid
 import wave
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
@@ -116,25 +119,42 @@ INFO_HEADLINE_MAX_CHARS = 36
 INFO_SUMMARY_MAX_CHARS = 160
 INFO_MAX_AGE_HOURS = int(os.getenv("HOMEAI_INFO_MAX_AGE_HOURS", "96"))
 
-# A4.1.2 fixed wall-clock schedule.
-# Fetch at 00:00, 01:00, then pause 02:00-08:59, resume at 09:00,
-# and continue hourly through 23:00.
+# Fixed wall-clock schedule.
+# Token-saving plan: refresh every two hours at
+# 09,11,13,15,17,19,21,23,01, then pause until 09:00.
 INFO_SCHEDULE_TIMEZONE = os.getenv("HOMEAI_INFO_TIMEZONE", "Asia/Taipei").strip()
-INFO_ALLOWED_HOURS = frozenset([0, 1, *range(9, 24)])
+INFO_ALLOWED_HOURS = frozenset([1, 9, 11, 13, 15, 17, 19, 21, 23])
 
-# A4.2 screen protection. The Gateway is the wall-clock authority so the
+# Each category is an independent machine-data request. Retry only on failure;
+# valid empty feeds (0 items) are accepted and are not retried.
+INFO_CATEGORY_ORDER = ("game", "finance")
+INFO_CATEGORY_RETRY_DELAYS_SEC = (0, 5, 15)
+
+# Screen protection. The Gateway is the wall-clock authority so the
 # StickS3 does not need NTP/Internet time of its own.
 DISPLAY_SLEEP_HOUR = 1
 DISPLAY_SLEEP_MINUTE = 5
 DISPLAY_WAKE_HOUR = 9
 DISPLAY_WAKE_MINUTE = 0
 
+# Display command handshake.
+# "sent" is not considered success. The device must report status=applied
+# and an actual sleeping state matching the requested policy.
+DISPLAY_ACK_TIMEOUT_SEC = 5.0
+DISPLAY_APPLY_TIMEOUT_SEC = 180.0
+DISPLAY_COMMAND_MAX_ATTEMPTS = 3
+DISPLAY_STATUS_RECHECK_SEC = 300
+
 INFO_FRAME_WIDTH = 128
 INFO_FRAME_HEIGHT = 64
 
 INFO_SKILL_CACHE_FILE = HOMEAI_DATA_DIR / "info_skill_feed_cache.json"
+INFO_SKILL_BAD_RESPONSE_DIR = HOMEAI_DATA_DIR / "info_skill_bad_responses"
+INFO_SKILL_STARTUP_SNAPSHOT_DIR = HOMEAI_DATA_DIR / "info_skill_startup_snapshots"
+INFO_SKILL_STARTUP_SNAPSHOT_KEEP = max(1, int(os.getenv("HOMEAI_INFO_STARTUP_SNAPSHOT_KEEP", "20")))
+INFO_SKILL_DELIVERY_TOOL = "homeai_info_deliver"
 
-# A4.1.3 bottom status: current 24K spot-equivalent gold value in CNY/gram.
+# Bottom status: current 24K spot-equivalent gold value in CNY/gram.
 # This is intentionally independent from the hourly news Skill schedule.
 GOLD_QUOTE_URL = os.getenv(
     "HOMEAI_GOLD_QUOTE_URL",
@@ -164,6 +184,22 @@ ACTIVE_SESSIONS: list["ClientSession"] = []
 FEED_ITEMS: list[FeedItem] = []
 FEED_ITEM_HISTORY: dict[str, FeedItem] = {}
 FEED_REVISION = "boot"
+
+# Keep independent last-good state for game and finance so one broken
+# category never freezes the other category.
+FEED_CATEGORY_ITEMS: dict[str, list[FeedItem]] = {
+    "game": [],
+    "finance": [],
+}
+FEED_CATEGORY_UPDATED_AT: dict[str, str] = {
+    "game": "",
+    "finance": "",
+}
+
+# Refresh diagnostics. Active during each real Info refresh:
+# Gateway startup freshness barrier, never during normal wall-clock polling.
+ACTIVE_INFO_STARTUP_SNAPSHOT_DIR: Path | None = None
+LAST_INFO_REFRESH_DIAGNOSTIC: dict[str, Any] = {}
 
 
 HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
@@ -259,7 +295,22 @@ OPENCLAW_BASE_URL = os.getenv("OPENCLAW_BASE_URL", "http://127.0.0.1:18790").rst
 OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "")
 OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
-OPENCLAW_INFO_USER = os.getenv("OPENCLAW_INFO_USER", "home-ai-agent:info-feed")
+
+# Info Skill session lifecycle. Each background request gets one exact,
+# unique OpenClaw session key so it never shares history with another refresh.
+# Cleanup is performed through the OpenClaw Gateway WebSocket RPC itself, not
+# SSH or a host-local CLI. This keeps HomeAIAgent independent from whichever
+# machine currently hosts OpenClaw.
+OPENCLAW_INFO_AGENT_ID = os.getenv("OPENCLAW_INFO_AGENT_ID", "main").strip() or "main"
+OPENCLAW_INFO_SESSION_CLEANUP = (
+    os.getenv("OPENCLAW_INFO_SESSION_CLEANUP", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+OPENCLAW_INFO_CLEANUP_TIMEOUT_SEC = max(5.0, float(
+    os.getenv("OPENCLAW_INFO_CLEANUP_TIMEOUT_SEC", "20")
+))
+OPENCLAW_GATEWAY_WS_URL = os.getenv("OPENCLAW_GATEWAY_WS_URL", "").strip()
+OPENCLAW_GATEWAY_PROTOCOL = int(os.getenv("OPENCLAW_GATEWAY_PROTOCOL", "4"))
 
 MIC_RATE = 16000
 MIC_CHANNELS = 1
@@ -312,6 +363,7 @@ def _cache_payload(items: list[FeedItem], revision: str) -> dict[str, Any]:
         "protocol_version": INFO_SKILL_PROTOCOL,
         "saved_at": int(time.time()),
         "revision": revision,
+        "category_updated_at": dict(FEED_CATEGORY_UPDATED_AT),
         "items": [
             {
                 "item_id": item.item_id,
@@ -403,6 +455,21 @@ def load_info_skill_cache() -> bool:
 
     FEED_ITEMS = loaded
     FEED_REVISION = str(body.get("revision") or _stable_feed_revision(loaded))
+
+    FEED_CATEGORY_ITEMS["game"] = [
+        item for item in FEED_ITEMS if item.category == "游戏"
+    ][:INFO_GAME_LIMIT]
+    FEED_CATEGORY_ITEMS["finance"] = [
+        item for item in FEED_ITEMS if item.category == "金融"
+    ][:INFO_FINANCE_LIMIT]
+
+    cached_times = body.get("category_updated_at")
+    if isinstance(cached_times, dict):
+        for category in INFO_CATEGORY_ORDER:
+            FEED_CATEGORY_UPDATED_AT[category] = str(
+                cached_times.get(category) or ""
+            )[:64]
+
     for item in FEED_ITEMS:
         FEED_ITEM_HISTORY[item.item_id] = item
 
@@ -443,69 +510,719 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("OpenClaw response is not a JSON object")
 
 
-async def _openclaw_background_text(
-    prompt: str,
-    *,
-    user: str = OPENCLAW_INFO_USER,
-    timeout: float = 120,
-) -> str:
-    headers = {"Content-Type": "application/json"}
-    if OPENCLAW_TOKEN:
-        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
-
-    payload = {
-        "model": OPENCLAW_MODEL,
-        "user": user,
-        "stream": False,
-        "messages": [{"role": "user", "content": prompt}],
+def _info_delivery_tool_spec() -> dict[str, Any]:
+    # Use the OpenAI-compatible client function-call channel as a
+    # structured return envelope. The internal HomeAI Info Skill still owns
+    # acquisition; this tool only transports its result back to the Mini.
+    return {
+        "type": "function",
+        "function": {
+            "name": INFO_SKILL_DELIVERY_TOOL,
+            "description": (
+                "After calling the internal homeai_info.get_feed Skill, "
+                "return that Skill result exactly as this function's arguments. "
+                "Do not summarize, rewrite, or invent fields."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "protocol_version": {"type": "string"},
+                    "protocol": {"type": "string"},
+                    "operation": {"type": "string"},
+                    "request_id": {"type": "string"},
+                    "category": {"type": "string"},
+                    "status": {"type": "string"},
+                    "next_refresh_after_sec": {"type": "integer"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "item_id": {"type": "string"},
+                                "category": {"type": "string"},
+                                "headline": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "source_name": {"type": "string"},
+                                "source": {"type": "string"},
+                                "source_url": {"type": "string"},
+                                "priority": {"type": "integer"},
+                                "published_at": {"type": "string"},
+                                "content_hash": {"type": "string"},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "warnings": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "error": {"type": "object"},
+                },
+                "additionalProperties": True,
+            },
+        },
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await _post_with_retry(
-            client,
-            f"{OPENCLAW_BASE_URL}/v1/chat/completions",
-            headers=headers,
-            json=payload,
+
+def _startup_snapshot_path(name: str) -> Path | None:
+    root = ACTIVE_INFO_STARTUP_SNAPSHOT_DIR
+    if root is None:
+        return None
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name)
+    return root / safe
+
+
+def _write_startup_snapshot_text(name: str, text: str) -> Path | None:
+    path = _startup_snapshot_path(name)
+    if path is None:
+        return None
+    try:
+        path.write_text(text, encoding="utf-8")
+        return path
+    except Exception as exc:
+        print(
+            f"[INFO-SNAPSHOT-WARN] failed to save {name}: "
+            f"{type(exc).__name__}: {exc}"
         )
-        body = response.json()
+        return None
 
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"OpenClaw returned no choices: {body}")
 
-    content = choices[0].get("message", {}).get("content", "")
+def _write_startup_snapshot_json(name: str, value: Any) -> Path | None:
+    try:
+        text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    except Exception as exc:
+        print(
+            f"[INFO-SNAPSHOT-WARN] failed to serialize {name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+    return _write_startup_snapshot_text(name, text)
+
+
+def _prune_startup_info_snapshots() -> None:
+    try:
+        INFO_SKILL_STARTUP_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        dirs = sorted(
+            [p for p in INFO_SKILL_STARTUP_SNAPSHOT_DIR.iterdir() if p.is_dir()],
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        for old in dirs[INFO_SKILL_STARTUP_SNAPSHOT_KEEP:]:
+            shutil.rmtree(old, ignore_errors=True)
+    except Exception as exc:
+        print(
+            f"[INFO-SNAPSHOT-WARN] retention cleanup failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def _begin_startup_info_snapshot(
+    started_at: datetime,
+    *,
+    trigger: str = "startup",
+    slot_label: str = "",
+) -> Path | None:
+    # Backward-compatible path/function name; records
+    # every real Info refresh (startup + fixed 2h scheduled slots).
+    global ACTIVE_INFO_STARTUP_SNAPSHOT_DIR
+    try:
+        INFO_SKILL_STARTUP_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = started_at.strftime("%Y%m%d-%H%M%S-%f")
+        safe_trigger = "".join(
+            ch if ch.isalnum() or ch in "._-" else "_"
+            for ch in str(trigger or "refresh")
+        )
+        if safe_trigger != "startup":
+            stamp = f"{stamp}_{safe_trigger}"
+        root = INFO_SKILL_STARTUP_SNAPSHOT_DIR / stamp
+        root.mkdir(parents=True, exist_ok=False)
+        ACTIVE_INFO_STARTUP_SNAPSHOT_DIR = root
+        _write_startup_snapshot_json(
+            "manifest.json",
+            {
+                "kind": "gateway-info-refresh",
+                "trigger": trigger,
+                "slot": slot_label or None,
+                "started_at": started_at.isoformat(),
+                "protocol": INFO_SKILL_PROTOCOL,
+                "status": "running",
+            },
+        )
+        _prune_startup_info_snapshots()
+        print(
+            f"[INFO-SNAPSHOT] capture={root} "
+            f"trigger={trigger} slot={slot_label or '-'}"
+        )
+        return root
+    except Exception as exc:
+        ACTIVE_INFO_STARTUP_SNAPSHOT_DIR = None
+        print(
+            f"[INFO-SNAPSHOT-WARN] capture unavailable trigger={trigger}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return None
+
+
+def _finish_startup_info_snapshot(
+    *,
+    started_at: datetime,
+    status: str,
+    error: str = "",
+    trigger: str = "startup",
+    slot_label: str = "",
+) -> None:
+    global ACTIVE_INFO_STARTUP_SNAPSHOT_DIR
+    root = ACTIVE_INFO_STARTUP_SNAPSHOT_DIR
+    if root is None:
+        return
+    try:
+        merged = [asdict(item) for item in FEED_ITEMS]
+        _write_startup_snapshot_json("final_feed_20.json", merged)
+        _write_startup_snapshot_json(
+            "manifest.json",
+            {
+                "kind": "gateway-info-refresh",
+                "trigger": trigger,
+                "slot": slot_label or None,
+                "started_at": started_at.isoformat(),
+                "completed_at": datetime.now(_info_schedule_tz()).isoformat(),
+                "protocol": INFO_SKILL_PROTOCOL,
+                "status": status,
+                "error": error or None,
+                "revision": FEED_REVISION,
+                "count": len(FEED_ITEMS),
+                "category_counts": {
+                    c: len(FEED_CATEGORY_ITEMS.get(c, []))
+                    for c in INFO_CATEGORY_ORDER
+                },
+                "category_updated_at": dict(FEED_CATEGORY_UPDATED_AT),
+                "refresh": dict(LAST_INFO_REFRESH_DIAGNOSTIC),
+            },
+        )
+        print(
+            f"[INFO-SNAPSHOT] capture complete={root} "
+            f"trigger={trigger} slot={slot_label or '-'} "
+            f"status={status} revision={FEED_REVISION}"
+        )
+    finally:
+        ACTIVE_INFO_STARTUP_SNAPSHOT_DIR = None
+
+
+def _save_bad_info_response(
+    *,
+    category: str,
+    stage: str,
+    raw: str,
+    exc: Exception,
+) -> Path | None:
+    try:
+        INFO_SKILL_BAD_RESPONSE_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_info_schedule_tz()).strftime("%Y%m%d-%H%M%S-%f")
+        path = INFO_SKILL_BAD_RESPONSE_DIR / (
+            f"{stamp}_{category}_{stage}.txt"
+        )
+        payload = (
+            f"category={category}\n"
+            f"stage={stage}\n"
+            f"error={type(exc).__name__}: {exc}\n"
+            "--- raw response ---\n"
+            f"{raw}\n"
+        )
+        path.write_text(payload, encoding="utf-8")
+        return path
+    except Exception as save_exc:
+        print(
+            f"[INFO-SKILL-JSON-WARN] failed to save bad response: "
+            f"{type(save_exc).__name__}: {save_exc}"
+        )
+        return None
+
+
+def _log_json_decode_context(
+    *,
+    category: str,
+    stage: str,
+    raw: str,
+    exc: json.JSONDecodeError,
+) -> None:
+    start = max(0, exc.pos - 120)
+    end = min(len(raw), exc.pos + 120)
+    near = raw[start:end]
+    print(
+        f"[INFO-SKILL-JSON] category={category} stage={stage} "
+        f"pos={exc.pos} line={exc.lineno} col={exc.colno} "
+        f"near={near!r}"
+    )
+    saved = _save_bad_info_response(
+        category=category,
+        stage=stage,
+        raw=raw,
+        exc=exc,
+    )
+    if saved is not None:
+        print(f"[INFO-SKILL-JSON] raw saved={saved}")
+
+
+def _message_content_text(message: dict[str, Any]) -> str:
+    content = message.get("content", "")
     if isinstance(content, list):
         content = "".join(
             str(part.get("text", ""))
             for part in content
             if isinstance(part, dict)
         )
+    return str(content or "").strip()
 
-    text = str(content).strip()
+
+def _new_info_session_key(category: str) -> str:
+    safe_category = "".join(
+        ch if ch.isalnum() or ch in "_-" else "-"
+        for ch in str(category or "info").strip().lower()
+    ).strip("-") or "info"
+    # Keep a narrow, unmistakable namespace so cleanup can reject anything else.
+    return (
+        f"agent:{OPENCLAW_INFO_AGENT_ID}:"
+        f"homeai-info-{safe_category}-{uuid.uuid4().hex}"
+    )
+
+
+def _is_safe_info_session_key(session_key: str) -> bool:
+    prefix = f"agent:{OPENCLAW_INFO_AGENT_ID}:homeai-info-"
+    return bool(
+        session_key.startswith(prefix)
+        and len(session_key) > len(prefix) + 32
+        and "home-ai-agent:main" not in session_key
+        and session_key != f"agent:{OPENCLAW_INFO_AGENT_ID}:main"
+    )
+
+
+def _openclaw_gateway_ws_url() -> str:
+    if OPENCLAW_GATEWAY_WS_URL:
+        return OPENCLAW_GATEWAY_WS_URL
+    parsed = urlsplit(OPENCLAW_BASE_URL)
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        raise RuntimeError(f"invalid OPENCLAW_BASE_URL for Gateway RPC: {OPENCLAW_BASE_URL!r}")
+    scheme = "wss" if parsed.scheme in {"https", "wss"} else "ws"
+    return urlunsplit((scheme, parsed.netloc, "/", "", ""))
+
+
+async def _gateway_rpc_recv_response(
+    ws: Any,
+    request_id: str,
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        frame = json.loads(raw)
+        if not isinstance(frame, dict):
+            continue
+        if frame.get("type") == "res" and str(frame.get("id", "")) == request_id:
+            return frame
+
+
+async def _openclaw_gateway_rpc(
+    method: str,
+    params: dict[str, Any],
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    ws_url = _openclaw_gateway_ws_url()
+    async with websockets.connect(
+        ws_url,
+        open_timeout=min(timeout, 8.0),
+        close_timeout=3,
+        max_size=1024 * 1024,
+    ) as ws:
+        # Current OpenClaw Gateway sends a connect.challenge before the client
+        # may authenticate. Ignore unrelated early events but require a valid
+        # challenge before sending connect.
+        challenge_deadline = asyncio.get_running_loop().time() + min(timeout, 8.0)
+        challenge: dict[str, Any] | None = None
+        while challenge is None:
+            remaining = challenge_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError("OpenClaw Gateway connect.challenge timeout")
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            frame = json.loads(raw)
+            if (
+                isinstance(frame, dict)
+                and frame.get("type") == "event"
+                and frame.get("event") == "connect.challenge"
+                and isinstance(frame.get("payload"), dict)
+            ):
+                challenge = frame["payload"]
+
+        nonce = str(challenge.get("nonce", "") or "")
+        ts = challenge.get("ts")
+        if not nonce or not isinstance(ts, int) or ts < 0:
+            raise RuntimeError("invalid OpenClaw Gateway connect.challenge")
+
+        connect_id = uuid.uuid4().hex
+        connect_params: dict[str, Any] = {
+            "minProtocol": OPENCLAW_GATEWAY_PROTOCOL,
+            "maxProtocol": OPENCLAW_GATEWAY_PROTOCOL,
+            "client": {
+                "id": "gateway-client",
+                "displayName": "HomeAIAgent Info Cleanup",
+                "version": "A4.4.18-RC1R13",
+                "platform": sys.platform,
+                "mode": "backend",
+            },
+            "role": "operator",
+            "scopes": ["operator.admin"],
+            "caps": [],
+            "commands": [],
+            "permissions": {},
+        }
+        if OPENCLAW_TOKEN:
+            connect_params["auth"] = {"token": OPENCLAW_TOKEN}
+
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": connect_id,
+            "method": "connect",
+            "params": connect_params,
+        }, ensure_ascii=False))
+        connect_res = await _gateway_rpc_recv_response(
+            ws, connect_id, timeout=min(timeout, 8.0)
+        )
+        if not bool(connect_res.get("ok")):
+            raise RuntimeError(
+                f"OpenClaw Gateway connect failed: {connect_res.get('error')!r}"
+            )
+
+        request_id = uuid.uuid4().hex
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }, ensure_ascii=False))
+        response = await _gateway_rpc_recv_response(
+            ws, request_id, timeout=timeout
+        )
+        if not bool(response.get("ok")):
+            raise RuntimeError(
+                f"OpenClaw Gateway RPC {method} failed: {response.get('error')!r}"
+            )
+        payload = response.get("payload")
+        return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+async def _cleanup_openclaw_info_session(
+    session_key: str,
+    *,
+    category: str,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    attempt_tag = f"attempt{int(attempt or 0):02d}"
+    result: dict[str, Any] = {
+        "session_key": session_key,
+        "enabled": OPENCLAW_INFO_SESSION_CLEANUP,
+        "method": "openclaw_gateway_rpc_sessions_delete",
+        "gateway_ws": _openclaw_gateway_ws_url(),
+        "status": "skipped",
+    }
+
+    if not OPENCLAW_INFO_SESSION_CLEANUP:
+        print(
+            f"[INFO-CLEANUP] category={category} attempt={int(attempt or 0)} "
+            f"session={session_key} status=disabled"
+        )
+        _write_startup_snapshot_json(
+            f"{category}_{attempt_tag}_session_cleanup.json", result
+        )
+        return result
+
+    if not _is_safe_info_session_key(session_key):
+        result.update({"status": "refused", "error": "unsafe_session_key"})
+        print(f"[INFO-CLEANUP-WARN] refused unsafe session key={session_key!r}")
+        _write_startup_snapshot_json(
+            f"{category}_{attempt_tag}_session_cleanup.json", result
+        )
+        return result
+
+    try:
+        payload = await _openclaw_gateway_rpc(
+            "sessions.delete",
+            {"key": session_key, "deleteTranscript": True},
+            timeout=OPENCLAW_INFO_CLEANUP_TIMEOUT_SEC,
+        )
+        result.update({"status": "deleted", "rpc_payload": payload})
+        print(
+            f"[INFO-CLEANUP] category={category} attempt={int(attempt or 0)} "
+            f"session={session_key} status=deleted transport=gateway-rpc"
+        )
+    except asyncio.TimeoutError:
+        result.update({"status": "failed", "error": "cleanup_timeout"})
+        print(
+            f"[INFO-CLEANUP-WARN] category={category} "
+            f"attempt={int(attempt or 0)} session={session_key} "
+            "transport=gateway-rpc timeout"
+        )
+    except Exception as exc:
+        result.update({
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        print(
+            f"[INFO-CLEANUP-WARN] category={category} "
+            f"attempt={int(attempt or 0)} session={session_key} "
+            f"transport=gateway-rpc error={type(exc).__name__}: {exc}"
+        )
+
+    _write_startup_snapshot_json(
+        f"{category}_{attempt_tag}_session_cleanup.json", result
+    )
+    return result
+
+
+async def _openclaw_background_json(
+    prompt: str,
+    *,
+    category: str,
+    attempt: int | None = None,
+    timeout: float = 120,
+) -> dict[str, Any]:
+    session_key = _new_info_session_key(category)
+    headers = {
+        "Content-Type": "application/json",
+        "x-openclaw-session-key": session_key,
+    }
+    if OPENCLAW_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+
+    # Keep the body free of `user`. The explicit per-request session key exists
+    # only so HomeAIAgent can delete that exact transient session afterwards.
+    payload = {
+        "model": OPENCLAW_MODEL,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt}],
+        "tools": [_info_delivery_tool_spec()],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": INFO_SKILL_DELIVERY_TOOL},
+        },
+    }
+
+    attempt_tag = f"attempt{int(attempt or 0):02d}"
+    _write_startup_snapshot_json(
+        f"{category}_{attempt_tag}_openclaw_request.json",
+        payload,
+    )
+    _write_startup_snapshot_json(
+        f"{category}_{attempt_tag}_openclaw_session.json",
+        {
+            "session_key": session_key,
+            "user_omitted": True,
+            "cleanup_enabled": OPENCLAW_INFO_SESSION_CLEANUP,
+        },
+    )
+    print(
+        f"[INFO-SKILL] category={category} attempt={int(attempt or 0)} "
+        f"openclaw_session=ephemeral key={session_key} user=omitted"
+    )
+
+    body: dict[str, Any]
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                # Category-level retry already exists. Keep exactly one HTTP
+                # request per transient session key so a transport retry cannot
+                # accidentally reuse a partially-running session.
+                response = await _post_with_retry(
+                    client,
+                    f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                    attempts=1,
+                    headers=headers,
+                    json=payload,
+                )
+            except httpx.HTTPStatusError as exc:
+                response = exc.response
+                if response is not None:
+                    _write_startup_snapshot_json(
+                        f"{category}_{attempt_tag}_openclaw_http_meta.json",
+                        {
+                            "status_code": response.status_code,
+                            "url": str(response.request.url),
+                            "headers": dict(response.headers),
+                            "session_key": session_key,
+                        },
+                    )
+                    _write_startup_snapshot_text(
+                        f"{category}_{attempt_tag}_openclaw_http.txt",
+                        response.text,
+                    )
+                raise
+            _write_startup_snapshot_json(
+                f"{category}_{attempt_tag}_openclaw_http_meta.json",
+                {
+                    "status_code": response.status_code,
+                    "url": str(response.request.url),
+                    "headers": dict(response.headers),
+                    "session_key": session_key,
+                },
+            )
+            _write_startup_snapshot_text(
+                f"{category}_{attempt_tag}_openclaw_http.txt",
+                response.text,
+            )
+            body = response.json()
+    finally:
+        await _cleanup_openclaw_info_session(
+            session_key, category=category, attempt=attempt
+        )
+
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenClaw returned no choices: {body}")
+
+    choice = choices[0]
+    message = choice.get("message") or {}
+    finish_reason = str(choice.get("finish_reason") or "")
+    tool_calls = message.get("tool_calls") or []
+
+    for tool_call in tool_calls:
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function") or {}
+        if str(function.get("name") or "") != INFO_SKILL_DELIVERY_TOOL:
+            continue
+
+        arguments = function.get("arguments", "")
+        attempt_tag = f"attempt{int(attempt or 0):02d}"
+        if isinstance(arguments, dict):
+            _write_startup_snapshot_json(
+                f"{category}_{attempt_tag}_tool_arguments.json",
+                arguments,
+            )
+            result = arguments
+        else:
+            raw_args = str(arguments or "")
+            _write_startup_snapshot_text(
+                f"{category}_{attempt_tag}_tool_arguments.txt",
+                raw_args,
+            )
+            try:
+                result = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                _log_json_decode_context(
+                    category=category,
+                    stage="tool-arguments",
+                    raw=raw_args,
+                    exc=exc,
+                )
+                raise
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                "OpenClaw structured Info delivery arguments are not an object"
+            )
+
+        print(
+            f"[INFO-SKILL] structured transport=tool_call "
+            f"category={category} finish={finish_reason or 'tool_calls'}"
+        )
+        return result
+
+    # Compatibility fallback for an older/incompatible OpenClaw endpoint.
+    # Keep strict validation and record any malformed free-text payload so the
+    # failure can be diagnosed precisely instead of silently repaired.
+    text = _message_content_text(message)
+    attempt_tag = f"attempt{int(attempt or 0):02d}"
+    if text:
+        _write_startup_snapshot_text(
+            f"{category}_{attempt_tag}_message_content.txt",
+            text,
+        )
     if not text:
-        raise RuntimeError("OpenClaw returned empty content")
-    return text
+        raise RuntimeError(
+            "OpenClaw returned neither homeai_info_deliver tool call nor content "
+            f"(finish_reason={finish_reason!r})"
+        )
+
+    print(
+        f"[INFO-SKILL-WARN] structured delivery missing; "
+        f"falling back to text JSON category={category} "
+        f"finish={finish_reason or 'unknown'}"
+    )
+    try:
+        return _extract_json_object(text)
+    except json.JSONDecodeError as exc:
+        _log_json_decode_context(
+            category=category,
+            stage="text-fallback",
+            raw=text,
+            exc=exc,
+        )
+        raise
 
 
-def _build_get_feed_request() -> dict[str, Any]:
-    return {
+def _category_limit(category: str) -> int:
+    if category == "game":
+        return INFO_GAME_LIMIT
+    if category == "finance":
+        return INFO_FINANCE_LIMIT
+    return INFO_MAX_ITEMS
+
+
+def _build_get_feed_request(
+    category: str = "all",
+    *,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    category = str(category or "all").strip().lower()
+    if category not in {"game", "finance", "all"}:
+        raise ValueError(f"invalid info category={category!r}")
+
+    if max_items is None:
+        max_items = _category_limit(category)
+    max_items = max(0, min(INFO_MAX_ITEMS, int(max_items)))
+
+    request: dict[str, Any] = {
         "protocol_version": INFO_SKILL_PROTOCOL,
         "operation": "get_feed",
-        "request_id": f"homeai-feed-{uuid.uuid4()}",
+        "request_id": f"homeai-feed-{category}-{uuid.uuid4()}",
         "locale": "zh-CN",
-        "timezone": "Asia/Taipei",
-        "max_items": INFO_MAX_ITEMS,
-        "category_limits": {
-            "game": INFO_GAME_LIMIT,
-            "finance": INFO_FINANCE_LIMIT,
-        },
-        "categories": ["game", "finance"],
+        "timezone": INFO_SCHEDULE_TIMEZONE,
+        "category": category,
+        "max_items": max_items,
         "max_age_hours": INFO_MAX_AGE_HOURS,
     }
 
+    # Keep the legacy fields for backward compatibility. A new Skill should
+    # honor `category`; an older Skill may still inspect these fields.
+    if category == "all":
+        request["category_limits"] = {
+            "game": INFO_GAME_LIMIT,
+            "finance": INFO_FINANCE_LIMIT,
+        }
+        request["categories"] = ["game", "finance"]
+    else:
+        request["category_limits"] = {category: max_items}
+        request["categories"] = [category]
 
-async def call_homeai_info_get_feed() -> dict[str, Any]:
-    request = _build_get_feed_request()
+    return request
+
+
+async def call_homeai_info_get_feed(
+    category: str = "all",
+    *,
+    max_items: int | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    request = _build_get_feed_request(category, max_items=max_items)
+    attempt_tag = f"attempt{int(attempt or 0):02d}"
+    _write_startup_snapshot_json(
+        f"{category}_{attempt_tag}_request.json",
+        request,
+    )
 
     prompt = f"""你现在执行 HomeAIAgent 的后台资讯任务，不是普通聊天。
 
@@ -519,27 +1236,59 @@ payload={json.dumps(request, ensure_ascii=False)}
 1. 上面的 HOMEAI_INFO_CALL 是 HomeAIAgent 的固定后台触发标记。
 2. 必须实际调用已经安装的 HomeAI Info Skill：homeai_info.get_feed。
 3. payload 必须原样作为接口输入，不要自行改写字段含义。
-4. 不要自己编造、补充或替代 Skill 的资讯。
-5. 最终回复只允许是 Skill 返回的 JSON。
-6. 不要 Markdown，不要代码围栏，不要解释，不要自然语言前后缀。
+4. 如果 category=game，只返回 game；如果 category=finance，只返回 finance。
+5. 不要自己编造、补充或替代 Skill 的资讯。
+6. 调用 Skill 后，不要把结果重写成普通 assistant 文本。
+7. 必须调用客户端函数 homeai_info_deliver，并把 Skill 返回对象原样作为函数参数。
+8. 不要总结、改写、补充或省略字段；不要输出 Markdown 或自然语言前后缀。
 """
 
-    text = await _openclaw_background_text(prompt)
-    body = _extract_json_object(text)
+    body = await _openclaw_background_json(
+        prompt,
+        category=category,
+        attempt=attempt,
+    )
+    _write_startup_snapshot_json(
+        f"{category}_{attempt_tag}_parsed_body.json",
+        body,
+    )
 
-    if body.get("protocol_version") != INFO_SKILL_PROTOCOL:
+    # New Skill examples may use "protocol"; old 1.1 payload uses
+    # "protocol_version". Accept both without weakening the version gate.
+    protocol = body.get("protocol_version") or body.get("protocol")
+    if protocol != INFO_SKILL_PROTOCOL:
         raise RuntimeError(
             "HomeAI Info protocol mismatch: "
-            f"{body.get('protocol_version')!r}"
+            f"{protocol!r}"
         )
-    if body.get("operation") != "get_feed":
+
+    operation = body.get("operation")
+    if operation not in {None, "", "get_feed"}:
         raise RuntimeError(
-            f"HomeAI Info operation mismatch: {body.get('operation')!r}"
+            f"HomeAI Info operation mismatch: {operation!r}"
         )
+
+    requested_category = str(category or "all").strip().lower()
+    returned_category = str(body.get("category") or "").strip().lower()
+    if (
+        requested_category in {"game", "finance"}
+        and returned_category
+        and returned_category != requested_category
+    ):
+        raise RuntimeError(
+            "HomeAI Info category mismatch: "
+            f"requested={requested_category!r} returned={returned_category!r}"
+        )
+
     return body
 
 
-def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
+def normalize_skill_feed(
+    body: dict[str, Any],
+    *,
+    expected_category: str | None = None,
+    allow_empty: bool = False,
+) -> list[FeedItem]:
     status = str(body.get("status") or "").strip().lower()
     if status not in {"ok", "partial"}:
         err = body.get("error") or {}
@@ -553,6 +1302,14 @@ def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
     if not isinstance(rows, list):
         raise RuntimeError("HomeAI Info items is not a list")
 
+    expected = (
+        str(expected_category or "").strip().lower()
+        if expected_category
+        else None
+    )
+    if expected not in {None, "game", "finance"}:
+        raise ValueError(f"invalid expected category={expected!r}")
+
     result: list[FeedItem] = []
     seen_ids: set[str] = set()
     counts = {"game": 0, "finance": 0}
@@ -564,12 +1321,21 @@ def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
         raw_category = str(raw.get("category") or "").strip().lower()
         if raw_category not in counts:
             continue
-        if counts[raw_category] >= (
-            INFO_GAME_LIMIT if raw_category == "game" else INFO_FINANCE_LIMIT
-        ):
+        if expected is not None and raw_category != expected:
+            # Backward-compatible guard: if an old Skill ignores the new
+            # category parameter and returns a mixed feed, retain only the
+            # requested category instead of failing the whole refresh.
             continue
 
-        item_id = str(raw.get("id") or "").strip()
+        limit = (
+            INFO_GAME_LIMIT
+            if raw_category == "game"
+            else INFO_FINANCE_LIMIT
+        )
+        if counts[raw_category] >= limit:
+            continue
+
+        item_id = str(raw.get("id") or raw.get("item_id") or "").strip()
         headline = str(raw.get("headline") or "").strip()
         summary = str(raw.get("summary") or "").strip()
         if not item_id or not headline or item_id in seen_ids:
@@ -601,7 +1367,11 @@ def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
             category=_display_category(raw_category),
             headline=headline,
             summary=summary,
-            source=str(raw.get("source_name") or "")[:200],
+            source=str(
+                raw.get("source_name")
+                or raw.get("source")
+                or ""
+            )[:200],
             source_url=str(raw.get("source_url") or "")[:600],
             priority=priority,
             published_at=str(raw.get("published_at") or "")[:64],
@@ -612,10 +1382,12 @@ def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
         seen_ids.add(item_id)
         counts[raw_category] += 1
 
-        if len(result) >= INFO_MAX_ITEMS:
+        if expected is not None and len(result) >= _category_limit(expected):
+            break
+        if expected is None and len(result) >= INFO_MAX_ITEMS:
             break
 
-    if not result:
+    if not result and not allow_empty:
         raise RuntimeError("HomeAI Info returned no usable items")
 
     print(
@@ -632,54 +1404,188 @@ def normalize_skill_feed(body: dict[str, Any]) -> list[FeedItem]:
     return result
 
 
-async def refresh_info_from_skill(*, force: bool = False) -> bool:
-    global FEED_ITEMS, FEED_REVISION
+def _merge_category_feeds() -> list[FeedItem]:
+    # Preserve each Skill's internal ranking but keep the visible feed balanced
+    # by interleaving game and finance.
+    game = FEED_CATEGORY_ITEMS["game"][:INFO_GAME_LIMIT]
+    finance = FEED_CATEGORY_ITEMS["finance"][:INFO_FINANCE_LIMIT]
 
-    body = await call_homeai_info_get_feed()
+    merged: list[FeedItem] = []
+    for index in range(max(len(game), len(finance))):
+        if index < len(game):
+            merged.append(game[index])
+        if index < len(finance):
+            merged.append(finance[index])
+    return merged[:INFO_MAX_ITEMS]
 
-    # A4.1.2 uses a fixed HomeAIAgent wall-clock schedule.
-    # Keep the Skill field for protocol compatibility, but do not let it
-    # override the user's 00/01/09..23 hourly schedule.
-    suggested = body.get("next_refresh_after_sec")
-    if suggested is not None:
-        print(
-            f"[INFO-SKILL] skill suggested next={suggested}s; "
-            "ignored by fixed hourly schedule"
-        )
 
-    new_items = normalize_skill_feed(body)
-    new_revision = _stable_feed_revision(new_items)
-
-    if not force and new_revision == FEED_REVISION:
-        print(
-            f"[INFO-SKILL] unchanged revision={new_revision}"
-        )
-        return False
-
-    FEED_ITEMS = new_items
-    FEED_REVISION = new_revision
-
+def _remember_feed_history() -> None:
     for item in FEED_ITEMS:
         FEED_ITEM_HISTORY[item.item_id] = item
 
-    # Keep enough history so an in-flight PTT turn can still resolve an item
-    # even if a feed refresh just replaced the visible list.
-    if len(FEED_ITEM_HISTORY) > 160:
+    # Keep recent IDs available for get_item / "这个讲讲" even after several
+    # two-hour feed rotations.
+    if len(FEED_ITEM_HISTORY) > 240:
         keep_ids = {item.item_id for item in FEED_ITEMS}
         old_keys = list(FEED_ITEM_HISTORY.keys())
         for key in old_keys:
-            if len(FEED_ITEM_HISTORY) <= 100:
+            if len(FEED_ITEM_HISTORY) <= 160:
                 break
             if key not in keep_ids:
                 FEED_ITEM_HISTORY.pop(key, None)
 
+
+async def _fetch_info_category_with_retries(
+    category: str,
+    *,
+    slot_label: str,
+) -> tuple[bool, list[FeedItem], str | None]:
+    attempts = len(INFO_CATEGORY_RETRY_DELAYS_SEC)
+    last_error: Exception | None = None
+
+    for index, delay_sec in enumerate(INFO_CATEGORY_RETRY_DELAYS_SEC, 1):
+        if delay_sec:
+            print(
+                f"[INFO-SKILL] slot={slot_label} category={category} "
+                f"retry_wait={delay_sec}s"
+            )
+            await asyncio.sleep(delay_sec)
+
+        print(
+            f"[INFO-SKILL] slot={slot_label} category={category} "
+            f"attempt={index}/{attempts}"
+        )
+
+        try:
+            body = await call_homeai_info_get_feed(
+                category,
+                max_items=_category_limit(category),
+                attempt=index,
+            )
+
+            suggested = body.get("next_refresh_after_sec")
+            if suggested is not None:
+                print(
+                    f"[INFO-SKILL] category={category} "
+                    f"skill suggested next={suggested}s; "
+                    "ignored by fixed 2h wall-clock schedule"
+                )
+
+            items = normalize_skill_feed(
+                body,
+                expected_category=category,
+                allow_empty=True,
+            )
+            _write_startup_snapshot_json(
+                f"{category}_attempt{index:02d}_normalized_items.json",
+                [asdict(item) for item in items],
+            )
+            print(
+                f"[INFO-SKILL] category={category} SUCCESS "
+                f"count={len(items)} attempt={index}/{attempts}"
+            )
+            return True, items, None
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            _write_startup_snapshot_text(
+                f"{category}_attempt{index:02d}_error.txt",
+                f"{type(exc).__name__}: {exc}\n",
+            )
+            print(
+                f"[INFO-SKILL-WARN] category={category} "
+                f"attempt={index}/{attempts} failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    error_text = (
+        f"{type(last_error).__name__}: {last_error}"
+        if last_error is not None
+        else "unknown error"
+    )
+    print(
+        f"[INFO-SKILL-ERROR] category={category} FAILED "
+        f"after={attempts} attempts; keeping category last-good: "
+        f"{error_text}"
+    )
+    return False, FEED_CATEGORY_ITEMS[category], error_text
+
+
+async def refresh_info_from_skill(
+    *,
+    force: bool = False,
+    slot_label: str | None = None,
+) -> bool:
+    global FEED_ITEMS, FEED_REVISION, LAST_INFO_REFRESH_DIAGNOSTIC
+
+    if slot_label is None:
+        slot_label = datetime.now(_info_schedule_tz()).strftime("%Y-%m-%dT%H:%M")
+
+    success: dict[str, bool] = {}
+    errors: dict[str, str | None] = {}
+
+    for category in INFO_CATEGORY_ORDER:
+        ok, items, error_text = await _fetch_info_category_with_retries(
+            category,
+            slot_label=slot_label,
+        )
+        success[category] = ok
+        errors[category] = error_text
+        if ok:
+            FEED_CATEGORY_ITEMS[category] = items
+            FEED_CATEGORY_UPDATED_AT[category] = datetime.now(
+                _info_schedule_tz()
+            ).isoformat()
+
+    succeeded = [c for c in INFO_CATEGORY_ORDER if success.get(c)]
+    failed = [c for c in INFO_CATEGORY_ORDER if not success.get(c)]
+
+    LAST_INFO_REFRESH_DIAGNOSTIC = {
+        "slot": slot_label,
+        "success": dict(success),
+        "errors": dict(errors),
+        "succeeded": list(succeeded),
+        "failed": list(failed),
+    }
+
+    if not succeeded:
+        print(
+            f"[INFO-SKILL] scheduled refresh FAILED slot={slot_label} "
+            "game=last-good finance=last-good"
+        )
+        return False
+
+    new_items = _merge_category_feeds()
+    new_revision = _stable_feed_revision(new_items) if new_items else "empty"
+
+    changed = force or new_revision != FEED_REVISION
+    FEED_ITEMS = new_items
+    FEED_REVISION = new_revision
+
+    _remember_feed_history()
     save_info_skill_cache()
 
-    print(
-        f"[INFO-SKILL] refreshed count={len(FEED_ITEMS)} "
-        f"revision={FEED_REVISION}"
-    )
-    return True
+    if failed:
+        print(
+            f"[INFO-SKILL] scheduled refresh PARTIAL slot={slot_label} "
+            f"success={','.join(succeeded)} "
+            f"last_good={','.join(failed)} "
+            f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
+        )
+    else:
+        print(
+            f"[INFO-SKILL] scheduled refresh SUCCESS slot={slot_label} "
+            f"game={len(FEED_CATEGORY_ITEMS['game'])} "
+            f"finance={len(FEED_CATEGORY_ITEMS['finance'])} "
+            f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
+        )
+
+    if not changed:
+        print(f"[INFO-SKILL] unchanged revision={FEED_REVISION}")
+
+    return changed
 
 
 def _feed_item_by_id(item_id: str) -> FeedItem | None:
@@ -822,7 +1728,7 @@ async def refresh_gold_quote(*, force_sync: bool = False) -> bool:
 
 async def gold_quote_loop() -> None:
     # Fetch once immediately, then keep the status current independently of
-    # the hourly news schedule (including the 01:00-09:00 news quiet window).
+    # the 2-hour news schedule (including the 01:00-09:00 news quiet window).
     while True:
         try:
             await refresh_gold_quote()
@@ -860,8 +1766,8 @@ def next_info_poll_at(now: datetime | None = None) -> datetime:
 
     candidate = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
-    # Allowed exact hours: 00, 01, 09..23.
-    # Therefore after 01:00 the next slot is 09:00.
+    # Exact two-hour slots: 09,11,13,15,17,19,21,23,01.
+    # After 01:00 the next slot is 09:00. There is no 00:00 refresh.
     while candidate.hour not in INFO_ALLOWED_HOURS:
         candidate += timedelta(hours=1)
 
@@ -925,30 +1831,237 @@ def next_display_transition_at(now: datetime | None = None) -> datetime:
     return sleep_today + timedelta(days=1)
 
 
-async def send_display_policy(session: "ClientSession") -> None:
-    sleeping = display_sleep_window_active()
-    await send_json(
-        session.ws,
-        {
-            "type": "display.sleep" if sleeping else "display.wake",
-            "reason": "night_schedule",
-            "timezone": INFO_SCHEDULE_TIMEZONE,
-        },
-    )
-    print(
-        f"[DISPLAY] policy sent "
-        f"{'SLEEP' if sleeping else 'WAKE'}"
-    )
+def _desired_display_sleeping() -> bool:
+    return display_sleep_window_active()
 
 
-async def broadcast_display_policy() -> None:
-    for session in list(ACTIVE_SESSIONS):
+def _drain_display_ack_queue(session: "ClientSession") -> None:
+    while True:
         try:
-            await send_display_policy(session)
-        except Exception as exc:
+            session.display_ack_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+
+async def _wait_for_matching_display_ack(
+    session: "ClientSession",
+    command_id: str,
+    timeout: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.1, timeout)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+
+        ack = await asyncio.wait_for(
+            session.display_ack_queue.get(),
+            timeout=remaining,
+        )
+
+        if str(ack.get("command_id") or "") != command_id:
             print(
-                f"[DISPLAY-WARN] policy send failed: "
-                f"{type(exc).__name__}: {exc}"
+                "[DISPLAY-WARN] stale ack ignored "
+                f"expected={command_id} "
+                f"got={ack.get('command_id')}"
+            )
+            continue
+
+        return ack
+
+
+async def ensure_display_policy(
+    session: "ClientSession",
+    *,
+    reason: str = "night_schedule",
+) -> bool:
+    """Send sleep/wake policy and require a device execution ACK.
+
+    A command is only successful when the device says status=applied and the
+    reported actual sleeping state matches the requested policy.
+
+    If the device is temporarily busy (voice/TTS), it may first report
+    status=pending. In that case the Gateway waits for a later applied ACK
+    instead of falsely treating "command received" as "command executed".
+    """
+    desired_sleeping = _desired_display_sleeping()
+    requested = "sleep" if desired_sleeping else "wake"
+    command_id = f"display-{uuid.uuid4()}"
+
+    session.display_expected_command_id = command_id
+    _drain_display_ack_queue(session)
+
+    payload = {
+        "type": f"display.{requested}",
+        "command_id": command_id,
+        "reason": reason,
+        "timezone": INFO_SCHEDULE_TIMEZONE,
+        "require_ack": True,
+    }
+
+    try:
+        for attempt in range(1, DISPLAY_COMMAND_MAX_ATTEMPTS + 1):
+            try:
+                await send_json(session.ws, payload)
+            except Exception as exc:
+                print(
+                    f"[DISPLAY-WARN] command send failed "
+                    f"requested={requested} attempt={attempt}/"
+                    f"{DISPLAY_COMMAND_MAX_ATTEMPTS}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if attempt >= DISPLAY_COMMAND_MAX_ATTEMPTS:
+                    return False
+                await asyncio.sleep(1.0)
+                continue
+
+            print(
+                f"[DISPLAY] command sent requested={requested} "
+                f"command_id={command_id} "
+                f"attempt={attempt}/{DISPLAY_COMMAND_MAX_ATTEMPTS}"
+            )
+
+            try:
+                ack = await _wait_for_matching_display_ack(
+                    session,
+                    command_id,
+                    DISPLAY_ACK_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"[DISPLAY-WARN] ACK timeout requested={requested} "
+                    f"command_id={command_id} "
+                    f"attempt={attempt}/{DISPLAY_COMMAND_MAX_ATTEMPTS}"
+                )
+                continue
+
+            status = str(ack.get("status") or "").strip().lower()
+            actual_sleeping = bool(ack.get("sleeping"))
+            session.display_last_ack = dict(ack)
+
+            if status == "applied":
+                if actual_sleeping == desired_sleeping:
+                    session.display_last_confirmed_sleeping = actual_sleeping
+                    print(
+                        f"[DISPLAY] ACK confirmed requested={requested} "
+                        f"sleeping={actual_sleeping} "
+                        f"command_id={command_id}"
+                    )
+                    return True
+
+                print(
+                    f"[DISPLAY-WARN] ACK state mismatch "
+                    f"requested={requested} "
+                    f"reported_sleeping={actual_sleeping} "
+                    f"command_id={command_id}"
+                )
+                continue
+
+            if status == "pending":
+                print(
+                    f"[DISPLAY] ACK pending requested={requested} "
+                    f"busy={bool(ack.get('busy'))} "
+                    f"command_id={command_id}; waiting for execution"
+                )
+
+                # A long TTS response can legitimately keep the screen awake.
+                # Wait for a second ACK from the same command after the device
+                # actually enters/exits sleep.
+                try:
+                    final_ack = await _wait_for_matching_display_ack(
+                        session,
+                        command_id,
+                        DISPLAY_APPLY_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        f"[DISPLAY-WARN] apply timeout requested={requested} "
+                        f"command_id={command_id}"
+                    )
+                    continue
+
+                final_status = str(
+                    final_ack.get("status") or ""
+                ).strip().lower()
+                final_sleeping = bool(final_ack.get("sleeping"))
+                session.display_last_ack = dict(final_ack)
+
+                if (
+                    final_status == "applied"
+                    and final_sleeping == desired_sleeping
+                ):
+                    session.display_last_confirmed_sleeping = final_sleeping
+                    print(
+                        f"[DISPLAY] ACK confirmed after pending "
+                        f"requested={requested} sleeping={final_sleeping} "
+                        f"command_id={command_id}"
+                    )
+                    return True
+
+                print(
+                    f"[DISPLAY-WARN] final ACK invalid "
+                    f"status={final_status!r} "
+                    f"sleeping={final_sleeping} "
+                    f"command_id={command_id}"
+                )
+                continue
+
+            print(
+                f"[DISPLAY-WARN] command rejected/unknown ACK "
+                f"status={status!r} command_id={command_id}"
+            )
+
+        print(
+            f"[DISPLAY-ERROR] policy NOT confirmed "
+            f"requested={requested} command_id={command_id}"
+        )
+        return False
+
+    finally:
+        if session.display_expected_command_id == command_id:
+            session.display_expected_command_id = ""
+
+
+def start_display_policy_task(
+    session: "ClientSession",
+    *,
+    reason: str,
+) -> None:
+    old_task = session.display_policy_task
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+
+    session.display_policy_task = asyncio.create_task(
+        ensure_display_policy(session, reason=reason)
+    )
+
+
+async def broadcast_display_policy(
+    *,
+    reason: str = "night_schedule",
+) -> None:
+    sessions = list(ACTIVE_SESSIONS)
+    if not sessions:
+        print(
+            f"[DISPLAY] no connected device for policy "
+            f"{'SLEEP' if _desired_display_sleeping() else 'WAKE'}"
+        )
+        return
+
+    results = await asyncio.gather(
+        *(
+            ensure_display_policy(session, reason=reason)
+            for session in sessions
+        ),
+        return_exceptions=True,
+    )
+
+    for result in results:
+        if isinstance(result, Exception):
+            print(
+                f"[DISPLAY-WARN] policy task failed: "
+                f"{type(result).__name__}: {result}"
             )
 
 
@@ -965,8 +2078,12 @@ async def display_schedule_loop() -> None:
         )
         await asyncio.sleep(wait_sec)
 
+        # Never intentionally run before the exact wall-clock transition.
+        while datetime.now(_info_schedule_tz()) < target:
+            await asyncio.sleep(0.05)
+
         try:
-            await broadcast_display_policy()
+            await broadcast_display_policy(reason="night_schedule_transition")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -974,6 +2091,32 @@ async def display_schedule_loop() -> None:
                 f"[DISPLAY-WARN] transition failed: "
                 f"{type(exc).__name__}: {exc}"
             )
+
+
+async def display_reconcile_loop() -> None:
+    """Periodic non-token watchdog for display policy.
+
+    This costs no LLM/OpenClaw tokens. It simply asks the connected device to
+    re-confirm the current sleep/wake policy every five minutes.
+
+    The command is not sent while a confirmed manual wake is in progress on
+    the firmware side; the device will return pending/manual state and later
+    confirm the final policy.
+    """
+    while True:
+        await asyncio.sleep(DISPLAY_STATUS_RECHECK_SEC)
+
+        for session in list(ACTIVE_SESSIONS):
+            try:
+                start_display_policy_task(
+                    session,
+                    reason="periodic_reconcile",
+                )
+            except Exception as exc:
+                print(
+                    f"[DISPLAY-WARN] reconcile start failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
 
 def _sessions_busy() -> bool:
@@ -1008,10 +2151,98 @@ async def broadcast_info_sync_when_idle() -> None:
             )
 
 
+async def _sleep_until_not_early(target: datetime) -> None:
+    # asyncio.sleep() may resume a few milliseconds early. Re-check the
+    # wall clock so a scheduled poll is never started before the exact slot.
+    while True:
+        now = datetime.now(_info_schedule_tz())
+        remaining = (target - now).total_seconds()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 1.0))
+
+
+async def startup_info_refresh_before_ws() -> None:
+    # Startup freshness barrier:
+    # refresh game + finance BEFORE the WebSocket server starts accepting
+    # device connections. This guarantees the first device sync observes the
+    # freshly fetched feed when refresh succeeds, rather than racing against
+    # the startup polling task and receiving stale last-good first.
+    startup_now = datetime.now(_info_schedule_tz())
+    startup_label = startup_now.strftime("startup-%Y-%m-%dT%H:%M:%S")
+    _begin_startup_info_snapshot(
+        startup_now,
+        trigger="startup",
+        slot_label=startup_label,
+    )
+    print(
+        f"[INFO-SKILL] startup barrier refresh start="
+        f"{startup_now.isoformat()} slot={startup_label}"
+    )
+    try:
+        changed = await refresh_info_from_skill(
+            force=True,
+            slot_label=startup_label,
+        )
+        failed = list(LAST_INFO_REFRESH_DIAGNOSTIC.get("failed") or [])
+        succeeded = list(LAST_INFO_REFRESH_DIAGNOSTIC.get("succeeded") or [])
+        if failed and succeeded:
+            snapshot_status = "partial"
+        elif failed and not succeeded:
+            snapshot_status = "last-good"
+        else:
+            snapshot_status = "success" if changed else "last-good"
+        if changed:
+            print(
+                f"[INFO-SKILL] startup barrier refresh READY "
+                f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
+            )
+        else:
+            print(
+                f"[INFO-SKILL-WARN] startup barrier refresh used last-good "
+                f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
+            )
+        _finish_startup_info_snapshot(
+            started_at=startup_now,
+            status=snapshot_status,
+            trigger="startup",
+            slot_label=startup_label,
+        )
+    except asyncio.CancelledError:
+        _finish_startup_info_snapshot(
+            started_at=startup_now,
+            status="cancelled",
+            error="asyncio.CancelledError",
+            trigger="startup",
+            slot_label=startup_label,
+        )
+        raise
+    except Exception as exc:
+        # Startup must remain available even if OpenClaw / Info Skill is
+        # temporarily unhealthy. The already-loaded last-good cache remains
+        # authoritative and will be sent once the server opens.
+        _finish_startup_info_snapshot(
+            started_at=startup_now,
+            status="error",
+            error=f"{type(exc).__name__}: {exc}",
+            trigger="startup",
+            slot_label=startup_label,
+        )
+        print(
+            f"[INFO-SKILL-ERROR] startup barrier refresh failure, "
+            f"opening server with last-good cache: {type(exc).__name__}: {exc}"
+        )
+
+
 async def info_skill_poll_loop() -> None:
-    # Fixed wall-clock schedule:
-    # 00:00, 01:00, then 09:00 through 23:00 every hour.
-    # The long overnight pause is intentional.
+    # Startup refresh is completed by startup_info_refresh_before_ws()
+    # before websockets.serve() opens. This loop owns only the fixed wall-clock
+    # schedule below, preventing a startup/device-sync race.
+
+    # Fixed wall-clock schedule remains:
+    # 09:00,11:00,13:00,15:00,17:00,19:00,21:00,23:00,01:00.
+    # Then remain silent until 09:00. Each slot independently fetches game
+    # and finance with bounded retries and per-category last-good fallback.
     while True:
         wait_sec, target = seconds_until_next_info_poll()
         print(
@@ -1019,7 +2250,7 @@ async def info_skill_poll_loop() -> None:
             f"{target.isoformat()} wait={int(wait_sec)}s"
         )
 
-        await asyncio.sleep(wait_sec)
+        await _sleep_until_not_early(target)
 
         try:
             if not await _wait_for_idle():
@@ -1029,20 +2260,72 @@ async def info_skill_poll_loop() -> None:
                 )
                 continue
 
+            actual = datetime.now(_info_schedule_tz())
+            slot_label = target.strftime("%Y-%m-%dT%H:%M")
             print(
                 f"[INFO-SKILL] scheduled poll start="
-                f"{datetime.now(_info_schedule_tz()).isoformat()}"
+                f"{actual.isoformat()} slot={slot_label}"
             )
-            changed = await refresh_info_from_skill(force=False)
+
+            snapshot_started = actual
+            _begin_startup_info_snapshot(
+                snapshot_started,
+                trigger="scheduled",
+                slot_label=slot_label,
+            )
+            try:
+                changed = await refresh_info_from_skill(
+                    force=False,
+                    slot_label=slot_label,
+                )
+                failed = list(
+                    LAST_INFO_REFRESH_DIAGNOSTIC.get("failed") or []
+                )
+                succeeded = list(
+                    LAST_INFO_REFRESH_DIAGNOSTIC.get("succeeded") or []
+                )
+                if failed and succeeded:
+                    snapshot_status = "partial"
+                elif failed and not succeeded:
+                    snapshot_status = "last-good"
+                else:
+                    snapshot_status = "success"
+                _finish_startup_info_snapshot(
+                    started_at=snapshot_started,
+                    status=snapshot_status,
+                    trigger="scheduled",
+                    slot_label=slot_label,
+                )
+            except asyncio.CancelledError:
+                _finish_startup_info_snapshot(
+                    started_at=snapshot_started,
+                    status="cancelled",
+                    error="asyncio.CancelledError",
+                    trigger="scheduled",
+                    slot_label=slot_label,
+                )
+                raise
+            except Exception as exc:
+                _finish_startup_info_snapshot(
+                    started_at=snapshot_started,
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}",
+                    trigger="scheduled",
+                    slot_label=slot_label,
+                )
+                raise
+
             if changed:
                 await broadcast_info_sync_when_idle()
+
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # Never clear last-good cache on OpenClaw/Skill failure.
+            # Category-level errors should normally be contained inside
+            # refresh_info_from_skill. This is the outer safety net.
             print(
-                f"[INFO-SKILL-ERROR] scheduled refresh failed, "
-                f"keeping last-good cache: "
+                f"[INFO-SKILL-ERROR] scheduled refresh outer failure, "
+                f"keeping all last-good cache: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -1133,7 +2416,7 @@ def render_feed_frame(item: FeedItem, index: int, total: int) -> bytes:
     image = Image.new("1", (INFO_FRAME_WIDTH, INFO_FRAME_HEIGHT), 0)
     draw = ImageDraw.Draw(image)
 
-    # A4.2: category/header is intentionally NOT rendered.
+    # Category/header is intentionally NOT rendered.
     # The full upper 47 px are used for three readable headline lines.
     body_font = _load_cjk_font(11)
     small_font = ImageFont.load_default()
@@ -1221,12 +2504,20 @@ class ClientSession:
     audio: bytearray = field(default_factory=bytearray)
     context: dict[str, Any] = field(default_factory=dict)
     diag_glass_mode: str = "GLASS NORMAL"
+    ptt_trigger: str = "unknown"
     recording: bool = False
     processing: bool = False
     playback_sequence_active: bool = False
     playback_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     playback_error_event: asyncio.Event = field(default_factory=asyncio.Event)
     playback_slot_ready_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    # Display policy handshake.
+    display_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    display_expected_command_id: str = ""
+    display_last_ack: dict[str, Any] = field(default_factory=dict)
+    display_last_confirmed_sleeping: bool | None = None
+    display_policy_task: Any = None
 
 
 async def send_json(ws, payload: dict[str, Any]) -> None:
@@ -2367,7 +3658,7 @@ async def process_utterance(session: ClientSession) -> None:
         await send_state(session.ws, "thinking")
 
         if MODE == "loopback":
-            # First P0-A2 acceptance test: the user should hear their own voice.
+            # Loopback acceptance mode: the user should hear their own voice.
             await send_pcm_for_playback(session, pcm, MIC_RATE)
             session.processing = False
             await send_state(session.ws, "idle")
@@ -2462,8 +3753,41 @@ async def handle_connection(ws) -> None:
                 print("[DEVICE] hello")
                 await send_json(ws, {"type": "gateway.ready", "mode": MODE})
                 await send_state(ws, "idle")
-                await send_display_policy(session)
+
+                # Do not await here: this coroutine must keep receiving so the
+                # device's display.ack can be processed.
+                start_display_policy_task(
+                    session,
+                    reason="device_hello",
+                )
                 await send_info_sync(session)
+
+            elif kind == "display.ack":
+                command_id = str(msg.get("command_id") or "")
+                status = str(msg.get("status") or "")
+                requested = str(msg.get("requested") or "")
+                sleeping = bool(msg.get("sleeping"))
+                busy = bool(msg.get("busy"))
+                manual_wake = bool(msg.get("manual_wake_active"))
+
+                print(
+                    f"[DISPLAY] device ACK requested={requested} "
+                    f"status={status} sleeping={sleeping} "
+                    f"busy={busy} manual_wake={manual_wake} "
+                    f"command_id={command_id}"
+                )
+
+                if (
+                    session.display_expected_command_id
+                    and command_id == session.display_expected_command_id
+                ):
+                    session.display_ack_queue.put_nowait(dict(msg))
+                else:
+                    print(
+                        f"[DISPLAY-WARN] unexpected/stale device ACK "
+                        f"expected={session.display_expected_command_id!r} "
+                        f"got={command_id!r}"
+                    )
 
             elif kind == "info.ack":
                 print(f"[INFO] device ack revision={FEED_REVISION}")
@@ -2474,16 +3798,37 @@ async def handle_connection(ws) -> None:
                 session.audio.clear()
                 session.context = dict(msg.get("context") or {})
                 session.diag_glass_mode = str(msg.get("diag_glass_mode") or "GLASS NORMAL")
+                session.ptt_trigger = str(msg.get("trigger") or "unknown")
                 session.recording = True
                 await send_state(ws, "listening")
                 current = (session.context.get("current") or {}).get("headline", "")
-                print(f"[PTT] start current={current}")
+                print(
+                    f"[PTT] start trigger={session.ptt_trigger} "
+                    f"current={current}"
+                )
 
             elif kind == "ptt.stop":
                 session.recording = False
+                stop_trigger = str(msg.get("trigger") or session.ptt_trigger or "unknown")
+                session.ptt_trigger = stop_trigger
                 declared = ((msg.get("audio") or {}).get("bytes"))
-                print(f"[PTT] stop received={len(session.audio)} declared={declared}")
+                print(
+                    f"[PTT] stop trigger={stop_trigger} "
+                    f"received={len(session.audio)} declared={declared}"
+                )
                 asyncio.create_task(process_utterance(session))
+
+            elif kind == "ptt.abort":
+                session.recording = False
+                abort_trigger = str(msg.get("trigger") or session.ptt_trigger or "unknown")
+                reason = str(msg.get("reason") or "unknown")
+                print(
+                    f"[PTT] abort trigger={abort_trigger} reason={reason} "
+                    f"received={len(session.audio)}"
+                )
+                session.audio.clear()
+                session.ptt_trigger = abort_trigger
+                await send_state(ws, "idle")
 
             elif kind == "playback.slot_ready":
                 print("[AUDIO] device TTS slot ready")
@@ -2506,13 +3851,15 @@ async def handle_connection(ws) -> None:
                     await send_state(ws, "error")
 
     finally:
+        if session.display_policy_task is not None:
+            session.display_policy_task.cancel()
         if session in ACTIVE_SESSIONS:
             ACTIVE_SESSIONS.remove(session)
         print("[WS] client disconnected")
 
 
 async def preflight() -> int:
-    print("=== HomeAIAgent P0-A3.8 persistent-config preflight ===")
+    print("=== HomeAIAgent Gateway persistent-config preflight ===")
     print(f"[CFG] persistent_config={PERSISTENT_ENV}")
     print(f"[CFG] persistent_exists={PERSISTENT_ENV.exists()}")
     print(f"[CFG] mode={MODE}")
@@ -2534,14 +3881,29 @@ async def preflight() -> int:
     print(f"[CFG] OpenClaw={OPENCLAW_BASE_URL} model={OPENCLAW_MODEL}")
     print(f"[CFG] session user={OPENCLAW_USER}")
     print(f"[CFG] info_skill_protocol={INFO_SKILL_PROTOCOL}")
+    print("[CFG] info_skill_transport=structured_tool_call fallback=strict_text")
+    print(
+        "[CFG] info_skill_openclaw_session=ephemeral-explicit "
+        "user=omitted cleanup=after-each-request"
+    )
+    print(
+        f"[CFG] info_skill_cleanup=gateway-rpc enabled={OPENCLAW_INFO_SESSION_CLEANUP} "
+        f"ws={_openclaw_gateway_ws_url()} method=sessions.delete "
+        f"scope=operator.admin ssh=disabled"
+    )
+    print("[CFG] info_startup_refresh=barrier-before-ws game+finance; wall_clock_schedule=unchanged")
     print(f"[CFG] info_skill_cache={INFO_SKILL_CACHE_FILE}")
+    print(
+        f"[CFG] info_refresh_snapshots={INFO_SKILL_STARTUP_SNAPSHOT_DIR} "
+        f"triggers=startup+scheduled keep={INFO_SKILL_STARTUP_SNAPSHOT_KEEP}"
+    )
     print(
         f"[CFG] info_skill_feed={INFO_GAME_LIMIT} game + "
         f"{INFO_FINANCE_LIMIT} finance / max {INFO_MAX_ITEMS}"
     )
     print(
         f"[CFG] info_schedule_tz={INFO_SCHEDULE_TIMEZONE} "
-        "hours=00,01,09-23"
+        "hours=09,11,13,15,17,19,21,23,01"
     )
     print(
         f"[CFG] gold_status=24K spot CNY/g "
@@ -2620,6 +3982,12 @@ async def main() -> None:
     load_info_skill_cache()
     load_gold_quote_cache()
 
+    # Hard startup ordering. Do not accept a terminal connection
+    # until the forced game + finance refresh has completed (or failed safely
+    # back to last-good). Therefore the very first device sync after Gateway
+    # startup cannot race ahead of the startup refresh.
+    await startup_info_refresh_before_ws()
+
     if MODE == "full":
         print(f"[MODE] full: {ASR_PROVIDER} ASR2 streaming -> OpenClaw -> {TTS_PROVIDER} TTS")
         if TTS_PROVIDER == "volcengine":
@@ -2637,16 +4005,18 @@ async def main() -> None:
         info_task = asyncio.create_task(info_skill_poll_loop())
         gold_task = asyncio.create_task(gold_quote_loop())
         display_task = asyncio.create_task(display_schedule_loop())
+        display_reconcile_task = asyncio.create_task(display_reconcile_loop())
         try:
             await asyncio.Future()
         finally:
             info_task.cancel()
             gold_task.cancel()
             display_task.cancel()
+            display_reconcile_task.cancel()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="HomeAIAgent A4.1 voice + OpenClaw Info Skill gateway")
+    parser = argparse.ArgumentParser(description="HomeAIAgent voice + OpenClaw Info Skill gateway")
     parser.add_argument(
         "--check",
         action="store_true",

@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-// A1.6: dual-size monochrome CJK bitmap subset for Glass2.
+// Dual-size monochrome CJK bitmap subset for Glass2.
 // Header keeps 14x14. Body uses a lighter 12x12 glyph to increase title capacity.
 
 struct Glass2ZhGlyph14 { uint32_t codepoint; uint16_t rows[14]; };

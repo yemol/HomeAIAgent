@@ -26,5 +26,5 @@ fi
 if [ -d ".venv" ]; then
   echo
   echo "[INFO] Legacy project-local .venv still exists."
-  echo "       It is no longer used and may be deleted after A3.10 passes."
+  echo "       It is no longer used and may be deleted after the persistent runtime is verified."
 fi

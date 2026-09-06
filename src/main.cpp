@@ -12,11 +12,34 @@
 #include "app_config.h"
 #include "glass2_zh_font_demo.h"
 
+#ifndef HOMEAI_WAKEWORD_ENABLE
+#define HOMEAI_WAKEWORD_ENABLE 0
+#endif
+
+#if HOMEAI_WAKEWORD_ENABLE
+  #include <ESP_SR_M5Unified.h>
+
+  // Local custom trigger phrase via Chinese MultiNet.
+  static const sr_cmd_t HOMEAI_WAKE_COMMANDS[] = {
+      {0, "逐光逐光", "zhu guang zhu guang"},
+  };
+  static constexpr size_t HOMEAI_WAKE_COMMAND_COUNT =
+      sizeof(HOMEAI_WAKE_COMMANDS) / sizeof(HOMEAI_WAKE_COMMANDS[0]);
+#endif
+
 #if COMPANION_GATEWAY_ENABLE
   #include <WiFi.h>
   #include <WebSocketsClient.h>
   #include <ArduinoJson.h>
-  #include "secrets.h"
+
+  // Submission-safe configuration: prefer a local, gitignored secrets.h when
+  // present. Clean/source-control builds fall back to placeholder defaults;
+  // provisioned devices load the real Wi-Fi/Gateway values from NVS.
+  #if __has_include("secrets.h")
+    #include "secrets.h"
+  #else
+    #include "secrets.example.h"
+  #endif
 #endif
 
 enum class CompanionState : uint8_t {
@@ -140,7 +163,7 @@ static void loadPersistentDeviceConfig() {
   deviceConfig = RuntimeDeviceConfig{};
   deviceConfig.provisioned = false;
   Serial.println("[CONFIG] device is not provisioned.");
-  Serial.println("[CONFIG] Use tools/configure_terminal.py or serial CFG command.");
+  Serial.println("[CONFIG] terminal setup required");
 }
 
 static void handleConfigJson(const String& jsonText) {
@@ -217,7 +240,7 @@ static void handleSerialConfig() {
 }
 #endif
 
-// A4.0: Mini pre-renders the complete 128x64 monochrome Glass2 frame.
+// The Gateway pre-renders each complete 128x64 monochrome Glass2 frame.
 // StickS3 only caches and displays it, so arbitrary Chinese headlines do not
 // require a full CJK font inside firmware.
 static constexpr size_t INFO_FRAME_BYTES = 128 * 64 / 8;
@@ -247,7 +270,7 @@ static void initFallbackInfoItems() {
 M5UnitGLASS2 glass2;
 bool glass2Ready = false;
 
-// P0-A2.6: isolate whether Glass2 noise comes from UI traffic or shared power.
+// Diagnostic mode for isolating Glass2 UI-traffic and shared-power audio noise.
 // B cycles the three diagnostic modes. A remains push-to-talk.
 enum class GlassAudioDiagMode : uint8_t {
   Normal = 0,      // Glass2 powered + normal UI updates
@@ -266,14 +289,13 @@ static uint32_t micAcceptedBlocks = 0;
 static uint32_t micBufferedBlocks = 0;
 static uint32_t pttStartedMs = 0;
 
-// A3.7: a 15 s mono PCM16/16k utterance is only ~480 KB.
-// Keep it in PSRAM during capture, then transmit after Mic/I2S has stopped.
-// This avoids overlapping the microphone capture current with Wi-Fi RF TX peaks.
+// Keep the complete utterance in PSRAM during capture, then transmit only after
+// Mic/I2S has stopped. This avoids overlapping mic capture with Wi-Fi RF peaks.
 static uint8_t* pttCaptureBuffer = nullptr;
 static size_t pttCaptureBytes = 0;
 static bool pttCaptureOverflow = false;
 
-// A3.9 gapless TTS pipeline.
+// Gapless segmented TTS pipeline.
 // M5Unified Speaker channel 0 exposes a two-request queue. Keep two PSRAM
 // buffers alive and alternate them so segment N+1 is already queued before
 // segment N finishes.
@@ -294,9 +316,52 @@ static int8_t ttsNextSlot = -1;
 static size_t ttsLastQueueDepth = 0;
 static bool ttsSequenceActive = false;
 static constexpr uint8_t kTtsSpeakerChannel = 0;
+
+#if HOMEAI_WAKEWORD_ENABLE
+// Local wake-word path.
+// Local command-only MultiNet wake phrase: "逐光逐光".
+// Wake listening stays entirely local.
+static volatile bool wakeWordDetected = false;
+static bool wakeEngineReady = false;
+static bool wakeListening = false;
+static bool wakeRecognizerPaused = true;
+
+static int16_t wakeRing[AUDIO_MIC_RING_BLOCKS][AUDIO_MIC_BLOCK_SAMPLES];
+static uint32_t wakeAcceptedBlocks = 0;
+static uint32_t wakeFedBlocks = 0;
+static uint32_t wakeNoiseFloor = 0;
+
+// Wake audio-feed watchdog. M5Unified's half-duplex Mic can
+// occasionally report a running state after a voice/error transition while
+// no new record blocks are actually being accepted. Track real feed progress
+// and rebuild only the Mic -> ESP-SR pipe if it stalls.
+static uint32_t wakeLastAudioProgressMs = 0;
+static uint32_t wakeLastRecoveryMs = 0;
+static uint32_t wakeRecoveryCount = 0;
+static constexpr uint32_t WAKE_FEED_STALL_MS = 1200;
+static constexpr uint32_t WAKE_RECOVERY_COOLDOWN_MS = 2500;
+
+// Hands-free capture state after a local wake event.
+static bool autoWakeCaptureActive = false;
+static bool autoWakeSpeechStarted = false;
+static bool autoWakePttStartSent = false;
+static uint32_t autoWakeCaptureStartedMs = 0;
+static uint32_t autoWakeLastVoiceMs = 0;
+static uint32_t autoWakeLongestSilenceMs = 0;
+static uint32_t autoWakeLastVadLevel = 0;
+static bool autoWakeVadVoice = false;
+static size_t autoWakeTrimOffsetBytes = 0;
+
+static constexpr uint32_t AUTO_WAKE_WAIT_SPEECH_MS = 3500;
+static constexpr uint32_t AUTO_WAKE_END_SILENCE_MS = 3000;
+static constexpr uint32_t AUTO_WAKE_MAX_CAPTURE_MS = 10000;
+static constexpr uint32_t AUTO_WAKE_MIN_CAPTURE_MS = 700;
+static constexpr uint32_t AUTO_WAKE_PREROLL_MS = 300;
+static constexpr uint32_t AUTO_WAKE_MIN_VOICE_LEVEL = 450;
+#endif
 #endif
 
-// A2.7 reset forensics.
+// Reset forensics.
 // RTC_NOINIT survives most software/panic/watchdog resets, so after a reboot
 // we can print the last critical stage even when USB CDC disappeared before
 // the crash text reached PlatformIO.
@@ -469,7 +534,7 @@ static void printResetForensics() {
       static_cast<unsigned>(rtcDiag.freeDma),
       static_cast<unsigned>(rtcDiag.glassMode));
   } else {
-    Serial.println("[BOOT-DIAG] no valid previous breadcrumb (power-on or RTC state lost)");
+    Serial.println("[BOOT-DIAG] no breadcrumb");
   }
 
   Serial.printf(
@@ -499,7 +564,7 @@ size_t currentItem = 0;
 uint32_t itemShownSinceMs = 0;
 bool infoPaused = false;
 
-// A4.2 night screen protection.
+// Night screen protection.
 // Wall-clock policy comes from the Mac mini Gateway.
 // During the night window, any button wakes both displays immediately for
 // two minutes. Core/Wi-Fi/audio/Gateway remain running throughout.
@@ -507,6 +572,15 @@ bool nightScreenWindowActive = false;
 bool displaysSleeping = false;
 uint32_t manualWakeUntilMs = 0;
 static constexpr uint32_t NIGHT_MANUAL_WAKE_MS = 120000;
+
+// Display execution handshake.
+// The Gateway supplies command_id; the device only reports "applied" after
+// the requested screen state is actually true.
+String displayPolicyCommandId;
+bool displayPolicyAckPending = false;
+bool displayPolicyTargetSleep = false;
+
+static void sendDisplayPolicyAck(const char* status);
 static constexpr uint8_t STICKS3_ACTIVE_BRIGHTNESS = 140;
 static constexpr uint8_t GLASS2_ACTIVE_BRIGHTNESS = 255;
 
@@ -544,14 +618,417 @@ static constexpr size_t WIFI_RETRY_BACKOFF_COUNT =
 
 static const char* stateLabel(CompanionState state) {
   switch (state) {
-    case CompanionState::Idle:      return "在这里";
-    case CompanionState::Listening: return "正在听";
-    case CompanionState::Thinking:  return "想一想";
-    case CompanionState::Speaking:  return "正在说";
-    case CompanionState::Success:   return "完成啦";
-    case CompanionState::Error:     return "出错了";
+    case CompanionState::Idle:      return "STANDBY";
+    case CompanionState::Listening: return "LISTEN";
+    case CompanionState::Thinking:  return "THINK";
+    case CompanionState::Speaking:  return "SPEAK";
+    case CompanionState::Success:   return "COMPLETE";
+    case CompanionState::Error:     return "FAULT";
   }
   return "";
+}
+
+// Cyber Expression renderer.
+//
+// The StickS3 LCD is no longer a digital-pet face.  HomeAI now uses one stable
+// visual identity across all runtime states:
+//   1) luminous central AI core
+//   2) segmented horizontal VISOR
+//   3) incomplete mechanical/data orbits
+//   4) fixed cardinal locator marks
+//
+// Keep animation intentionally lightweight while Mic/I2S or gapless TTS is
+// active.  The voice chain is the product-critical path; UI motion must never
+// win a scheduling fight against capture/playback.
+static uint32_t cyberLastFrameMs = 0;
+static float cyberAudioLevel = 0.0f;
+static float cyberSmoothedAudio = 0.0f;
+
+// Full-frame off-screen renderer.
+// All cyber UI primitives are drawn into this RGB565 canvas first, then the
+// completed frame is transferred to the StickS3 LCD in one pushSprite().
+// This prevents a visible clear -> redraw cycle on the physical LCD.
+static M5Canvas cyberCanvas;
+static bool cyberCanvasReady = false;
+static bool cyberCanvasAllocFailed = false;
+
+static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+  return M5.Display.color565(r, g, b);
+}
+
+static bool ensureCyberCanvas() {
+  if (cyberCanvasReady) {
+    // Rotation is frozen in production, but reject a stale buffer defensively.
+    if (cyberCanvas.width() == M5.Display.width() &&
+        cyberCanvas.height() == M5.Display.height()) {
+      return true;
+    }
+    cyberCanvas.deleteSprite();
+    cyberCanvasReady = false;
+  }
+  if (cyberCanvasAllocFailed) return false;
+
+  cyberCanvas.setPsram(true);
+  cyberCanvas.setColorDepth(16);
+  void* buffer = cyberCanvas.createSprite(M5.Display.width(), M5.Display.height());
+  if (!buffer) {
+    // One SRAM fallback is useful for development boards with PSRAM disabled.
+    // Production StickS3 builds have BOARD_HAS_PSRAM and should use PSRAM.
+    cyberCanvas.setPsram(false);
+    cyberCanvas.setColorDepth(16);
+    buffer = cyberCanvas.createSprite(M5.Display.width(), M5.Display.height());
+  }
+
+  if (!buffer) {
+    cyberCanvasAllocFailed = true;
+    Serial.printf("[UI] Cyber canvas allocation FAILED (%dx%d RGB565)\n",
+                  M5.Display.width(), M5.Display.height());
+    return false;
+  }
+
+  cyberCanvasReady = true;
+  Serial.printf("[UI] Cyber canvas ready: %dx%d RGB565, %u bytes\n",
+                cyberCanvas.width(), cyberCanvas.height(),
+                static_cast<unsigned>(cyberCanvas.bufferLength()));
+  return true;
+}
+
+static float cyberClamp01(float v) {
+  if (v < 0.0f) return 0.0f;
+  if (v > 1.0f) return 1.0f;
+  return v;
+}
+
+static float cyberEaseOutCubic(float t) {
+  t = cyberClamp01(t);
+  const float p = 1.0f - t;
+  return 1.0f - p * p * p;
+}
+
+static void setCyberAudioLevel(float level) {
+  cyberAudioLevel = cyberClamp01(level);
+}
+
+static void cyberDrawRotArc(M5Canvas& d, int cx, int cy, int outerR, int thickness,
+                            float startDeg, float sweepDeg, uint16_t color) {
+  while (startDeg < 0.0f) startDeg += 360.0f;
+  while (startDeg >= 360.0f) startDeg -= 360.0f;
+  const float end = startDeg + sweepDeg;
+  if (end <= 360.0f) {
+    d.drawArc(cx, cy, outerR, outerR - thickness,
+              static_cast<int>(startDeg), static_cast<int>(end), color);
+  } else {
+    d.drawArc(cx, cy, outerR, outerR - thickness,
+              static_cast<int>(startDeg), 360, color);
+    d.drawArc(cx, cy, outerR, outerR - thickness,
+              0, static_cast<int>(end - 360.0f), color);
+  }
+}
+
+static void cyberDrawDotPolar(M5Canvas& d, int cx, int cy, float radius, float angleDeg,
+                              int radiusPx, uint16_t color) {
+  constexpr float kPi = 3.14159265358979323846f;
+  const float a = angleDeg * kPi / 180.0f;
+  const int x = cx + static_cast<int>(cosf(a) * radius);
+  const int y = cy + static_cast<int>(sinf(a) * radius);
+  d.fillCircle(x, y, radiusPx, color);
+}
+
+static void cyberDrawCore(M5Canvas& d, int cx, int cy, float pulse, uint16_t coreColor) {
+  pulse = cyberClamp01(pulse);
+  const int glowR = 9 + static_cast<int>(pulse * 3.0f);
+
+  d.fillCircle(cx, cy, glowR + 8, rgb565(0, 8, 24));
+  d.fillCircle(cx, cy, glowR + 5, rgb565(0, 27, 61));
+  d.fillCircle(cx, cy, glowR + 2, rgb565(0, 72, 139));
+  d.fillCircle(cx, cy, 7 + static_cast<int>(pulse * 2.0f), coreColor);
+  d.fillCircle(cx, cy, 3, rgb565(239, 250, 255));
+
+  d.drawCircle(cx, cy, 16, rgb565(13, 85, 144));
+  d.drawCircle(cx, cy, 20, rgb565(5, 39, 80));
+  d.drawCircle(cx, cy, 23, rgb565(3, 23, 52));
+}
+
+static void cyberDrawVisor(M5Canvas& d, int cx, int cy, int halfWidth,
+                           uint16_t color, uint16_t glow,
+                           int yOffsetLeft = 0, int yOffsetRight = 0) {
+  const int gap = 12;
+  const int xL0 = cx - halfWidth;
+  const int xL1 = cx - gap;
+  const int xR0 = cx + gap;
+  const int xR1 = cx + halfWidth;
+
+  d.drawFastHLine(xL0, cy - 2 + yOffsetLeft, xL1 - xL0, glow);
+  d.drawFastHLine(xL0, cy + 2 + yOffsetLeft, xL1 - xL0, glow);
+  d.drawFastHLine(xR0, cy - 2 + yOffsetRight, xR1 - xR0, glow);
+  d.drawFastHLine(xR0, cy + 2 + yOffsetRight, xR1 - xR0, glow);
+
+  d.drawFastHLine(xL0, cy + yOffsetLeft, xL1 - xL0, color);
+  d.drawFastHLine(xR0, cy + yOffsetRight, xR1 - xR0, color);
+  d.drawFastHLine(xL0 + 3, cy - 1 + yOffsetLeft,
+                  xL1 - xL0 - 6, rgb565(121, 227, 255));
+  d.drawFastHLine(xR0 + 3, cy - 1 + yOffsetRight,
+                  xR1 - xR0 - 6, rgb565(121, 227, 255));
+
+  d.drawFastVLine(xL0, cy - 4 + yOffsetLeft, 9, rgb565(9, 75, 126));
+  d.drawFastVLine(xR1, cy - 4 + yOffsetRight, 9, rgb565(9, 75, 126));
+  d.drawPixel(xL0 - 2, cy + yOffsetLeft, rgb565(106, 220, 255));
+  d.drawPixel(xR1 + 2, cy + yOffsetRight, rgb565(106, 220, 255));
+}
+
+static void cyberDrawOrbitBase(M5Canvas& d, int cx, int cy, uint32_t now, float energy,
+                               uint16_t midColor = 0) {
+  const float drift = fmodf(now * 0.018f, 360.0f);
+  const uint16_t dim = rgb565(3, 34, 66);
+  const uint16_t mid = midColor ? midColor : rgb565(7, 78, 137);
+
+  cyberDrawRotArc(d, cx, cy, 29, 2, 205 + drift * 0.08f, 58, dim);
+  cyberDrawRotArc(d, cx, cy, 29, 2, 25 + drift * 0.08f, 58, dim);
+  cyberDrawRotArc(d, cx, cy, 36, 2, 224 - drift * 0.05f, 42, mid);
+  cyberDrawRotArc(d, cx, cy, 36, 2, 44 - drift * 0.05f, 42, mid);
+
+  // HomeAI visual DNA: fixed cardinal locator marks remain in every state.
+  d.drawFastVLine(cx, cy - 49, 8, rgb565(20, 94, 155));
+  d.drawFastVLine(cx, cy + 42, 8, rgb565(20, 94, 155));
+  d.drawFastHLine(cx - 50, cy, 7, rgb565(20, 94, 155));
+  d.drawFastHLine(cx + 43, cy, 7, rgb565(20, 94, 155));
+
+  if (energy > 0.25f) {
+    cyberDrawDotPolar(d, cx, cy, 40, 305 + drift, 1, rgb565(29, 156, 237));
+    cyberDrawDotPolar(d, cx, cy, 40, 125 + drift, 1, rgb565(29, 156, 237));
+  }
+}
+
+static void cyberDrawWaveCluster(M5Canvas& d, int x0, int cy, int direction,
+                                 float intensity, uint32_t now,
+                                 uint16_t primary, uint16_t secondary) {
+  constexpr int bars = 6;
+  const float phase = now * 0.012f;
+  for (int i = 0; i < bars; ++i) {
+    const float local = 0.35f + 0.65f * fabsf(sinf(phase + i * 0.78f));
+    const int barH = 3 + static_cast<int>(intensity * local * (7 + i));
+    const int x = x0 + direction * i * 3;
+    d.drawFastVLine(x, cy - barH / 2, barH, i < 2 ? primary : secondary);
+  }
+}
+
+static void cyberDrawChrome(M5Canvas& d, uint16_t accent, uint16_t bg, const char* label) {
+  const int w = d.width();
+  const int h = d.height();
+  const uint16_t frame = rgb565(5, 23, 42);
+  const uint16_t muted = rgb565(57, 105, 139);
+
+  // Sparse industrial frame.  It adds identity without turning into HUD clutter.
+  d.drawFastHLine(8, 14, 15, frame);
+  d.drawFastVLine(8, 14, 10, frame);
+  d.drawFastHLine(w - 23, 14, 15, frame);
+  d.drawFastVLine(w - 9, 14, 10, frame);
+  d.drawFastHLine(8, h - 16, 15, frame);
+  d.drawFastVLine(8, h - 25, 10, frame);
+  d.drawFastHLine(w - 23, h - 16, 15, frame);
+  d.drawFastVLine(w - 9, h - 25, 10, frame);
+
+  d.setTextWrap(false);
+  d.setFont(&fonts::efontCN_10);
+  d.setTextSize(1);
+  d.setTextDatum(top_left);
+  d.setTextColor(muted, bg);
+  d.drawString("HOMEAI", 10, 25);
+  d.setTextDatum(top_right);
+  d.drawString("NODE/01", w - 10, 25);
+
+  d.setTextDatum(middle_center);
+  d.setTextColor(accent, bg);
+  d.drawString(label, w / 2, 204);
+  d.setTextColor(muted, bg);
+  d.drawString("A:TALK  B:INFO", w / 2, 222);
+}
+
+static void cyberDrawIdle(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const float breathing = 0.5f + 0.5f * sinf(now * 0.0018f);
+  cyberDrawOrbitBase(d, cx, cy, now, 0.22f);
+  cyberDrawVisor(d, cx, cy, 46, rgb565(34, 137, 221), rgb565(0, 23, 55));
+  cyberDrawCore(d, cx, cy, 0.20f + breathing * 0.22f, rgb565(87, 210, 255));
+
+  if (((now / 900U) & 1U) == 0U) {
+    d.drawPixel(cx, cy + 59, rgb565(52, 132, 184));
+  }
+}
+
+static void cyberDrawListening(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const float autoBreath = 0.18f + 0.12f * (0.5f + 0.5f * sinf(now * 0.007f));
+  const float e = cyberClamp01(cyberSmoothedAudio + autoBreath);
+  cyberDrawOrbitBase(d, cx, cy, now, 0.55f + e * 0.3f);
+  cyberDrawVisor(d, cx, cy, 43, rgb565(48, 170, 245), rgb565(0, 34, 72));
+  cyberDrawCore(d, cx, cy, 0.35f + e * 0.52f, rgb565(105, 226, 255));
+
+  for (int i = 0; i < 3; ++i) {
+    const int r = 7 + i * 6 + static_cast<int>(e * 2.0f);
+    const uint16_t c = i == 0 ? rgb565(123, 231, 255)
+                               : rgb565(18, 103 + i * 20, 177 + i * 17);
+    d.drawArc(cx - 47, cy, r, r - 1, 300, 360, c);
+    d.drawArc(cx - 47, cy, r, r - 1, 0, 60, c);
+    d.drawArc(cx + 47, cy, r, r - 1, 120, 240, c);
+  }
+
+  const int travel = static_cast<int>((now / 24U) % 23U);
+  d.fillCircle(cx - 60 + travel, cy, 1, rgb565(130, 235, 255));
+  d.fillCircle(cx + 60 - travel, cy, 1, rgb565(130, 235, 255));
+}
+
+static void cyberDrawThinking(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const float t = now * 0.035f;
+  cyberDrawOrbitBase(d, cx, cy, now, 1.0f);
+  cyberDrawVisor(d, cx, cy, 42, rgb565(35, 130, 220), rgb565(0, 26, 64));
+  cyberDrawCore(d, cx, cy, 0.48f + 0.14f * sinf(now * 0.004f), rgb565(81, 205, 255));
+
+  cyberDrawRotArc(d, cx, cy, 42, 3, fmodf(t, 360.0f), 56, rgb565(31, 153, 238));
+  cyberDrawRotArc(d, cx, cy, 42, 2, fmodf(t + 142.0f, 360.0f), 26, rgb565(119, 228, 255));
+  cyberDrawRotArc(d, cx, cy, 47, 2, fmodf(320.0f - t * 0.72f, 360.0f), 68,
+                  rgb565(14, 85, 162));
+
+  cyberDrawDotPolar(d, cx, cy, 46, fmodf(t * 1.8f, 360.0f), 2, rgb565(121, 230, 255));
+  cyberDrawDotPolar(d, cx, cy, 39, fmodf(260.0f - t * 1.25f, 360.0f), 1,
+                    rgb565(232, 248, 255));
+
+  for (int i = 0; i < 6; ++i) {
+    const int x = cx - 21 + i * 8;
+    const int len = 2 + ((i + (now / 120U)) % 3U);
+    d.drawFastVLine(x, cy + 54, len, rgb565(12, 72, 130));
+  }
+}
+
+static void cyberDrawSpeaking(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const float autoVoice = 0.28f + 0.23f * (0.5f + 0.5f * sinf(now * 0.010f));
+  const float e = cyberClamp01(cyberSmoothedAudio * 0.9f + autoVoice);
+  cyberDrawOrbitBase(d, cx, cy, now, 0.72f);
+  cyberDrawVisor(d, cx, cy, 39, rgb565(42, 154, 238), rgb565(0, 31, 70));
+  cyberDrawCore(d, cx, cy, 0.44f + e * 0.45f, rgb565(111, 232, 255));
+
+  cyberDrawWaveCluster(d, cx - 48, cy, -1, e, now,
+                       rgb565(128, 233, 255), rgb565(24, 112, 201));
+  cyberDrawWaveCluster(d, cx + 48, cy, +1, e, now,
+                       rgb565(128, 233, 255), rgb565(24, 112, 201));
+}
+
+static void cyberDrawSuccess(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const uint16_t ok = rgb565(99, 238, 218);
+  cyberDrawOrbitBase(d, cx, cy, now, 0.72f, rgb565(14, 110, 112));
+  cyberDrawVisor(d, cx, cy, 42, ok, rgb565(0, 38, 48));
+  cyberDrawCore(d, cx, cy, 0.58f, rgb565(133, 255, 235));
+
+  // Completion is shown as mechanical alignment, not a software check icon.
+  cyberDrawRotArc(d, cx, cy, 45, 2, 8, 74, rgb565(42, 174, 170));
+  cyberDrawRotArc(d, cx, cy, 45, 2, 98, 74, rgb565(42, 174, 170));
+  cyberDrawRotArc(d, cx, cy, 45, 2, 188, 74, rgb565(42, 174, 170));
+  cyberDrawRotArc(d, cx, cy, 45, 2, 278, 74, rgb565(42, 174, 170));
+}
+
+static void cyberDrawError(M5Canvas& d, int cx, int cy, uint32_t now) {
+  const uint16_t red = rgb565(255, 73, 91);
+  const uint16_t redDim = rgb565(112, 17, 31);
+  cyberDrawOrbitBase(d, cx, cy, now, 0.35f, redDim);
+
+  // A fault is the same HomeAI face losing alignment, not a separate icon.
+  cyberDrawVisor(d, cx, cy, 44, red, rgb565(48, 0, 8), -2, +3);
+  cyberDrawCore(d, cx, cy, 0.36f, rgb565(255, 91, 105));
+  cyberDrawRotArc(d, cx, cy, 42, 3, 212, 45, red);
+  cyberDrawRotArc(d, cx, cy, 47, 2, 18, 51, redDim);
+  cyberDrawRotArc(d, cx, cy, 39, 2, 104, 34, red);
+
+  // Deterministic short glitch bars: visible, but never a full-screen strobe.
+  const int phase = static_cast<int>((now / 120U) % 4U);
+  d.drawFastHLine(cx - 52 + phase * 2, cy - 31, 17, redDim);
+  d.drawFastHLine(cx + 25 - phase, cy + 28, 24, redDim);
+  d.drawFastHLine(cx - 18, cy + 50 + (phase & 1), 31, red);
+}
+
+static uint32_t cyberFrameIntervalMs() {
+  // Conservative refresh while the half-duplex audio path is active.
+  switch (companionState) {
+    case CompanionState::Listening: return 160;  // ~6 FPS during Mic capture
+    case CompanionState::Speaking:  return 125;  // 8 FPS during gapless TTS
+    case CompanionState::Thinking:  return 50;   // 20 FPS when audio is idle
+    case CompanionState::Success:   return 80;
+    case CompanionState::Error:     return 100;
+    case CompanionState::Idle:
+    default:                        return 100;   // restrained ambient motion
+  }
+}
+
+static void renderCyberExpression(CompanionState state, uint32_t now) {
+  if (displaysSleeping) return;
+  if (!ensureCyberCanvas()) return;
+
+  auto& d = cyberCanvas;
+  const int w = d.width();
+  const int cx = w / 2;
+  const int cy = 112;
+
+  const uint16_t bg = rgb565(1, 5, 11);
+  const uint16_t normalAccent = rgb565(75, 185, 246);
+  const uint16_t successAccent = rgb565(99, 238, 218);
+  const uint16_t errorAccent = rgb565(255, 73, 91);
+  const uint16_t accent = state == CompanionState::Success ? successAccent
+                           : state == CompanionState::Error ? errorAccent
+                           : normalAccent;
+
+  // IMPORTANT: clear only the off-screen canvas. The physical LCD keeps the
+  // previous complete frame until pushSprite() below replaces it atomically
+  // from the user's point of view.
+  d.fillSprite(bg);
+
+  const float transition = cyberEaseOutCubic((now - stateSinceMs) / 360.0f);
+  const int reveal = 14 + static_cast<int>(30.0f * transition);
+  const uint16_t transitionColor = state == CompanionState::Error
+                                       ? rgb565(76, 10, 22)
+                                       : rgb565(10, 59, 105);
+  d.drawArc(cx, cy, reveal, reveal - 1, 210, 330, transitionColor);
+  d.drawArc(cx, cy, reveal, reveal - 1, 30, 150, transitionColor);
+
+  // Long vertical sensor axis makes the composition recognisable even in a
+  // peripheral glance beside the monitor.
+  d.drawFastVLine(cx, 45, 15, rgb565(11, 63, 105));
+  d.drawFastVLine(cx, 164, 15, rgb565(11, 63, 105));
+  d.drawPixel(cx, 65, accent);
+  d.drawPixel(cx, 184, accent);
+
+  switch (state) {
+    case CompanionState::Idle:      cyberDrawIdle(d, cx, cy, now); break;
+    case CompanionState::Listening: cyberDrawListening(d, cx, cy, now); break;
+    case CompanionState::Thinking:  cyberDrawThinking(d, cx, cy, now); break;
+    case CompanionState::Speaking:  cyberDrawSpeaking(d, cx, cy, now); break;
+    case CompanionState::Success:   cyberDrawSuccess(d, cx, cy, now); break;
+    case CompanionState::Error:     cyberDrawError(d, cx, cy, now); break;
+  }
+
+  cyberDrawChrome(d, accent, bg, stateLabel(state));
+
+  // Single physical display transaction per frame. No visible fillScreen().
+  M5.Display.startWrite();
+  d.pushSprite(&M5.Display, 0, 0);
+  M5.Display.endWrite();
+}
+
+static void drawMascotFace(CompanionState state, bool blink = false) {
+  (void)blink;
+  if (displaysSleeping) return;
+  renderCyberExpression(state, millis());
+  cyberLastFrameMs = millis();
+}
+
+static void updateCyberExpression() {
+  if (displaysSleeping) return;
+  const uint32_t now = millis();
+  if (now - cyberLastFrameMs < cyberFrameIntervalMs()) return;
+  cyberLastFrameMs = now;
+
+  // Audio-reactive hook.  Current production voice path intentionally does not
+  // perform extra RMS passes solely for UI.  The autonomous envelope keeps
+  // Listening/Speaking alive without adding work to Mic/TTS critical sections.
+  cyberSmoothedAudio += (cyberAudioLevel - cyberSmoothedAudio) * 0.34f;
+  cyberAudioLevel *= 0.87f;
+  renderCyberExpression(companionState, now);
 }
 
 static void setState(CompanionState state) {
@@ -559,101 +1036,9 @@ static void setState(CompanionState state) {
   companionState = state;
   stateSinceMs = millis();
   idleBlink = false;
-}
 
-static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-  return M5.Display.color565(r, g, b);
-}
-
-static void drawMascotFace(CompanionState state, bool blink = false) {
-  if (displaysSleeping) return;
-  auto& d = M5.Display;
-  const int w = d.width();
-  const int h = d.height();
-
-  const uint16_t bg      = rgb565(6, 11, 18);
-  const uint16_t visor   = rgb565(22, 38, 49);
-  const uint16_t accent  = (state == CompanionState::Thinking) ? rgb565(255, 205, 74)
-                           : (state == CompanionState::Listening || state == CompanionState::Success)
-                             ? rgb565(92, 231, 157)
-                             : (state == CompanionState::Error)
-                               ? rgb565(255, 107, 107)
-                               : rgb565(73, 222, 231);
-  const uint16_t white   = rgb565(246, 252, 252);
-  const uint16_t pupil   = rgb565(11, 24, 31);
-  const uint16_t blush   = rgb565(255, 132, 167);
-  const uint16_t muted   = rgb565(138, 160, 171);
-
-  d.fillScreen(bg);
-
-  // P0-A1.2 treats the LCD as a "face window" inside a future fixed shell.
-  // Only a small state label remains outside the expression window.
-  d.setFont(&fonts::efontCN_12_b);
-  d.setTextDatum(middle_center);
-  d.setTextColor(accent, bg);
-  d.drawString(stateLabel(state), w / 2, 20);
-
-  d.fillRoundRect(12, 42, w - 24, 126, 24, visor);
-  d.drawRoundRect(12, 42, w - 24, 126, 24, accent);
-
-  const int eyeY = 91;
-  const int leftX = w / 2 - 25;
-  const int rightX = w / 2 + 25;
-
-  if (blink && state == CompanionState::Idle) {
-    d.drawRoundRect(leftX - 13, eyeY - 2, 26, 5, 2, white);
-    d.drawRoundRect(rightX - 13, eyeY - 2, 26, 5, 2, white);
-  } else if (state == CompanionState::Success) {
-    d.drawArc(leftX, eyeY + 4, 13, 9, 195, 345, white);
-    d.drawArc(rightX, eyeY + 4, 13, 9, 195, 345, white);
-  } else if (state == CompanionState::Error) {
-    d.drawLine(leftX - 9, eyeY - 7, leftX + 9, eyeY + 7, white);
-    d.drawLine(leftX + 9, eyeY - 7, leftX - 9, eyeY + 7, white);
-    d.drawLine(rightX - 9, eyeY - 7, rightX + 9, eyeY + 7, white);
-    d.drawLine(rightX + 9, eyeY - 7, rightX - 9, eyeY + 7, white);
-  } else {
-    // Large digital-pet eyes. Thinking looks upward; listening widens pupils.
-    d.fillRoundRect(leftX - 15, eyeY - 17, 30, 34, 12, white);
-    d.fillRoundRect(rightX - 15, eyeY - 17, 30, 34, 12, white);
-
-    int px = 0, py = 3, pr = 7;
-    if (state == CompanionState::Thinking) { px = 5; py = -4; }
-    if (state == CompanionState::Listening) { pr = 8; py = 1; }
-
-    d.fillCircle(leftX + px, eyeY + py, pr, pupil);
-    d.fillCircle(rightX + px, eyeY + py, pr, pupil);
-    d.fillCircle(leftX + px - 3, eyeY + py - 4, 2, white);
-    d.fillCircle(rightX + px - 3, eyeY + py - 4, 2, white);
-  }
-
-  if (state != CompanionState::Thinking && state != CompanionState::Error) {
-    d.fillCircle(leftX - 20, 120, 3, blush);
-    d.fillCircle(rightX + 20, 120, 3, blush);
-  }
-
-  const int mx = w / 2;
-  const int my = 136;
-  if (state == CompanionState::Listening) {
-    d.drawCircle(mx, my, 7, accent);
-  } else if (state == CompanionState::Speaking) {
-    const bool open = ((millis() / 180) & 1) != 0;
-    if (open) d.fillEllipse(mx, my, 7, 10, accent);
-    else d.drawFastHLine(mx - 8, my, 17, accent);
-  } else if (state == CompanionState::Thinking) {
-    d.fillCircle(mx, my, 2, accent);
-    d.fillCircle(mx + 20, 58, 2, accent);
-    d.fillCircle(mx + 27, 53, 3, accent);
-    d.fillCircle(mx + 35, 46, 4, accent);
-  } else if (state == CompanionState::Error) {
-    d.drawArc(mx, my + 10, 14, 9, 205, 335, accent);
-  } else {
-    d.drawArc(mx, my - 3, 15, 10, 20, 160, accent);
-  }
-
-  d.setFont(&fonts::efontCN_10);
-  d.setTextColor(muted, bg);
-  d.setTextDatum(middle_center);
-  d.drawString("A 说话  ·  B 资讯", w / 2, h - 18);
+  // Force the next cyber frame immediately after a state transition.
+  cyberLastFrameMs = 0;
 }
 
 
@@ -1010,7 +1395,7 @@ static void drawGlassFrame() {
 
 
   // Local fallback before the first successful Mini sync.
-  // A4.2 matches the production layout: no category/header, three body lines,
+  // Production fallback layout: no category/header, three body lines,
   // bottom-left item index. The Gateway-rendered frame remains authoritative.
   glass2.fillScreen(TFT_BLACK);
   glass2.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -1083,6 +1468,11 @@ static void enterNightScreenSleep() {
   M5.Display.setBrightness(0);
   displaysSleeping = true;
   Serial.println("[SCREEN] night sleep ON");
+
+  if (displayPolicyAckPending && displayPolicyTargetSleep) {
+    sendDisplayPolicyAck("applied");
+    displayPolicyAckPending = false;
+  }
 }
 
 static void wakeDisplays(bool manualWake) {
@@ -1106,6 +1496,11 @@ static void wakeDisplays(bool manualWake) {
       "[SCREEN] wake manual=%u nightWindow=%u\n",
       manualWake ? 1u : 0u,
       nightScreenWindowActive ? 1u : 0u);
+
+  if (displayPolicyAckPending && !displayPolicyTargetSleep) {
+    sendDisplayPolicyAck("applied");
+    displayPolicyAckPending = false;
+  }
 }
 
 static void wakeDisplaysForActivity() {
@@ -1123,6 +1518,12 @@ static void setNightScreenWindow(bool active) {
     manualWakeUntilMs = 0;
     wakeDisplays(false);
     Serial.println("[SCREEN] night window OFF");
+
+    if (displayPolicyAckPending && !displayPolicyTargetSleep &&
+        !displaysSleeping) {
+      sendDisplayPolicyAck("applied");
+      displayPolicyAckPending = false;
+    }
     return;
   }
 
@@ -1164,7 +1565,7 @@ static void beginGlassVoiceIsolation() {
   glassUiFrozen = true;
 
   if (glassDiagMode == GlassAudioDiagMode::UiFrozen) {
-    Serial.println("[GLASS-DIAG] voice mode=FREEZE (powered, zero display writes)");
+    Serial.println("[GLASS] freeze");
     return;
   }
 
@@ -1176,7 +1577,7 @@ static void beginGlassVoiceIsolation() {
   glassPowerCutForVoice = true;
   delay(50);
   diagCheckpoint(CP_GLASS_POWER_OFF_OK, true);
-  Serial.println("[GLASS-DIAG] voice mode=POWER_OFF (EXT 5V disabled)");
+  Serial.println("[GLASS] power off");
 }
 
 static void endGlassVoiceIsolation() {
@@ -1226,6 +1627,10 @@ static void updateInfoCycle() {
 }
 
 #if COMPANION_GATEWAY_ENABLE
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+static void pauseWakeRecognizerForTurn();
+#endif
+
 static size_t wrappedItemIndex(int offset) {
   if (infoItemCount == 0) return 0;
   int idx = static_cast<int>(currentItem) + offset;
@@ -1240,13 +1645,19 @@ static void addItemContext(JsonObject obj, const InfoItem& item) {
   obj["headline"] = item.headline.c_str();
 }
 
-static void sendJsonEvent(const char* type, size_t audioBytes = 0) {
+static void sendJsonEvent(const char* type, size_t audioBytes = 0, const char* trigger = nullptr, const char* reason = nullptr) {
   if (!gatewayConnected) return;
 
   JsonDocument doc;
   doc["type"] = type;
   doc["protocol"] = 2;
   doc["diag_glass_mode"] = glassDiagLabel();
+  if (trigger && trigger[0] != '\0') {
+    doc["trigger"] = trigger;
+  }
+  if (reason && reason[0] != '\0') {
+    doc["reason"] = reason;
+  }
 
   JsonObject context = doc["context"].to<JsonObject>();
   if (infoItemCount > 0) {
@@ -1267,6 +1678,40 @@ static void sendJsonEvent(const char* type, size_t audioBytes = 0) {
   String payload;
   serializeJson(doc, payload);
   webSocket.sendTXT(payload);
+}
+
+static void sendDisplayPolicyAck(const char* status) {
+  if (!gatewayConnected) return;
+  if (displayPolicyCommandId.isEmpty()) return;
+
+  JsonDocument doc;
+  doc["type"] = "display.ack";
+  doc["protocol"] = 2;
+  doc["command_id"] = displayPolicyCommandId;
+  doc["requested"] = displayPolicyTargetSleep ? "sleep" : "wake";
+  doc["status"] = status;
+  doc["window_active"] = nightScreenWindowActive;
+  doc["sleeping"] = displaysSleeping;
+  doc["busy"] = nightConversationBusy();
+
+  const bool manualWakeActive =
+      nightScreenWindowActive &&
+      !displaysSleeping &&
+      manualWakeUntilMs != 0 &&
+      static_cast<int32_t>(millis() - manualWakeUntilMs) < 0;
+  doc["manual_wake_active"] = manualWakeActive;
+
+  String payload;
+  serializeJson(doc, payload);
+  webSocket.sendTXT(payload);
+
+  Serial.printf(
+      "[SCREEN-ACK] requested=%s status=%s sleeping=%u busy=%u id=%s\n",
+      displayPolicyTargetSleep ? "sleep" : "wake",
+      status,
+      displaysSleeping ? 1u : 0u,
+      nightConversationBusy() ? 1u : 0u,
+      displayPolicyCommandId.c_str());
 }
 
 static CompanionState parseRemoteState(const char* value) {
@@ -1342,6 +1787,13 @@ static int8_t findFreeTtsSlot() {
 }
 
 static bool ensureSpeakerForTts() {
+#if HOMEAI_WAKEWORD_ENABLE
+  if (wakeEngineReady && !wakeRecognizerPaused) {
+    ESP_SR_M5.pause();
+    wakeRecognizerPaused = true;
+    wakeListening = false;
+  }
+#endif
   if (M5.Mic.isRunning()) M5.Mic.end();
 
   if (!M5.Speaker.isRunning()) {
@@ -1618,6 +2070,9 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_DISCONNECTED:
       gatewayConnected = false;
       Serial.println("[WS] disconnected");
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+      pauseWakeRecognizerForTurn();
+#endif
 #if COMPANION_AUDIO_ENABLE
       if (micStreaming) {
         if (M5.Mic.isRunning()) M5.Mic.end();
@@ -1657,10 +2112,36 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         }
       }
       else if (!strcmp(msgType, "display.sleep")) {
+        const char* commandId = doc["command_id"] | "";
+        displayPolicyCommandId = commandId;
+        displayPolicyTargetSleep = true;
+        displayPolicyAckPending = true;
+
         setNightScreenWindow(true);
+
+        if (displaysSleeping) {
+          sendDisplayPolicyAck("applied");
+          displayPolicyAckPending = false;
+        } else {
+          // The command was received but cannot yet be called "executed".
+          // Typical reason: voice/TTS path is still busy.
+          sendDisplayPolicyAck("pending");
+        }
       }
       else if (!strcmp(msgType, "display.wake")) {
+        const char* commandId = doc["command_id"] | "";
+        displayPolicyCommandId = commandId;
+        displayPolicyTargetSleep = false;
+        displayPolicyAckPending = true;
+
         setNightScreenWindow(false);
+
+        if (!displaysSleeping) {
+          sendDisplayPolicyAck("applied");
+          displayPolicyAckPending = false;
+        } else {
+          sendDisplayPolicyAck("pending");
+        }
       }
       else if (!strcmp(msgType, "assistant.state")) {
         const char* state = doc["state"] | "idle";
@@ -1766,7 +2247,7 @@ static void startWifiAttempt() {
   WiFi.disconnect(false, false);
   WiFi.begin(deviceConfig.wifiSsid.c_str(), deviceConfig.wifiPassword.c_str());
 
-  // A3.7: keep the brownout detector ON and reduce the source of the spike
+  // Keep the brownout detector ON and reduce the source of the spike
   // instead. ESP-IDF uses quarter-dBm units, so 40 = 10 dBm.
   const esp_err_t txPowerResult =
       esp_wifi_set_max_tx_power(static_cast<int8_t>(WIFI_MAX_TX_POWER_QDBM));
@@ -1952,7 +2433,545 @@ static bool transmitPttBuffer() {
   return true;
 }
 
+
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+static void finishPttCapture();
+
+static uint32_t meanAbsLevel(const int16_t* samples, size_t count) {
+  if (!samples || count == 0) return 0;
+
+  uint64_t sum = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const int32_t value = static_cast<int32_t>(samples[i]);
+    sum += static_cast<uint32_t>(value < 0 ? -value : value);
+  }
+  return static_cast<uint32_t>(sum / count);
+}
+
+static uint32_t currentAutoVadThreshold() {
+  const uint32_t adaptive =
+      wakeNoiseFloor > 0
+          ? static_cast<uint32_t>((wakeNoiseFloor * 23u) / 10u)
+          : AUTO_WAKE_MIN_VOICE_LEVEL;
+
+  return adaptive > AUTO_WAKE_MIN_VOICE_LEVEL
+             ? adaptive
+             : AUTO_WAKE_MIN_VOICE_LEVEL;
+}
+
+static void updateWakeNoiseFloor(const int16_t* samples, size_t count) {
+  const uint32_t level = meanAbsLevel(samples, count);
+  if (level == 0) return;
+
+  if (wakeNoiseFloor == 0) {
+    wakeNoiseFloor = level;
+    return;
+  }
+
+  // Avoid learning actual speech as the room noise floor.
+  if (level <= wakeNoiseFloor * 2u) {
+    wakeNoiseFloor = (wakeNoiseFloor * 31u + level) / 32u;
+  }
+}
+
+static void onWakeSrEvent(sr_event_t event, int commandId, int phraseId) {
+  (void)phraseId;
+
+  if (event == SR_EVENT_COMMAND && commandId == 0) {
+    wakeWordDetected = true;
+    return;
+  }
+
+  if (event == SR_EVENT_TIMEOUT && wakeEngineReady) {
+    ESP_SR_M5.setMode(SR_MODE_COMMAND);
+  }
+}
+
+static bool initLocalWakeWordEngine() {
+  Serial.println("[WAKE] ESP-SR init begin language=CN model=mn5q8_cn");
+  ESP_SR_M5.onEvent(onWakeSrEvent);
+
+  if (!ESP_SR_M5.begin(
+          HOMEAI_WAKE_COMMANDS,
+          HOMEAI_WAKE_COMMAND_COUNT,
+          SR_MODE_COMMAND,
+          SR_CHANNELS_MONO)) {
+    Serial.println("[WAKE] ESP-SR Chinese MultiNet init FAILED");
+    return false;
+  }
+
+  ESP_SR_M5.pause();
+  wakeRecognizerPaused = true;
+  wakeEngineReady = true;
+
+  Serial.println("[WAKE] local keyword engine ready: 逐光逐光");
+  return true;
+}
+
+static void pauseWakeRecognizerForTurn() {
+  if (!wakeEngineReady) return;
+
+  if (!wakeRecognizerPaused) {
+    ESP_SR_M5.pause();
+    wakeRecognizerPaused = true;
+  }
+
+  wakeListening = false;
+}
+
+static bool restartWakeMicPath(const char* reason, bool recovery) {
+  if (!wakeEngineReady) return false;
+  if (micStreaming || ttsSequenceActive || ttsReceiveSlot >= 0) return false;
+  if (companionState != CompanionState::Idle) return false;
+  if (M5.Speaker.isRunning()) return false;
+
+  // Canonicalize the half-duplex hardware state instead of trusting only
+  // Mic.isRunning(). A stale running flag with no accepted record blocks is
+  // exactly the failure seen after an ASR-empty wake turn.
+  const bool pauseOk = wakeRecognizerPaused ? true : ESP_SR_M5.pause();
+  wakeRecognizerPaused = true;
+  wakeListening = false;
+
+  const uint32_t settleStarted = millis();
+  while (M5.Mic.isRecording() && millis() - settleStarted < 100) {
+    M5.update();
+    delay(1);
+  }
+  if (M5.Mic.isRunning()) M5.Mic.end();
+  delay(8);
+
+  if (!M5.Mic.begin()) {
+    Serial.printf(
+        "[WAKE-RECOVER] mic begin FAILED reason=%s pause=%u\n",
+        reason ? reason : "unknown",
+        static_cast<unsigned>(pauseOk));
+    return false;
+  }
+  configureStickS3MicInput();
+
+  wakeAcceptedBlocks = 0;
+  wakeFedBlocks = 0;
+  wakeWordDetected = false;
+
+  const bool modeOk = ESP_SR_M5.setMode(SR_MODE_COMMAND);
+  const bool resumeOk = ESP_SR_M5.resume();
+  if (!resumeOk) {
+    Serial.printf(
+        "[WAKE-RECOVER] ESP-SR resume FAILED reason=%s mode=%u\n",
+        reason ? reason : "unknown",
+        static_cast<unsigned>(modeOk));
+    if (M5.Mic.isRunning()) M5.Mic.end();
+    return false;
+  }
+
+  wakeRecognizerPaused = false;
+  wakeListening = true;
+  wakeLastAudioProgressMs = millis();
+
+  if (recovery) {
+    ++wakeRecoveryCount;
+    wakeLastRecoveryMs = wakeLastAudioProgressMs;
+    Serial.printf(
+        "[WAKE-RECOVER] recovered reason=%s count=%u pause=%u mode=%u noiseFloor=%u\n",
+        reason ? reason : "unknown",
+        static_cast<unsigned>(wakeRecoveryCount),
+        static_cast<unsigned>(pauseOk),
+        static_cast<unsigned>(modeOk),
+        static_cast<unsigned>(wakeNoiseFloor));
+  } else {
+    Serial.printf(
+        "[WAKE] listening local-only noiseFloor=%u\n",
+        static_cast<unsigned>(wakeNoiseFloor));
+  }
+  return true;
+}
+
+static bool startWakeListeningIfPossible() {
+#if COMPANION_GATEWAY_ENABLE
+  if (!gatewayConnected) return false;
+#endif
+
+  if (!wakeEngineReady || wakeListening) return wakeListening;
+  return restartWakeMicPath("listen-start", false);
+}
+
+static void updateWakeAudioFeed() {
+  if (!wakeListening || !wakeEngineReady) return;
+  if (micStreaming || companionState != CompanionState::Idle) return;
+
+  const uint32_t now = millis();
+  const uint32_t sequence = wakeAcceptedBlocks;
+  const size_t idx = sequence % AUDIO_MIC_RING_BLOCKS;
+
+  if (M5.Mic.record(
+          wakeRing[idx],
+          AUDIO_MIC_BLOCK_SAMPLES,
+          AUDIO_MIC_SAMPLE_RATE,
+          false)) {
+    ++wakeAcceptedBlocks;
+    wakeLastAudioProgressMs = now;
+
+    // Preserve the two-request safety gap required by the PTT path.
+    if (wakeAcceptedBlocks >= 3) {
+      const uint32_t safeSequence = wakeAcceptedBlocks - 3;
+
+      if (safeSequence >= wakeFedBlocks) {
+        const size_t safeIdx = safeSequence % AUDIO_MIC_RING_BLOCKS;
+
+        updateWakeNoiseFloor(
+            wakeRing[safeIdx],
+            AUDIO_MIC_BLOCK_SAMPLES);
+
+        ESP_SR_M5.feedAudio(
+            wakeRing[safeIdx],
+            AUDIO_MIC_BLOCK_SAMPLES);
+
+        ++wakeFedBlocks;
+        wakeLastAudioProgressMs = now;
+      }
+    }
+    return;
+  }
+
+  // "listening" is not considered healthy unless record/feed blocks keep
+  // moving. Self-heal a stalled M5 Mic/I2S queue after half-duplex turns.
+  if (wakeLastAudioProgressMs != 0 &&
+      now - wakeLastAudioProgressMs >= WAKE_FEED_STALL_MS &&
+      now - wakeLastRecoveryMs >= WAKE_RECOVERY_COOLDOWN_MS) {
+    Serial.printf(
+        "[WAKE-RECOVER] feed stall ms=%u accepted=%u fed=%u micRunning=%u micRecording=%u\n",
+        static_cast<unsigned>(now - wakeLastAudioProgressMs),
+        static_cast<unsigned>(wakeAcceptedBlocks),
+        static_cast<unsigned>(wakeFedBlocks),
+        static_cast<unsigned>(M5.Mic.isRunning()),
+        static_cast<unsigned>(M5.Mic.isRecording()));
+    restartWakeMicPath("feed-stall", true);
+  }
+}
+
+static void resetAutoWakeCaptureState() {
+  autoWakeCaptureActive = false;
+  autoWakeSpeechStarted = false;
+  autoWakePttStartSent = false;
+  autoWakeLongestSilenceMs = 0;
+  autoWakeLastVadLevel = 0;
+  autoWakeVadVoice = false;
+  autoWakeTrimOffsetBytes = 0;
+}
+
+static void cancelAutoWakeCaptureNoSpeech() {
+  if (!autoWakeCaptureActive) return;
+
+  micStreaming = false;
+
+  const uint32_t waitStarted = millis();
+  while (M5.Mic.isRecording() && millis() - waitStarted < 250) {
+    M5.update();
+    delay(1);
+  }
+
+  if (M5.Mic.isRunning()) M5.Mic.end();
+
+  sendJsonEvent("ptt.abort", 0, "wake_word", "no_speech");
+  resetAutoWakeCaptureState();
+  pttCaptureBytes = 0;
+  pttCaptureOverflow = false;
+
+  infoPaused = false;
+  setState(CompanionState::Idle);
+  itemShownSinceMs = millis();
+
+  endGlassVoiceIsolation();
+  drawGlassFrame();
+
+  Serial.println("[WAKE] no command");
+}
+
+static void updateAutoWakeVad(
+    const int16_t* samples,
+    size_t sampleCount) {
+  if (!autoWakeCaptureActive || !samples || sampleCount == 0) return;
+
+  const uint32_t now = millis();
+  const uint32_t level = meanAbsLevel(samples, sampleCount);
+  const uint32_t threshold = currentAutoVadThreshold();
+  autoWakeLastVadLevel = level;
+
+  if (level >= threshold) {
+    if (autoWakeSpeechStarted && !autoWakeVadVoice) {
+      const uint32_t silenceMs = now - autoWakeLastVoiceMs;
+      if (silenceMs > autoWakeLongestSilenceMs) {
+        autoWakeLongestSilenceMs = silenceMs;
+      }
+      Serial.printf(
+          "[VAD] voice-resume level=%u threshold=%u silence=%u\n",
+          static_cast<unsigned>(level),
+          static_cast<unsigned>(threshold),
+          static_cast<unsigned>(silenceMs));
+    }
+
+    autoWakeVadVoice = true;
+    autoWakeLastVoiceMs = now;
+
+    if (!autoWakeSpeechStarted) {
+      autoWakeSpeechStarted = true;
+
+      const size_t prerollBytes =
+          (static_cast<size_t>(AUDIO_MIC_SAMPLE_RATE) * 2u *
+           AUTO_WAKE_PREROLL_MS) /
+          1000u;
+
+      autoWakeTrimOffsetBytes =
+          pttCaptureBytes > prerollBytes
+              ? pttCaptureBytes - prerollBytes
+              : 0;
+
+      Serial.printf(
+          "[WAKE] command speech start level=%u threshold=%u trim=%u\n",
+          static_cast<unsigned>(level),
+          static_cast<unsigned>(threshold),
+          static_cast<unsigned>(autoWakeTrimOffsetBytes));
+    }
+  } else if (autoWakeSpeechStarted) {
+    if (autoWakeVadVoice) {
+      Serial.printf(
+          "[VAD] silence level=%u threshold=%u\n",
+          static_cast<unsigned>(level),
+          static_cast<unsigned>(threshold));
+    }
+    autoWakeVadVoice = false;
+    const uint32_t silenceMs = now - autoWakeLastVoiceMs;
+    if (silenceMs > autoWakeLongestSilenceMs) {
+      autoWakeLongestSilenceMs = silenceMs;
+    }
+  }
+
+  const uint32_t elapsed = now - autoWakeCaptureStartedMs;
+
+  if (!autoWakeSpeechStarted) {
+    if (elapsed >= AUTO_WAKE_WAIT_SPEECH_MS) {
+      cancelAutoWakeCaptureNoSpeech();
+    }
+    return;
+  }
+
+  if (elapsed >= AUTO_WAKE_MIN_CAPTURE_MS &&
+      now - autoWakeLastVoiceMs >= AUTO_WAKE_END_SILENCE_MS) {
+    Serial.printf(
+        "[WAKE] end-of-speech silence=%u ms\n",
+        static_cast<unsigned>(now - autoWakeLastVoiceMs));
+
+    finishPttCapture();
+    return;
+  }
+
+  if (elapsed >= AUTO_WAKE_MAX_CAPTURE_MS) {
+    Serial.printf(
+        "[VAD] timeout level=%u threshold=%u longest=%u\n",
+        static_cast<unsigned>(autoWakeLastVadLevel),
+        static_cast<unsigned>(threshold),
+        static_cast<unsigned>(autoWakeLongestSilenceMs));
+    Serial.println("[WAKE] hands-free capture max duration reached");
+    finishPttCapture();
+  }
+}
+
+static void playLocalWakeAckTone() {
+  // StickS3 ES8311 is half-duplex.  Stop the wake microphone first, play a
+  // tiny local confirmation sound, then let startVoiceCaptureInternal()
+  // restart the microphone.  No Gateway / ASR / OpenClaw / cloud TTS is used.
+  const uint32_t settleStarted = millis();
+  while (M5.Mic.isRecording() && millis() - settleStarted < 80) {
+    M5.update();
+    delay(1);
+  }
+
+  if (M5.Mic.isRunning()) M5.Mic.end();
+
+  // The wake acknowledgement is intentionally much lower-power than normal
+  // TTS.  A full-volume speaker transition immediately after Mic shutdown can
+  // create a sharp rail transient on StickS3 and trigger the brownout detector.
+  // Give the half-duplex audio rail a moment to settle, then use a dedicated
+  // low-power speaker configuration.  Normal TTS restores its validated
+  // AUDIO_SPEAKER_* settings in ensureSpeakerForTts().
+  delay(24);
+
+  if (!M5.Speaker.isRunning()) {
+    auto ackCfg = M5.Speaker.config();
+    ackCfg.magnification = 1;
+    M5.Speaker.config(ackCfg);
+    if (!M5.Speaker.begin()) {
+      Serial.println("[WAKE-ACK] speaker begin failed");
+      return;
+    }
+  }
+
+  M5.Speaker.setVolume(80);
+  M5.Speaker.setAllChannelVolume(96);
+  delay(12);
+
+  // Short rising two-note acknowledgement.  It is deliberately compact so
+  // the wake-to-command gap remains small and firmware flash cost stays tiny.
+  const bool tone1 = M5.Speaker.tone(1047.0f, 65, -1, true);
+  delay(78);
+  const bool tone2 = M5.Speaker.tone(1319.0f, 80, -1, true);
+  delay(96);
+
+  M5.Speaker.stop();
+  M5.Speaker.end();
+
+  Serial.printf(
+      "[WAKE-ACK] local confirm tone played tone1=%u tone2=%u ms=%u\n",
+      static_cast<unsigned>(tone1),
+      static_cast<unsigned>(tone2),
+      static_cast<unsigned>(millis()));
+}
+
+static bool startVoiceCaptureInternal(bool wakeInitiated) {
+#if COMPANION_GATEWAY_ENABLE
+  if (!gatewayConnected) return false;
+#endif
+
+  if (micStreaming || ttsSequenceActive || ttsReceiveSlot >= 0) return false;
+
+  if (companionState == CompanionState::Thinking ||
+      companionState == CompanionState::Speaking) {
+    return false;
+  }
+
+  diagCheckpoint(CP_PTT_ENTER, true);
+  pauseWakeRecognizerForTurn();
+
+  beginGlassVoiceIsolation();
+  diagCheckpoint(CP_PTT_ISOLATION_DONE, true);
+
+  if (M5.Speaker.isRunning()) {
+    M5.Speaker.stop();
+    M5.Speaker.end();
+  }
+
+  if (!wakeInitiated) {
+    if (M5.Mic.isRunning()) M5.Mic.end();
+  } else {
+    // Give the user an immediate local acknowledgement before opening the
+    // hands-free command window.  The 3.5 s speech-start timer is armed only
+    // after this function returns and the microphone is running again.
+    playLocalWakeAckTone();
+  }
+
+  diagCheckpoint(CP_PTT_AUDIO_IDLE, true);
+
+  if (!M5.Mic.isRunning()) {
+    diagCheckpoint(CP_MIC_BEGIN_PRE, true);
+
+    if (!M5.Mic.begin()) {
+      Serial.println("[AUDIO] M5.Mic.begin failed");
+      setState(CompanionState::Error);
+      endGlassVoiceIsolation();
+      return false;
+    }
+
+    diagCheckpoint(CP_MIC_BEGIN_OK, true);
+    configureStickS3MicInput();
+    diagCheckpoint(CP_MIC_CODEC_OK, true);
+  }
+
+  if (!ensurePttCaptureBuffer()) {
+    if (M5.Mic.isRunning()) M5.Mic.end();
+
+    setState(CompanionState::Error);
+    endGlassVoiceIsolation();
+    return false;
+  }
+
+  micAcceptedBlocks = 0;
+  micBufferedBlocks = 0;
+  pttCaptureBytes = 0;
+  pttCaptureOverflow = false;
+  pttStartedMs = millis();
+
+  micStreaming = true;
+  infoPaused = true;
+
+  autoWakeCaptureActive = wakeInitiated;
+  autoWakeSpeechStarted = false;
+  autoWakePttStartSent = false;
+  autoWakeCaptureStartedMs = millis();
+  autoWakeLastVoiceMs = autoWakeCaptureStartedMs;
+  autoWakeLongestSilenceMs = 0;
+  autoWakeLastVadLevel = 0;
+  autoWakeVadVoice = false;
+  autoWakeTrimOffsetBytes = 0;
+
+  if (wakeInitiated) {
+    wakeDisplaysForActivity();
+  }
+
+  drawGlassFrame();
+  setState(CompanionState::Listening);
+
+  if (!wakeInitiated) {
+    // Manual PTT retains the existing protocol behavior.
+    diagCheckpoint(CP_PTT_EVENT_PRE, true);
+    sendJsonEvent("ptt.start", 0, "button_a");
+    diagCheckpoint(CP_PTT_RUNNING, true);
+    Serial.println("[TRG] button_a");
+  } else {
+    // Hands-free wake keeps all network audio work out of the active mic
+    // window. ptt.start will be sent only after Mic/I2S stops.
+    Serial.println("[WAKE] capture start");
+  }
+
+  return true;
+}
+
+static bool startAutoCaptureFromWake() {
+  wakeWordDetected = false;
+  Serial.println("[TRG] wake_word");
+
+  if (!startVoiceCaptureInternal(true)) {
+    Serial.println("[WAKE] wake capture could not start");
+    return false;
+  }
+
+  return true;
+}
+
+static void updateWakeWordSystem() {
+  if (!wakeEngineReady) return;
+
+  // Event callbacks only set a flag. Product-state changes happen here.
+  if (wakeWordDetected &&
+      wakeListening &&
+      companionState == CompanionState::Idle) {
+    if (!startAutoCaptureFromWake()) {
+      wakeWordDetected = false;
+    }
+    return;
+  }
+
+  if (micStreaming ||
+      ttsSequenceActive ||
+      ttsReceiveSlot >= 0 ||
+      companionState != CompanionState::Idle) {
+    if (wakeListening) {
+      pauseWakeRecognizerForTurn();
+    }
+    return;
+  }
+
+  if (!wakeListening) {
+    startWakeListeningIfPossible();
+  }
+
+  updateWakeAudioFeed();
+}
+#endif  // COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+
 static bool startPttCapture() {
+#if HOMEAI_WAKEWORD_ENABLE
+  return startVoiceCaptureInternal(false);
+#else
   if (!gatewayConnected || micStreaming || ttsSequenceActive || ttsReceiveSlot >= 0) return false;
   diagCheckpoint(CP_PTT_ENTER, true);
   if (companionState == CompanionState::Thinking || companionState == CompanionState::Speaking) return false;
@@ -1996,10 +3015,11 @@ static bool startPttCapture() {
   drawGlassFrame();
   setState(CompanionState::Listening);
   diagCheckpoint(CP_PTT_EVENT_PRE, true);
-  sendJsonEvent("ptt.start");
+  sendJsonEvent("ptt.start", 0, "button_a");
   diagCheckpoint(CP_PTT_RUNNING, true);
-  Serial.println("[AUDIO] PTT start");
+  Serial.println("[TRG] button_a");
   return true;
+#endif
 }
 
 static void finishPttCapture() {
@@ -2008,7 +3028,7 @@ static void finishPttCapture() {
   micStreaming = false;
 
   // Let M5Unified's outstanding mic queue complete WITHOUT servicing the
-  // WebSocket. A3.7 intentionally keeps RF application traffic out of the
+  // WebSocket. RF application traffic stays out of the
   // active capture window.
   const uint32_t waitStarted = millis();
   while (M5.Mic.isRecording() && millis() - waitStarted < 250) {
@@ -2027,24 +3047,78 @@ static void finishPttCapture() {
   }
   diagCheckpoint(CP_MIC_FLUSH_DONE, true);
 
+#if HOMEAI_WAKEWORD_ENABLE
+  if (autoWakeCaptureActive &&
+      autoWakeTrimOffsetBytes > 0 &&
+      autoWakeTrimOffsetBytes < pttCaptureBytes) {
+    const size_t remaining =
+        pttCaptureBytes - autoWakeTrimOffsetBytes;
+
+    memmove(
+        pttCaptureBuffer,
+        pttCaptureBuffer + autoWakeTrimOffsetBytes,
+        remaining);
+
+    pttCaptureBytes = remaining;
+
+    Serial.printf(
+        "[WAKE] trimmed leading silence bytes=%u\n",
+        static_cast<unsigned>(pttCaptureBytes));
+  }
+#endif
+
   if (pttCaptureOverflow || pttCaptureBytes == 0) {
-    Serial.println("[AUDIO] invalid PTT capture buffer; aborting turn");
-    sendJsonEvent("ptt.stop", 0);
+    const char* trigger = "button_a";
+#if HOMEAI_WAKEWORD_ENABLE
+    if (autoWakeCaptureActive) trigger = "wake_word";
+#endif
+    const char* reason = pttCaptureOverflow ? "buffer_overflow" : "empty";
+    Serial.printf("[AUDIO] PTT abort trigger=%s reason=%s bytes=%u\n",
+                  trigger, reason, static_cast<unsigned>(pttCaptureBytes));
+    sendJsonEvent("ptt.abort", 0, trigger, reason);
+#if HOMEAI_WAKEWORD_ENABLE
+    resetAutoWakeCaptureState();
+#endif
     setState(CompanionState::Error);
     endGlassVoiceIsolation();
     return;
   }
 
   // Important: the radio upload now happens only after Mic/I2S is fully off.
+#if HOMEAI_WAKEWORD_ENABLE
+  if (autoWakeCaptureActive && !autoWakePttStartSent) {
+    diagCheckpoint(CP_PTT_EVENT_PRE, true);
+    sendJsonEvent("ptt.start", 0, "wake_word");
+    autoWakePttStartSent = true;
+    diagCheckpoint(CP_PTT_RUNNING, true);
+  }
+#endif
+
   if (!transmitPttBuffer()) {
-    sendJsonEvent("ptt.stop", 0);
+    const char* trigger = "button_a";
+#if HOMEAI_WAKEWORD_ENABLE
+    if (autoWakeCaptureActive) trigger = "wake_word";
+#endif
+    sendJsonEvent("ptt.abort", 0, trigger, "tx_failed");
+#if HOMEAI_WAKEWORD_ENABLE
+    resetAutoWakeCaptureState();
+#endif
     setState(CompanionState::Error);
     endGlassVoiceIsolation();
     return;
   }
 
-  sendJsonEvent("ptt.stop", pttCaptureBytes);
+  const char* stopTrigger = "button_a";
+#if HOMEAI_WAKEWORD_ENABLE
+  if (autoWakeCaptureActive) stopTrigger = "wake_word";
+#endif
+  sendJsonEvent("ptt.stop", pttCaptureBytes, stopTrigger);
   diagCheckpoint(CP_PTT_STOP_SENT, true);
+
+#if HOMEAI_WAKEWORD_ENABLE
+  resetAutoWakeCaptureState();
+#endif
+
   setState(CompanionState::Thinking);
   Serial.printf("[AUDIO] PTT stop blocks=%u buffered=%u bytes=%u\n",
                 static_cast<unsigned>(micAcceptedBlocks),
@@ -2055,6 +3129,28 @@ static void finishPttCapture() {
 static void updateMicStreaming() {
   if (!micStreaming) return;
 
+  const uint32_t now = millis();
+#if HOMEAI_WAKEWORD_ENABLE
+  if (autoWakeCaptureActive) {
+    if (now - autoWakeCaptureStartedMs >= AUTO_WAKE_MAX_CAPTURE_MS) {
+      const uint32_t threshold = currentAutoVadThreshold();
+      Serial.printf(
+          "[VAD] timeout level=%u threshold=%u longest=%u\n",
+          static_cast<unsigned>(autoWakeLastVadLevel),
+          static_cast<unsigned>(threshold),
+          static_cast<unsigned>(autoWakeLongestSilenceMs));
+      Serial.println("[WAKE] max capture reached");
+      finishPttCapture();
+      return;
+    }
+  } else
+#endif
+  if (now - pttStartedMs >= AUDIO_MAX_PTT_MS) {
+    Serial.println("[AUDIO] max PTT duration reached");
+    finishPttCapture();
+    return;
+  }
+
   const uint32_t sequence = micAcceptedBlocks;
   const size_t idx = sequence % AUDIO_MIC_RING_BLOCKS;
   diagCheckpoint(CP_MIC_RECORD_PRE, false, sequence);
@@ -2063,17 +3159,6 @@ static void updateMicStreaming() {
     diagCheckpoint(CP_MIC_RECORD_OK, false, sequence);
     diagCheckpoint(CP_PTT_RUNNING, false, sequence);
 
-    if ((micAcceptedBlocks % 25u) == 0u) {
-      Serial.printf(
-          "[MEM] blocks=%u heap=%u min=%u psram=%u internal=%u largestInt=%u dma=%u\n",
-          static_cast<unsigned>(micAcceptedBlocks),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
-          static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
-          static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)));
-    }
 
     // M5Unified's official mic example keeps a two-buffer gap before consuming
     // recorded data. Preserve that rule, but copy the stable block to PSRAM
@@ -2082,16 +3167,25 @@ static void updateMicStreaming() {
       const uint32_t safeSequence = micAcceptedBlocks - 3;
       if (safeSequence >= micBufferedBlocks) {
         if (bufferMicBlock(safeSequence)) {
+#if HOMEAI_WAKEWORD_ENABLE
+          if (autoWakeCaptureActive) {
+            const size_t safeIdx =
+                safeSequence % AUDIO_MIC_RING_BLOCKS;
+
+            updateAutoWakeVad(
+                micRing[safeIdx],
+                AUDIO_MIC_BLOCK_SAMPLES);
+
+            // VAD may have ended or cancelled capture.
+            if (!micStreaming) return;
+          }
+#endif
           ++micBufferedBlocks;
         }
       }
     }
   }
 
-  if (millis() - pttStartedMs >= AUDIO_MAX_PTT_MS) {
-    Serial.println("[AUDIO] max PTT duration reached");
-    finishPttCapture();
-  }
 }
 #else
 static bool startPttCapture() { return false; }
@@ -2108,7 +3202,7 @@ static void onPttStart() {
   drawGlassFrame();
   setState(CompanionState::Listening);
 #if COMPANION_GATEWAY_ENABLE
-  sendJsonEvent("ptt.start");
+  sendJsonEvent("ptt.start", 0, "button_a");
 #endif
 #endif
 }
@@ -2118,7 +3212,7 @@ static void onPttStop() {
   finishPttCapture();
 #else
 #if COMPANION_GATEWAY_ENABLE
-  sendJsonEvent("ptt.stop");
+  sendJsonEvent("ptt.stop", 0, "button_a");
 #endif
   setState(CompanionState::Thinking);
 #endif
@@ -2186,7 +3280,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== HomeAIAgent P0-A4.2 THREE-LINE + NIGHT SCREEN + A3.9 GAPLESS ===");
+  Serial.println("=== HomeAIAgent A4.5 Cyber Expression A2 Flicker-Free / base A4.4.18 RC1R9 ===");
 
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -2224,6 +3318,12 @@ void setup() {
                 static_cast<unsigned>(AUDIO_MIC_NOISE_FILTER_LEVEL),
                 static_cast<unsigned>(AUDIO_SPEAKER_VOLUME),
                 static_cast<unsigned>(AUDIO_SPEAKER_MAGNIFICATION));
+
+#if HOMEAI_WAKEWORD_ENABLE
+  if (!initLocalWakeWordEngine()) {
+    Serial.println("[WAKE] local wake word disabled due to init failure");
+  }
+#endif
 #endif
 
   // Glass2 is powered only after StickS3 itself has initialized successfully.
@@ -2237,13 +3337,13 @@ void setup() {
 
   // External Glass2 bus: G9 SDA / G10 SCL, address 0x3C.
   if (initGlass2AfterPowerOn()) {
-    Serial.println("[P0-A4.2] Glass2 ready");
+    Serial.println("[P0-A4.3.1] Glass2 ready");
   } else {
-    Serial.println("[P0-A4.2] Glass2 init FAILED");
+    Serial.println("[P0-A4.3.1] Glass2 init FAILED");
     setState(CompanionState::Error);
   }
 
-  // A2.6 hardware test found NORMAL/FREEZE/POWER_OFF acoustically equivalent.
+  // Hardware tests found NORMAL/FREEZE/POWER_OFF acoustically equivalent.
   // Return the product UI to normal; reset diagnostics remain enabled.
   glassDiagMode = GlassAudioDiagMode::Normal;
   Serial.println("[GLASS] isolation test closed; normal display mode restored");
@@ -2263,7 +3363,7 @@ void loop() {
   updateNetworkManager();
   if (webSocketStarted && wifiOnline) {
 #if COMPANION_AUDIO_ENABLE
-    // A3.7: no application-level WebSocket servicing during Mic/I2S capture.
+    // Do not service application-level WebSocket traffic during Mic/I2S capture.
     // The Wi-Fi link remains associated; queued socket work resumes immediately
     // after the microphone is stopped.
     if (!micStreaming) webSocket.loop();
@@ -2273,6 +3373,9 @@ void loop() {
   }
 #endif
 
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+  updateWakeWordSystem();
+#endif
   updateButtons();
   updateMicStreaming();
   updateTtsPlayback();
@@ -2280,15 +3383,9 @@ void loop() {
   updateInfoCycle();
   updateNightScreenSaver();
 
-  static CompanionState lastDrawnState = static_cast<CompanionState>(255);
-  static bool lastDrawnBlink = false;
-  const bool animationChanged = updateIdleAnimation();
-
-  if (lastDrawnState != companionState || animationChanged || lastDrawnBlink != idleBlink) {
-    drawMascotFace(companionState, idleBlink);
-    lastDrawnState = companionState;
-    lastDrawnBlink = idleBlink;
-  }
+  // Flicker-free cyber expression uses one off-screen RGB565 canvas.
+  // Its internal state-dependent frame cap protects Mic/I2S and gapless TTS.
+  updateCyberExpression();
 
   delay(4);
 }

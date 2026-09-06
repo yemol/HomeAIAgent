@@ -1,6 +1,6 @@
 #pragma once
 
-// HomeAIAgent P0-A3.1: edit these values before flashing.
+// Compile-time placeholders for unprovisioned development builds.
 #define WIFI_SSID "YOUR_WIFI"
 #define WIFI_PASSWORD "YOUR_PASSWORD"
 

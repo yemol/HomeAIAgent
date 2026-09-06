@@ -1,4 +1,4 @@
-# HomeAIAgent / OpenClaw Info Skill Interface v1.1 FINAL
+# HomeAIAgent / OpenClaw Info Skill Interface v1.1
 
 协议版本保持：
 
@@ -272,7 +272,7 @@ Glass2 单条停留：10 秒
 
 分类字号：12px
 正文字号：11px
-正文位置：沿用 A4.0.3 实机确认布局
+正文位置：沿用当前实机确认布局
 ```
 
 Skill 不负责设备显示和 10 秒计时。
@@ -314,4 +314,4 @@ PTT 时冻结当前资讯
 显示
 ```
 
-A3.9 Gapless TTS 与语音链不属于本接口，不修改。
+Gapless TTS 与语音链不属于本接口，不在此协议中修改。

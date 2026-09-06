@@ -7,7 +7,7 @@ source ./homeai_runtime.sh
 
 echo
 echo "========================================================"
-echo " HomeAIAgent P0-A3.10 | Persistent Config + Runtime"
+echo " HomeAIAgent Gateway | Persistent Config + Runtime"
 echo "========================================================"
 echo " Config : $HOMEAI_CONFIG_FILE"
 echo " Runtime: $HOMEAI_VENV"
