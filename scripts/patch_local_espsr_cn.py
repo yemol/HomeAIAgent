@@ -4,7 +4,7 @@ from pathlib import Path
 import shutil
 
 PROJECT = Path(env["PROJECT_DIR"])
-print("[ESP-SR-CN] patcher=A4.4.13 ESPSR-SYMLINK")
+print("[ESP-SR-CN] patcher=A4.5-A3R9 WAKE-RECOVERY")
 TARGET = PROJECT / ".pio-local" / "ESP-SR-For-M5Unified" / "src" / "esp32-hal-sr-m5.c"
 BACKUP = TARGET.with_name(TARGET.name + ".homeai-a4.4.12.prepatch")
 CN_MARKER = "HOMEAI_A4_4_10_MULTINET_CN"
@@ -176,6 +176,26 @@ if not TARGET.is_file():
     )
 
 text = TARGET.read_text(encoding="utf-8")
+
+# A4.5 A3R9 recovery migration. A3R8 injected an explicit MultiNet
+# candidate threshold into the persistent .pio-local wrapper. The stable
+# A3R7 path never overrode MultiNet's model/default threshold. Remove only
+# the A3R8 block if it is present; never replace or delete .pio-local.
+A3R8_THRESHOLD_MARKER = "HOMEAI_A4_5_WAKE_CANDIDATE_THRESHOLD"
+if A3R8_THRESHOLD_MARKER in text:
+    threshold_start_token = "    /* HOMEAI_A4_5_WAKE_CANDIDATE_THRESHOLD"
+    threshold_start = require_once(text, threshold_start_token, "A3R8-threshold-start")
+    threshold_end = text.find(ADD_COMMANDS_ANCHOR, threshold_start)
+    if threshold_end < 0:
+        raise RuntimeError("[ESP-SR-CN] A3R8 threshold block end anchor not found; refusing unsafe edit")
+    text = text[:threshold_start] + text[threshold_end:]
+    TARGET.write_text(text, encoding="utf-8")
+    print("[ESP-SR-CN] A3R9 removed A3R8 candidate-threshold override; MultiNet default restored")
+else:
+    print("[ESP-SR-CN] A3R9 candidate-threshold override absent; MultiNet default unchanged")
+
+if A3R8_THRESHOLD_MARKER in TARGET.read_text(encoding="utf-8"):
+    raise RuntimeError("[ESP-SR-CN] A3R9 recovery validation failed: threshold override still present")
 
 if GUARD_MARKER in text:
     validate(text)

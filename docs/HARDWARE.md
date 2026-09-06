@@ -30,7 +30,7 @@ Current production audio settings remain frozen in the firmware configuration.
 
 ### StickS3 LCD
 
-Primary interaction/state display. Current baseline uses the A4.5 Cyber Expression A2 renderer rather than the earlier digital-pet face.
+Primary interaction/state display. Current candidate uses the A4.5 Cyber Expression A3R1 renderer, built on the verified A2 flicker-free path rather than the earlier digital-pet face.
 
 ### Glass2
 
@@ -40,7 +40,7 @@ Transparent information display for the pre-rendered game/finance feed and botto
 
 After flashing the current baseline:
 
-1. StickS3 boots and prints the A4.5 A2 banner.
+1. StickS3 boots and prints the A4.5 A3R4 PCM-Synced Voice Wave banner.
 2. The cyber expression appears without full-screen flicker.
 3. Glass2 initializes and displays an information frame.
 4. Button A enters Listening and the voice path completes through Thinking/Speaking.

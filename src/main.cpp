@@ -306,6 +306,7 @@ struct TtsSlot {
   uint32_t sampleRate = 16000;
   uint16_t segmentIndex = 0;
   uint16_t segmentTotal = 0;
+  uint32_t playbackStartedMs = 0;
   bool receiving = false;
 };
 
@@ -316,6 +317,62 @@ static int8_t ttsNextSlot = -1;
 static size_t ttsLastQueueDepth = 0;
 static bool ttsSequenceActive = false;
 static constexpr uint8_t kTtsSpeakerChannel = 0;
+
+// Read a very small trailing window from the PCM buffer that M5Unified is
+// already playing.  This makes Speaking react to the actual synthesized voice
+// without opening the microphone, adding another audio device, or running a
+// full-buffer analysis pass on the gapless TTS path.
+static float ttsPcmVisualLevelAt(uint32_t now) {
+  if (!ttsSequenceActive || ttsCurrentSlot < 0 || ttsCurrentSlot >= 2) return 0.0f;
+
+  const TtsSlot& slot = ttsSlots[ttsCurrentSlot];
+  if (!slot.data || slot.receivedBytes < sizeof(int16_t) ||
+      slot.sampleRate == 0 || slot.playbackStartedMs == 0) {
+    return 0.0f;
+  }
+
+  const size_t totalSamples = slot.receivedBytes / sizeof(int16_t);
+  const uint32_t elapsedMs = now - slot.playbackStartedMs;
+  size_t currentSample = static_cast<size_t>(
+      (static_cast<uint64_t>(elapsedMs) * slot.sampleRate) / 1000ULL);
+  if (currentSample >= totalSamples) currentSample = totalSamples - 1;
+
+  // A trailing ~90 ms window follows syllables and pauses closely while still
+  // looking stable at the ~24 FPS Speaking display cadence.
+  const size_t windowSamples = static_cast<size_t>(
+      (static_cast<uint64_t>(slot.sampleRate) * 90ULL) / 1000ULL);
+  const size_t startSample = currentSample > windowSamples
+                                 ? currentSample - windowSamples
+                                 : 0;
+  const int16_t* pcm = reinterpret_cast<const int16_t*>(slot.data);
+
+  uint64_t sumSq = 0;
+  uint32_t peak = 0;
+  size_t count = 0;
+
+  // Every second sample is enough for a UI envelope and keeps PSRAM traffic
+  // tiny compared with the canvas transfer itself.
+  for (size_t i = startSample; i <= currentSample; i += 2) {
+    const int32_t v = static_cast<int32_t>(pcm[i]);
+    const uint32_t a = static_cast<uint32_t>(v < 0 ? -v : v);
+    sumSq += static_cast<uint64_t>(a) * static_cast<uint64_t>(a);
+    if (a > peak) peak = a;
+    ++count;
+  }
+
+  if (!count) return 0.0f;
+
+  const float rms = sqrtf(static_cast<float>(sumSq / count)) / 32768.0f;
+  const float peakNorm = static_cast<float>(peak) / 32768.0f;
+  const float energy = rms * 0.82f + peakNorm * 0.18f;
+
+  // Remove digital near-silence, then apply gentle compression so ordinary
+  // syllables remain visible without flattening genuine loud/quiet changes.
+  float level = (energy - 0.004f) / 0.220f;
+  if (level <= 0.0f) return 0.0f;
+  if (level >= 1.0f) return 1.0f;
+  return powf(level, 0.78f);
+}
 
 #if HOMEAI_WAKEWORD_ENABLE
 // Local wake-word path.
@@ -643,6 +700,9 @@ static const char* stateLabel(CompanionState state) {
 static uint32_t cyberLastFrameMs = 0;
 static float cyberAudioLevel = 0.0f;
 static float cyberSmoothedAudio = 0.0f;
+static constexpr size_t kCyberVoiceHistoryCount = 8;
+static float cyberVoiceHistory[kCyberVoiceHistoryCount] = {};
+static CompanionState cyberPreviousState = CompanionState::Idle;
 
 // Full-frame off-screen renderer.
 // All cyber UI primitives are drawn into this RGB565 canvas first, then the
@@ -799,16 +859,249 @@ static void cyberDrawOrbitBase(M5Canvas& d, int cx, int cy, uint32_t now, float 
   }
 }
 
-static void cyberDrawWaveCluster(M5Canvas& d, int x0, int cy, int direction,
-                                 float intensity, uint32_t now,
-                                 uint16_t primary, uint16_t secondary) {
-  constexpr int bars = 6;
-  const float phase = now * 0.012f;
-  for (int i = 0; i < bars; ++i) {
-    const float local = 0.35f + 0.65f * fabsf(sinf(phase + i * 0.78f));
-    const int barH = 3 + static_cast<int>(intensity * local * (7 + i));
-    const int x = x0 + direction * i * 3;
-    d.drawFastVLine(x, cy - barH / 2, barH, i < 2 ? primary : secondary);
+static void cyberDrawRadialVoiceWave(M5Canvas& d, int cx, int cy, int direction,
+                                      float intensity, uint32_t now,
+                                      uint16_t primary, uint16_t secondary) {
+  // Speaking has one acoustic origin: the central CORE.  Draw a travelling
+  // waveform from just outside the core toward the display edge instead of
+  // two independent equalizer clusters.  Distance from the core determines
+  // phase, so left and right sides read as one symmetric outward emission.
+  constexpr int startR = 16;
+  constexpr int endR = 61;
+  constexpr float kPi = 3.14159265358979323846f;
+  const float timePhase = now * 0.0065f;
+
+  int prevX = cx + direction * startR;
+  int prevY = cy;
+  int prevGhostY = cy;
+
+  for (int r = startR + 2; r <= endR; r += 2) {
+    const float u = static_cast<float>(r - startR) /
+                    static_cast<float>(endR - startR);
+
+    // Distance from the CORE also maps to recent voice history: the newest
+    // syllable lives near the source and older energy has propagated farther
+    // toward the edge. This makes the contour itself follow speech content.
+    const float historyPos = u * static_cast<float>(kCyberVoiceHistoryCount - 1);
+    const size_t historyIndex = static_cast<size_t>(historyPos);
+    const size_t historyNext = historyIndex + 1 < kCyberVoiceHistoryCount
+                                   ? historyIndex + 1
+                                   : historyIndex;
+    const float historyMix = historyPos - static_cast<float>(historyIndex);
+    const float propagatedEnergy =
+        cyberVoiceHistory[historyIndex] * (1.0f - historyMix) +
+        cyberVoiceHistory[historyNext] * historyMix;
+
+    // Small at the source, largest through the middle field, then gently
+    // taper near the bezel so the motion looks emitted rather than clipped.
+    const float envelope = 0.28f + 0.72f * sinf(kPi * u);
+    const float localIntensity = cyberClamp01(0.18f * intensity + 0.82f * propagatedEnergy);
+    const float amplitude = 0.8f + localIntensity * (18.5f * envelope);
+    const float wavePhase = (r - startR) * 0.31f - timePhase;
+    const float ghostPhase = wavePhase - 0.70f;
+
+    const int x = cx + direction * r;
+    const int y = cy + static_cast<int>(sinf(wavePhase) * amplitude);
+    const int ghostY = cy + static_cast<int>(sinf(ghostPhase) * amplitude * 0.58f);
+
+    d.drawLine(prevX, prevGhostY, x, ghostY, rgb565(4, 55, 103));
+    d.drawLine(prevX, prevY, x, y, secondary);
+    d.drawLine(prevX, prevY - 1, x, y - 1, primary);
+
+    prevX = x;
+    prevY = y;
+    prevGhostY = ghostY;
+  }
+
+  // One moving packet marker makes the propagation direction legible even in
+  // peripheral vision at the ~24 FPS TTS cadence.
+  if (intensity > 0.08f) {
+    const float packetPhase = fmodf(now * 0.020f, static_cast<float>(endR - startR));
+    const int packetR = startR + static_cast<int>(packetPhase);
+    const float packetU = static_cast<float>(packetR - startR) /
+                          static_cast<float>(endR - startR);
+    const float packetEnvelope = 0.28f + 0.72f * sinf(kPi * packetU);
+    const float packetHistoryPos = packetU * static_cast<float>(kCyberVoiceHistoryCount - 1);
+    const size_t packetHistoryIndex = static_cast<size_t>(packetHistoryPos);
+    const float packetEnergy = cyberVoiceHistory[packetHistoryIndex];
+    const float packetAmp = 0.8f + packetEnergy * (18.5f * packetEnvelope);
+    const float packetWave = (packetR - startR) * 0.31f - timePhase;
+    const int packetX = cx + direction * packetR;
+    const int packetY = cy + static_cast<int>(sinf(packetWave) * packetAmp);
+    d.fillCircle(packetX, packetY, 2, primary);
+  }
+}
+
+static void cyberDrawChevron(M5Canvas& d, int x, int cy, int direction,
+                             uint16_t color, int size = 4) {
+  const int tipX = x + direction * size;
+  d.drawLine(x, cy - size, tipX, cy, color);
+  d.drawLine(x, cy + size, tipX, cy, color);
+}
+
+static void cyberDrawWake(M5Canvas& d, int cx, int cy, uint32_t elapsedMs) {
+  const float coreT = cyberEaseOutCubic(elapsedMs / 180.0f);
+  const float visorT = cyberEaseOutCubic((static_cast<float>(elapsedMs) - 70.0f) / 280.0f);
+  const float orbitT = cyberEaseOutCubic((static_cast<float>(elapsedMs) - 210.0f) / 300.0f);
+  const float settleT = cyberEaseOutCubic((static_cast<float>(elapsedMs) - 360.0f) / 200.0f);
+
+  const uint16_t bright = rgb565(117, 232, 255);
+  const uint16_t mid = rgb565(41, 154, 232);
+  const uint16_t dim = rgb565(5, 50, 95);
+
+  // End the wake animation on the same basic pose used by Listening.  The A3
+  // wake used to finish wider/brighter than Listening, which created a small
+  // but visible snap on the first normal Listening frame.
+  const int visorHalf = 20 + static_cast<int>(21.0f * visorT);
+  const float ignitionPulse = 0.18f + coreT * 0.66f;
+  const float corePulse = ignitionPulse + (0.50f - ignitionPulse) * settleT;
+  cyberDrawVisor(d, cx, cy, visorHalf, mid, rgb565(0, 29, 63));
+  cyberDrawCore(d, cx, cy, corePulse, bright);
+
+  if (orbitT > 0.01f) {
+    const float sweepA = 18.0f + 48.0f * orbitT;
+    const float sweepB = 10.0f + 30.0f * orbitT;
+    cyberDrawRotArc(d, cx, cy, 34, 2, 206, sweepA, rgb565(11, 91, 157));
+    cyberDrawRotArc(d, cx, cy, 34, 2, 26, sweepA, rgb565(11, 91, 157));
+    cyberDrawRotArc(d, cx, cy, 43, 2, 303, sweepB, dim);
+    cyberDrawRotArc(d, cx, cy, 43, 2, 123, sweepB, dim);
+
+    if (orbitT > 0.55f) {
+      cyberDrawDotPolar(d, cx, cy, 42, 315, 1, bright);
+      cyberDrawDotPolar(d, cx, cy, 42, 135, 1, bright);
+    }
+  }
+}
+
+struct CyberTransitionPose {
+  float visorHalf;
+  float corePulse;
+  float orbitEnergy;
+  uint16_t accent;
+  uint16_t glow;
+};
+
+static uint16_t cyberLerp565(uint16_t a, uint16_t b, float t) {
+  t = cyberClamp01(t);
+  const int ar = (a >> 11) & 0x1F;
+  const int ag = (a >> 5) & 0x3F;
+  const int ab = a & 0x1F;
+  const int br = (b >> 11) & 0x1F;
+  const int bg = (b >> 5) & 0x3F;
+  const int bb = b & 0x1F;
+  const int rr = ar + static_cast<int>((br - ar) * t);
+  const int rg = ag + static_cast<int>((bg - ag) * t);
+  const int rb = ab + static_cast<int>((bb - ab) * t);
+  return static_cast<uint16_t>((rr << 11) | (rg << 5) | rb);
+}
+
+static CyberTransitionPose cyberPoseForState(CompanionState state) {
+  switch (state) {
+    case CompanionState::Listening:
+      return {41.0f, 0.50f, 0.62f, rgb565(41, 154, 232), rgb565(0, 32, 69)};
+    case CompanionState::Thinking:
+      return {36.0f, 0.54f, 1.00f, rgb565(30, 118, 203), rgb565(0, 24, 58)};
+    case CompanionState::Speaking:
+      return {47.0f, 0.60f, 0.70f, rgb565(50, 174, 239), rgb565(0, 33, 72)};
+    case CompanionState::Success:
+      return {42.0f, 0.58f, 0.72f, rgb565(99, 238, 218), rgb565(0, 38, 48)};
+    case CompanionState::Error:
+      return {44.0f, 0.36f, 0.35f, rgb565(255, 73, 91), rgb565(48, 0, 8)};
+    case CompanionState::Idle:
+    default:
+      return {44.0f, 0.24f, 0.16f, rgb565(27, 118, 199), rgb565(0, 19, 47)};
+  }
+}
+
+static constexpr uint32_t kCyberMorphMs = 220U;
+
+static void cyberDrawStateMorph(M5Canvas& d, int cx, int cy,
+                                CompanionState from, CompanionState to,
+                                uint32_t now, uint32_t elapsedMs) {
+  const float rawT = cyberClamp01(static_cast<float>(elapsedMs) /
+                                  static_cast<float>(kCyberMorphMs));
+  // Smoothstep keeps velocity continuous at both ends of the morph, avoiding
+  // the quick-start/slow-stop feel of the previous ease-out curve.
+  const float t = rawT * rawT * (3.0f - 2.0f * rawT);
+  const CyberTransitionPose a = cyberPoseForState(from);
+  const CyberTransitionPose b = cyberPoseForState(to);
+
+  const int visorHalf = static_cast<int>(a.visorHalf + (b.visorHalf - a.visorHalf) * t);
+  const float corePulse = a.corePulse + (b.corePulse - a.corePulse) * t;
+  const float orbitEnergy = a.orbitEnergy + (b.orbitEnergy - a.orbitEnergy) * t;
+  const uint16_t accent = cyberLerp565(a.accent, b.accent, t);
+  const uint16_t glow = cyberLerp565(a.glow, b.glow, t);
+
+  // Keep the shared CORE/VISOR/orbit geometry moving throughout the short
+  // morph.  The outgoing and incoming state-specific motion is layered below,
+  // so a state change never reads as a static calibration pause.
+  cyberDrawOrbitBase(d, cx, cy, now, orbitEnergy,
+                     cyberLerp565(rgb565(7, 78, 137), accent, 0.35f));
+  cyberDrawVisor(d, cx, cy, visorHalf, accent, glow);
+  cyberDrawCore(d, cx, cy, corePulse,
+                cyberLerp565(rgb565(82, 199, 244), accent, 0.30f));
+
+  // Moving bridge arcs preserve rotational momentum through the handoff.
+  // They are intentionally time-driven rather than fixed "re-lock" brackets,
+  // which removes the tiny visual pause that remained in A3R1-A3R4.
+  const float bridge = 1.0f - fabsf(0.5f - t) * 2.0f;
+  if (bridge > 0.05f) {
+    const float phase = fmodf(now * 0.090f, 360.0f);
+    const float sweep = 12.0f + 28.0f * bridge;
+    const uint16_t bridgeColor = cyberLerp565(rgb565(6, 53, 96), accent, 0.55f);
+    cyberDrawRotArc(d, cx, cy, 43, 2, phase, sweep, bridgeColor);
+    cyberDrawRotArc(d, cx, cy, 43, 2, phase + 180.0f, sweep, bridgeColor);
+  }
+
+  // Preserve outgoing motion during the first half, and begin the incoming
+  // state's signature motion almost immediately.  This is the key difference
+  // from A3R1-A3R4: the morph no longer suppresses state motion for ~300 ms.
+  const float outPresence = 1.0f - t;
+  const float inPresence = t;
+
+  auto drawListeningHint = [&](float presence, bool inbound) {
+    if (presence <= 0.04f) return;
+    const int spread = 39 - static_cast<int>(12.0f * presence);
+    const uint16_t c = cyberLerp565(rgb565(4, 48, 86), accent, 0.35f + 0.55f * presence);
+    cyberDrawChevron(d, cx - spread, cy, inbound ? +1 : -1, c, 3);
+    cyberDrawChevron(d, cx + spread, cy, inbound ? -1 : +1, c, 3);
+  };
+
+  auto drawThinkingHint = [&](float presence) {
+    if (presence <= 0.04f) return;
+    const uint16_t c = cyberLerp565(rgb565(5, 50, 92), accent, 0.30f + 0.60f * presence);
+    const float phase = fmodf(now * 0.055f, 360.0f);
+    cyberDrawRotArc(d, cx, cy, 40, 2, phase, 18.0f + 40.0f * presence, c);
+    cyberDrawRotArc(d, cx, cy, 46, 1, 210.0f - phase * 0.45f,
+                    12.0f + 28.0f * presence, c);
+  };
+
+  auto drawSpeakingHint = [&](float presence) {
+    if (presence <= 0.04f) return;
+    const float voice = cyberClamp01(cyberSmoothedAudio * presence);
+    const uint16_t p = cyberLerp565(rgb565(7, 66, 111), rgb565(132, 236, 255), presence);
+    const uint16_t q = cyberLerp565(rgb565(4, 47, 89), rgb565(50, 174, 239), presence);
+    // Keep an outward direction cue even in a silent PCM gap, then let real
+    // TTS energy take over the radial contour as soon as audio is present.
+    drawListeningHint(presence, false);
+    if (voice > 0.02f) {
+      cyberDrawRadialVoiceWave(d, cx, cy, -1, voice, now, p, q);
+      cyberDrawRadialVoiceWave(d, cx, cy, +1, voice, now, p, q);
+    }
+  };
+
+  switch (from) {
+    case CompanionState::Listening: drawListeningHint(outPresence * 0.70f, true); break;
+    case CompanionState::Thinking:  drawThinkingHint(outPresence * 0.70f); break;
+    case CompanionState::Speaking:  drawSpeakingHint(outPresence * 0.65f); break;
+    default: break;
+  }
+
+  switch (to) {
+    case CompanionState::Listening: drawListeningHint(inPresence, true); break;
+    case CompanionState::Thinking:  drawThinkingHint(inPresence); break;
+    case CompanionState::Speaking:  drawSpeakingHint(inPresence); break;
+    default: break;
   }
 }
 
@@ -845,70 +1138,122 @@ static void cyberDrawChrome(M5Canvas& d, uint16_t accent, uint16_t bg, const cha
 }
 
 static void cyberDrawIdle(M5Canvas& d, int cx, int cy, uint32_t now) {
-  const float breathing = 0.5f + 0.5f * sinf(now * 0.0018f);
-  cyberDrawOrbitBase(d, cx, cy, now, 0.22f);
-  cyberDrawVisor(d, cx, cy, 46, rgb565(34, 137, 221), rgb565(0, 23, 55));
-  cyberDrawCore(d, cx, cy, 0.20f + breathing * 0.22f, rgb565(87, 210, 255));
+  // Idle is intentionally quiet: slow orbital drift and one low-frequency scan.
+  const uint32_t slowNow = now / 3U;
+  const float breathing = 0.5f + 0.5f * sinf(now * 0.00135f);
+  cyberDrawOrbitBase(d, cx, cy, slowNow, 0.16f);
+  cyberDrawVisor(d, cx, cy, 44, rgb565(27, 118, 199), rgb565(0, 19, 47));
+  cyberDrawCore(d, cx, cy, 0.15f + breathing * 0.20f, rgb565(82, 199, 244));
 
-  if (((now / 900U) & 1U) == 0U) {
-    d.drawPixel(cx, cy + 59, rgb565(52, 132, 184));
+  const uint32_t scanCycle = now % 6200U;
+  if (scanCycle < 1150U) {
+    const float scanT = scanCycle / 1150.0f;
+    const float angle = 214.0f + 112.0f * cyberEaseOutCubic(scanT);
+    cyberDrawDotPolar(d, cx, cy, 40, angle, 1, rgb565(45, 135, 190));
   }
 }
 
 static void cyberDrawListening(M5Canvas& d, int cx, int cy, uint32_t now) {
-  const float autoBreath = 0.18f + 0.12f * (0.5f + 0.5f * sinf(now * 0.007f));
+  const float autoBreath = 0.16f + 0.10f * (0.5f + 0.5f * sinf(now * 0.006f));
   const float e = cyberClamp01(cyberSmoothedAudio + autoBreath);
-  cyberDrawOrbitBase(d, cx, cy, now, 0.55f + e * 0.3f);
-  cyberDrawVisor(d, cx, cy, 43, rgb565(48, 170, 245), rgb565(0, 34, 72));
-  cyberDrawCore(d, cx, cy, 0.35f + e * 0.52f, rgb565(105, 226, 255));
+  const uint16_t bright = rgb565(126, 234, 255);
+  const uint16_t primary = rgb565(45, 168, 242);
+  const uint16_t secondary = rgb565(12, 91, 164);
 
+  cyberDrawOrbitBase(d, cx, cy, now / 2U, 0.55f + e * 0.25f);
+  cyberDrawVisor(d, cx, cy, 41, primary, rgb565(0, 32, 69));
+  cyberDrawCore(d, cx, cy, 0.34f + e * 0.48f, rgb565(104, 225, 255));
+
+  // Inbound packets make Listening readable at a glance: everything converges.
   for (int i = 0; i < 3; ++i) {
-    const int r = 7 + i * 6 + static_cast<int>(e * 2.0f);
-    const uint16_t c = i == 0 ? rgb565(123, 231, 255)
-                               : rgb565(18, 103 + i * 20, 177 + i * 17);
-    d.drawArc(cx - 47, cy, r, r - 1, 300, 360, c);
-    d.drawArc(cx - 47, cy, r, r - 1, 0, 60, c);
-    d.drawArc(cx + 47, cy, r, r - 1, 120, 240, c);
+    const float phase = fmodf(now * 0.050f + i * 12.0f, 25.0f);
+    const int leftX = cx - 61 + static_cast<int>(phase);
+    const int rightX = cx + 61 - static_cast<int>(phase);
+    cyberDrawChevron(d, leftX, cy, +1, i == 0 ? bright : secondary, 3);
+    cyberDrawChevron(d, rightX, cy, -1, i == 0 ? bright : secondary, 3);
   }
 
-  const int travel = static_cast<int>((now / 24U) % 23U);
-  d.fillCircle(cx - 60 + travel, cy, 1, rgb565(130, 235, 255));
-  d.fillCircle(cx + 60 - travel, cy, 1, rgb565(130, 235, 255));
+  // Receiver brackets close around the core as input energy rises.
+  const int bracketR = 24 + static_cast<int>(e * 3.0f);
+  d.drawArc(cx, cy, bracketR, bracketR - 1, 138, 222, secondary);
+  d.drawArc(cx, cy, bracketR, bracketR - 1, 318, 360, secondary);
+  d.drawArc(cx, cy, bracketR, bracketR - 1, 0, 42, secondary);
 }
 
 static void cyberDrawThinking(M5Canvas& d, int cx, int cy, uint32_t now) {
-  const float t = now * 0.035f;
+  constexpr float kPi = 3.14159265358979323846f;
+  const float t = now * 0.036f;
+  const uint16_t bright = rgb565(126, 234, 255);
+  const uint16_t primary = rgb565(31, 153, 238);
+  const uint16_t mid = rgb565(15, 94, 173);
+  const uint16_t dim = rgb565(5, 52, 101);
+
   cyberDrawOrbitBase(d, cx, cy, now, 1.0f);
-  cyberDrawVisor(d, cx, cy, 42, rgb565(35, 130, 220), rgb565(0, 26, 64));
-  cyberDrawCore(d, cx, cy, 0.48f + 0.14f * sinf(now * 0.004f), rgb565(81, 205, 255));
+  cyberDrawVisor(d, cx, cy, 36, rgb565(30, 118, 203), rgb565(0, 24, 58));
+  cyberDrawCore(d, cx, cy, 0.44f + 0.10f * sinf(now * 0.004f), rgb565(86, 211, 255));
 
-  cyberDrawRotArc(d, cx, cy, 42, 3, fmodf(t, 360.0f), 56, rgb565(31, 153, 238));
-  cyberDrawRotArc(d, cx, cy, 42, 2, fmodf(t + 142.0f, 360.0f), 26, rgb565(119, 228, 255));
-  cyberDrawRotArc(d, cx, cy, 47, 2, fmodf(320.0f - t * 0.72f, 360.0f), 68,
-                  rgb565(14, 85, 162));
+  // Three asymmetric compute lanes rotate at different speeds and directions.
+  cyberDrawRotArc(d, cx, cy, 33, 2, fmodf(t * 1.18f, 360.0f), 74, primary);
+  cyberDrawRotArc(d, cx, cy, 40, 3, fmodf(145.0f - t * 0.84f, 360.0f), 52, bright);
+  cyberDrawRotArc(d, cx, cy, 47, 2, fmodf(290.0f + t * 0.58f, 360.0f), 86, mid);
+  cyberDrawRotArc(d, cx, cy, 47, 1, fmodf(76.0f + t * 0.58f, 360.0f), 24, dim);
 
-  cyberDrawDotPolar(d, cx, cy, 46, fmodf(t * 1.8f, 360.0f), 2, rgb565(121, 230, 255));
-  cyberDrawDotPolar(d, cx, cy, 39, fmodf(260.0f - t * 1.25f, 360.0f), 1,
-                    rgb565(232, 248, 255));
+  cyberDrawDotPolar(d, cx, cy, 39, fmodf(t * 1.7f, 360.0f), 2, bright);
+  cyberDrawDotPolar(d, cx, cy, 46, fmodf(252.0f - t * 1.1f, 360.0f), 1,
+                    rgb565(231, 248, 255));
 
-  for (int i = 0; i < 6; ++i) {
-    const int x = cx - 21 + i * 8;
-    const int len = 2 + ((i + (now / 120U)) % 3U);
-    d.drawFastVLine(x, cy + 54, len, rgb565(12, 72, 130));
+  // A scanning needle periodically sweeps the calculation field.
+  const float scanDeg = fmodf(now * 0.055f, 360.0f);
+  const float a = scanDeg * kPi / 180.0f;
+  const int x0 = cx + static_cast<int>(cosf(a) * 25.0f);
+  const int y0 = cy + static_cast<int>(sinf(a) * 25.0f);
+  const int x1 = cx + static_cast<int>(cosf(a) * 45.0f);
+  const int y1 = cy + static_cast<int>(sinf(a) * 45.0f);
+  d.drawLine(x0, y0, x1, y1, dim);
+  d.fillCircle(x1, y1, 1, primary);
+
+  // Sparse data ticks. They move, but never become a wall of fake code.
+  const int tickShift = static_cast<int>((now / 140U) % 4U);
+  for (int i = 0; i < 7; ++i) {
+    const int x = cx - 25 + i * 8;
+    const int len = 2 + ((i + tickShift) % 3);
+    d.drawFastVLine(x, cy + 55, len, i == tickShift ? primary : dim);
   }
 }
 
 static void cyberDrawSpeaking(M5Canvas& d, int cx, int cy, uint32_t now) {
-  const float autoVoice = 0.28f + 0.23f * (0.5f + 0.5f * sinf(now * 0.010f));
-  const float e = cyberClamp01(cyberSmoothedAudio * 0.9f + autoVoice);
-  cyberDrawOrbitBase(d, cx, cy, now, 0.72f);
-  cyberDrawVisor(d, cx, cy, 39, rgb565(42, 154, 238), rgb565(0, 31, 70));
-  cyberDrawCore(d, cx, cy, 0.44f + e * 0.45f, rgb565(111, 232, 255));
+  // Speaking energy now comes from the PCM that is actually being played.
+  // Silence collapses the wave; syllables and emphasis expand it.
+  const float e = cyberClamp01(cyberSmoothedAudio);
+  const uint16_t bright = rgb565(132, 236, 255);
+  const uint16_t primary = rgb565(43, 160, 239);
+  const uint16_t secondary = rgb565(19, 103, 190);
 
-  cyberDrawWaveCluster(d, cx - 48, cy, -1, e, now,
-                       rgb565(128, 233, 255), rgb565(24, 112, 201));
-  cyberDrawWaveCluster(d, cx + 48, cy, +1, e, now,
-                       rgb565(128, 233, 255), rgb565(24, 112, 201));
+  cyberDrawOrbitBase(d, cx, cy, now / 2U, 0.66f + e * 0.12f);
+  const int speakingVisorHalf = 42 + static_cast<int>(e * 6.0f);
+  cyberDrawVisor(d, cx, cy, speakingVisorHalf, primary, rgb565(0, 33, 72));
+
+  // The CORE remains the single acoustic origin, but its pulse now follows the
+  // real short-term voice energy rather than a free-running sine envelope.
+  cyberDrawCore(d, cx, cy, 0.32f + e * 0.68f, rgb565(113, 233, 255));
+  d.drawCircle(cx, cy, 23 + static_cast<int>(e * 5.0f), rgb565(10, 74, 128));
+
+  // Continuous symmetric travelling waves originate immediately outside the
+  // CORE. Their amplitude follows the current TTS syllable envelope.
+  cyberDrawRadialVoiceWave(d, cx, cy, -1, e, now, bright, secondary);
+  cyberDrawRadialVoiceWave(d, cx, cy, +1, e, now, bright, secondary);
+
+  // Packet markers appear only while there is real voice energy, so sentence
+  // pauses visibly settle instead of continuing to look like active speech.
+  if (e > 0.08f) {
+    for (int i = 0; i < 2; ++i) {
+      const float phase = fmodf(now * 0.045f + i * 16.0f, 34.0f);
+      const int leftX = cx - 20 - static_cast<int>(phase);
+      const int rightX = cx + 20 + static_cast<int>(phase);
+      cyberDrawChevron(d, leftX, cy, -1, i == 0 ? bright : secondary, 3);
+      cyberDrawChevron(d, rightX, cy, +1, i == 0 ? bright : secondary, 3);
+    }
+  }
 }
 
 static void cyberDrawSuccess(M5Canvas& d, int cx, int cy, uint32_t now) {
@@ -943,16 +1288,40 @@ static void cyberDrawError(M5Canvas& d, int cx, int cy, uint32_t now) {
   d.drawFastHLine(cx - 18, cy + 50 + (phase & 1), 31, red);
 }
 
-static uint32_t cyberFrameIntervalMs() {
-  // Conservative refresh while the half-duplex audio path is active.
+static uint32_t cyberFrameIntervalMs(uint32_t now) {
+  const uint32_t elapsed = now - stateSinceMs;
+
+  // State changes use a short high-cadence bridge.  The canvas remains
+  // double-buffered, so the extra frames improve motion continuity without
+  // reintroducing the old clear/redraw flicker.
+  const bool wakeIntro = companionState == CompanionState::Listening &&
+                         cyberPreviousState == CompanionState::Idle &&
+                         elapsed < 560U;
+  if (wakeIntro) return 42;  // ~24 FPS only during the wake flourish
+
+  if (elapsed < kCyberMorphMs && cyberPreviousState != companionState) {
+    switch (companionState) {
+      case CompanionState::Listening: return 50;  // 20 FPS, bounded Mic transition
+      case CompanionState::Speaking:  return 45;  // ~22 FPS, bounded TTS transition
+      case CompanionState::Thinking:  return 42;  // ~24 FPS, audio idle
+      case CompanionState::Success:   return 50;
+      case CompanionState::Error:     return 50;
+      case CompanionState::Idle:
+      default:                        return 50;
+    }
+  }
+
+  // Steady-state caps.  Speaking is raised from 20 FPS to ~24 FPS for a smoother
+  // PCM-synced waveform while still keeping a bounded display load
+  // on the gapless TTS path.
   switch (companionState) {
     case CompanionState::Listening: return 160;  // ~6 FPS during Mic capture
-    case CompanionState::Speaking:  return 125;  // 8 FPS during gapless TTS
+    case CompanionState::Speaking:  return 42;   // ~24 FPS during gapless TTS
     case CompanionState::Thinking:  return 50;   // 20 FPS when audio is idle
     case CompanionState::Success:   return 80;
     case CompanionState::Error:     return 100;
     case CompanionState::Idle:
-    default:                        return 100;   // restrained ambient motion
+    default:                        return 160;   // quiet ambient motion
   }
 }
 
@@ -978,13 +1347,15 @@ static void renderCyberExpression(CompanionState state, uint32_t now) {
   // from the user's point of view.
   d.fillSprite(bg);
 
-  const float transition = cyberEaseOutCubic((now - stateSinceMs) / 360.0f);
-  const int reveal = 14 + static_cast<int>(30.0f * transition);
-  const uint16_t transitionColor = state == CompanionState::Error
-                                       ? rgb565(76, 10, 22)
-                                       : rgb565(10, 59, 105);
-  d.drawArc(cx, cy, reveal, reveal - 1, 210, 330, transitionColor);
-  d.drawArc(cx, cy, reveal, reveal - 1, 30, 150, transitionColor);
+  // Keep the outer field arcs at a stable radius across state changes. Earlier
+  // builds collapsed them to the CORE and re-expanded them on every setState(),
+  // which looked like a tiny pause even when the main morph itself was smooth.
+  const int fieldRadius = 44;
+  const uint16_t fieldColor = state == CompanionState::Error
+                                  ? rgb565(76, 10, 22)
+                                  : rgb565(10, 59, 105);
+  d.drawArc(cx, cy, fieldRadius, fieldRadius - 1, 210, 330, fieldColor);
+  d.drawArc(cx, cy, fieldRadius, fieldRadius - 1, 30, 150, fieldColor);
 
   // Long vertical sensor axis makes the composition recognisable even in a
   // peripheral glance beside the monitor.
@@ -993,13 +1364,26 @@ static void renderCyberExpression(CompanionState state, uint32_t now) {
   d.drawPixel(cx, 65, accent);
   d.drawPixel(cx, 184, accent);
 
-  switch (state) {
-    case CompanionState::Idle:      cyberDrawIdle(d, cx, cy, now); break;
-    case CompanionState::Listening: cyberDrawListening(d, cx, cy, now); break;
-    case CompanionState::Thinking:  cyberDrawThinking(d, cx, cy, now); break;
-    case CompanionState::Speaking:  cyberDrawSpeaking(d, cx, cy, now); break;
-    case CompanionState::Success:   cyberDrawSuccess(d, cx, cy, now); break;
-    case CompanionState::Error:     cyberDrawError(d, cx, cy, now); break;
+  const uint32_t stateElapsedMs = now - stateSinceMs;
+  const bool wakeIntro = state == CompanionState::Listening &&
+                         cyberPreviousState == CompanionState::Idle &&
+                         stateElapsedMs < 560U;
+
+  const bool morphIntro = !wakeIntro && cyberPreviousState != state && stateElapsedMs < kCyberMorphMs;
+
+  if (wakeIntro) {
+    cyberDrawWake(d, cx, cy, stateElapsedMs);
+  } else if (morphIntro) {
+    cyberDrawStateMorph(d, cx, cy, cyberPreviousState, state, now, stateElapsedMs);
+  } else {
+    switch (state) {
+      case CompanionState::Idle:      cyberDrawIdle(d, cx, cy, now); break;
+      case CompanionState::Listening: cyberDrawListening(d, cx, cy, now); break;
+      case CompanionState::Thinking:  cyberDrawThinking(d, cx, cy, now); break;
+      case CompanionState::Speaking:  cyberDrawSpeaking(d, cx, cy, now); break;
+      case CompanionState::Success:   cyberDrawSuccess(d, cx, cy, now); break;
+      case CompanionState::Error:     cyberDrawError(d, cx, cy, now); break;
+    }
   }
 
   cyberDrawChrome(d, accent, bg, stateLabel(state));
@@ -1020,19 +1404,50 @@ static void drawMascotFace(CompanionState state, bool blink = false) {
 static void updateCyberExpression() {
   if (displaysSleeping) return;
   const uint32_t now = millis();
-  if (now - cyberLastFrameMs < cyberFrameIntervalMs()) return;
+  if (now - cyberLastFrameMs < cyberFrameIntervalMs(now)) return;
   cyberLastFrameMs = now;
 
-  // Audio-reactive hook.  Current production voice path intentionally does not
-  // perform extra RMS passes solely for UI.  The autonomous envelope keeps
-  // Listening/Speaking alive without adding work to Mic/TTS critical sections.
-  cyberSmoothedAudio += (cyberAudioLevel - cyberSmoothedAudio) * 0.34f;
-  cyberAudioLevel *= 0.87f;
+  // Speaking follows the PCM buffer already in the gapless TTS queue.  Only a
+  // tiny trailing sample window is inspected at display-frame cadence, so no
+  // microphone loopback or full-buffer analysis is added to the audio path.
+  float audioTarget = cyberAudioLevel;
+#if COMPANION_AUDIO_ENABLE
+  if (companionState == CompanionState::Speaking && ttsSequenceActive) {
+    audioTarget = ttsPcmVisualLevelAt(now);
+    cyberAudioLevel = audioTarget;
+  } else if (companionState == CompanionState::Speaking) {
+    // No local PCM means no fabricated voice energy. The CORE/VISOR still
+    // indicate Speaking, but the wave remains quiet until audio actually plays.
+    audioTarget = 0.0f;
+  }
+#endif
+
+  // Fast attack makes consonants/restarts legible; slower release avoids a
+  // nervous one-frame collapse between adjacent voiced windows.
+  const float smoothing = audioTarget > cyberSmoothedAudio ? 0.72f : 0.42f;
+  cyberSmoothedAudio += (audioTarget - cyberSmoothedAudio) * smoothing;
+  cyberAudioLevel *= 0.84f;
+
+  if (companionState == CompanionState::Speaking) {
+    for (size_t i = kCyberVoiceHistoryCount - 1; i > 0; --i) {
+      cyberVoiceHistory[i] = cyberVoiceHistory[i - 1];
+    }
+    cyberVoiceHistory[0] = cyberSmoothedAudio;
+  }
+
   renderCyberExpression(companionState, now);
 }
 
 static void setState(CompanionState state) {
   if (companionState == state) return;
+  cyberPreviousState = companionState;
+
+  if (state == CompanionState::Speaking && companionState != CompanionState::Speaking) {
+    for (size_t i = 0; i < kCyberVoiceHistoryCount; ++i) cyberVoiceHistory[i] = 0.0f;
+    cyberAudioLevel = 0.0f;
+    cyberSmoothedAudio = 0.0f;
+  }
+
   companionState = state;
   stateSinceMs = millis();
   idleBlink = false;
@@ -1761,6 +2176,7 @@ static void freeTtsSlot(int8_t slotIndex) {
   slot.sampleRate = 16000;
   slot.segmentIndex = 0;
   slot.segmentTotal = 0;
+  slot.playbackStartedMs = 0;
   slot.receiving = false;
 }
 
@@ -1865,6 +2281,7 @@ static bool beginTtsReceive(
   slot.sampleRate = sampleRate ? sampleRate : 16000;
   slot.segmentIndex = segmentIndex ? segmentIndex : 1;
   slot.segmentTotal = segmentTotal ? segmentTotal : 1;
+  slot.playbackStartedMs = 0;
   slot.receiving = true;
   ttsReceiveSlot = slotIndex;
 
@@ -1955,8 +2372,13 @@ static bool queueReceivedTtsSegment() {
 
   if (ttsCurrentSlot < 0) {
     ttsCurrentSlot = slotIndex;
+    // playRaw() begins this request immediately when channel 0 was idle. The
+    // timestamp lets the UI map the current speaker time back into this PCM.
+    slot.playbackStartedMs = millis();
   } else {
     ttsNextSlot = slotIndex;
+    // The queued slot receives its real start time at the seamless handoff.
+    slot.playbackStartedMs = 0;
   }
 
   ttsSequenceActive = true;
@@ -2010,8 +2432,27 @@ static void updateTtsPlayback() {
   // and immediately tell Mini there is room for another segment.
   if (ttsLastQueueDepth >= 2 && depth == 1) {
     const int8_t finishedSlot = ttsCurrentSlot;
+    uint32_t handoffMs = millis();
+
+    // Prefer the sample-derived boundary when it is close to the observed
+    // queue handoff. This removes loop-poll jitter from the visual timeline.
+    if (finishedSlot >= 0 && finishedSlot < 2) {
+      const TtsSlot& finished = ttsSlots[finishedSlot];
+      if (finished.playbackStartedMs && finished.sampleRate) {
+        const uint64_t samples = finished.receivedBytes / sizeof(int16_t);
+        const uint32_t durationMs = static_cast<uint32_t>(
+            (samples * 1000ULL) / finished.sampleRate);
+        const uint32_t predictedMs = finished.playbackStartedMs + durationMs;
+        const int32_t skewMs = static_cast<int32_t>(handoffMs - predictedMs);
+        if (skewMs > -80 && skewMs < 180) handoffMs = predictedMs;
+      }
+    }
+
     ttsCurrentSlot = ttsNextSlot;
     ttsNextSlot = -1;
+    if (ttsCurrentSlot >= 0 && ttsCurrentSlot < 2) {
+      ttsSlots[ttsCurrentSlot].playbackStartedMs = handoffMs;
+    }
     freeTtsSlot(finishedSlot);
 
     Serial.printf(
@@ -3280,7 +3721,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== HomeAIAgent A4.5 Cyber Expression A2 Flicker-Free / base A4.4.18 RC1R9 ===");
+  Serial.println("=== HomeAIAgent A4.5 Cyber Expression A3R9 24FPS WAKE RECOVERY / base A4.4.18 RC1R9 ===");
 
   auto cfg = M5.config();
   M5.begin(cfg);

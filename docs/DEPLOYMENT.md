@@ -1,6 +1,6 @@
 # Deployment
 
-This document describes the current A4.5 Cyber Expression A2 deployment path.
+This document describes the A4.5 Cyber Expression A3R4 PCM-Synced Voice Wave evaluation deployment path.
 
 ## 1. StickS3 firmware
 
@@ -41,7 +41,7 @@ Use PlatformIO:
 Expected boot banner:
 
 ```text
-=== HomeAIAgent A4.5 Cyber Expression A2 Flicker-Free / base A4.4.18 RC1R9 ===
+=== HomeAIAgent A4.5 Cyber Expression A3R4 PCM-Synced Voice Wave / base A4.4.18 RC1R9 ===
 ```
 
 Expected renderer line:
