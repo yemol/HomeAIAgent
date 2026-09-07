@@ -97,6 +97,8 @@ EOF
   echo "[OK] Persistent config created."
 fi
 
+homeai_apply_a46_voice_migration
+
 python protocol_selftest.py
 
 echo

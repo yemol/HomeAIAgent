@@ -147,3 +147,12 @@ Gateway sends `display.sleep` or `display.wake` with a unique `command_id`. Devi
 ## Half-duplex rule
 
 The StickS3 ES8311 path is half-duplex by design. Voice capture, network-heavy upload and TTS playback are sequenced rather than overlapped.
+
+## Reminder A1
+
+Reminder A1 adds no new StickS3 JSON message type. The Mac mini Gateway reuses two already-frozen transports:
+
+1. Existing Info sync (`info.begin`, one `info.item`, `info.end`) temporarily carries a pre-rendered 128x64 reminder frame.
+2. Existing TTS (`tts.start`, binary PCM, `tts.end`) speaks the reminder, and existing `playback.done` is the final device delivery acknowledgement.
+
+After `playback.done`, the Gateway sends the canonical Info revision again so Glass2 returns to the normal feed. If the device is offline/busy or delivery fails, the persistent Gateway reminder queue retries later.

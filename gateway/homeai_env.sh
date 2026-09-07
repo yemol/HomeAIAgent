@@ -32,3 +32,59 @@ homeai_source_config() {
   source "$HOMEAI_CONFIG_FILE"
   set +a
 }
+
+homeai_apply_a46_voice_migration() {
+  # A1R7: standard-voice convergence guard.
+  # Do not rely on a one-time marker: every Gateway start verifies the persisted
+  # values and rewrites only the TTS resource/voice fields when they drift.
+  local desired_voice="zh_female_vv_uranus_bigtts"
+  local desired_resource="seed-tts-2.0"
+  local cfg="$HOMEAI_CONFIG_FILE"
+
+  [ -f "$cfg" ] || return 0
+
+  mkdir -p "$HOMEAI_CONFIG_DIR"
+  local current_voice=""
+  local current_resource=""
+  current_voice="$(grep '^VOLCENGINE_TTS_VOICE=' "$cfg" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+  current_resource="$(grep '^VOLCENGINE_TTS_RESOURCE_ID=' "$cfg" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+
+  if [ "$current_voice" != "$desired_voice" ] || [ "$current_resource" != "$desired_resource" ]; then
+    local stamp tmp backup
+    stamp="$(date +%Y%m%d_%H%M%S)"
+    backup="$cfg.bak_a46_a1r7_standard_voice_$stamp"
+    tmp="$cfg.tmp_a46_a1r7_standard_voice_$$"
+    cp "$cfg" "$backup"
+    chmod 600 "$backup"
+
+    awk -v voice="$desired_voice" -v resource="$desired_resource" '
+      BEGIN { voice_done = 0; resource_done = 0 }
+      /^[[:space:]]*(export[[:space:]]+)?VOLCENGINE_TTS_VOICE=/ {
+        if (!voice_done) {
+          print "VOLCENGINE_TTS_VOICE=" voice
+          voice_done = 1
+        }
+        next
+      }
+      /^[[:space:]]*(export[[:space:]]+)?VOLCENGINE_TTS_RESOURCE_ID=/ {
+        if (!resource_done) {
+          print "VOLCENGINE_TTS_RESOURCE_ID=" resource
+          resource_done = 1
+        }
+        next
+      }
+      { print }
+      END {
+        if (!resource_done) print "VOLCENGINE_TTS_RESOURCE_ID=" resource
+        if (!voice_done) print "VOLCENGINE_TTS_VOICE=" voice
+      }
+    ' "$cfg" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$cfg"
+    echo "[CONFIG-ENFORCE] Volc TTS resource -> $desired_resource"
+    echo "[CONFIG-ENFORCE] Volc TTS voice -> $desired_voice"
+    echo "[CONFIG-ENFORCE] backup=$backup"
+  else
+    echo "[CONFIG-ENFORCE] standard Volc TTS pairing already correct"
+  fi
+}

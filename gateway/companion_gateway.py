@@ -45,6 +45,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 import httpx
 import websockets
+from websockets.exceptions import ConnectionClosed
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -180,7 +181,28 @@ class FeedItem:
     published_at: str = ""
     content_hash: str = ""
 
+
+@dataclass
+class ReminderRecord:
+    reminder_id: str
+    dedup_key: str
+    text: str
+    title: str = "提醒"
+    job_id: str = ""
+    run_id: str = ""
+    scheduled_at: str = ""
+    fired_at: str = ""
+    received_at: str = ""
+    attempts: int = 0
+    next_attempt_at: float = 0.0
+    last_error: str = ""
+
+
 ACTIVE_SESSIONS: list["ClientSession"] = []
+REMINDER_PENDING: list[ReminderRecord] = []
+REMINDER_DELIVERED: list[dict[str, str]] = []
+REMINDER_DELIVERED_KEYS: set[str] = set()
+REMINDER_LOCK: asyncio.Lock | None = None
 FEED_ITEMS: list[FeedItem] = []
 FEED_ITEM_HISTORY: dict[str, FeedItem] = {}
 FEED_REVISION = "boot"
@@ -206,6 +228,34 @@ HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.getenv("GATEWAY_PORT", "8765"))
 WS_PATH = os.getenv("GATEWAY_PATH", "/companion")
 MODE = os.getenv("P0_MODE", "full").strip().lower()
+
+# HomeAIAgent Notification A1. OpenClaw background reminders already land in
+# the same stable voice session used by /v1/chat/completions. Instead of opening
+# a reverse webhook port, the Mac mini keeps one outbound Gateway WebSocket over
+# the existing 127.0.0.1:18790 SSH/Tailscale tunnel and subscribes to that exact
+# session. The authoritative transcript is reconciled through chat.history.
+NOTIFICATION_LISTENER_ENABLED = (
+    os.getenv("HOMEAI_NOTIFICATION_LISTENER_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+NOTIFICATION_HISTORY_LIMIT = max(
+    10,
+    min(200, int(os.getenv("HOMEAI_NOTIFICATION_HISTORY_LIMIT", "60"))),
+)
+NOTIFICATION_RECONNECT_MIN_SEC = max(
+    1.0, float(os.getenv("HOMEAI_NOTIFICATION_RECONNECT_MIN_SEC", "2"))
+)
+NOTIFICATION_RECONNECT_MAX_SEC = max(
+    NOTIFICATION_RECONNECT_MIN_SEC,
+    float(os.getenv("HOMEAI_NOTIFICATION_RECONNECT_MAX_SEC", "30")),
+)
+NOTIFICATION_SEEN_HISTORY = max(
+    100, int(os.getenv("HOMEAI_NOTIFICATION_SEEN_HISTORY", "500"))
+)
+NOTIFICATION_STATE_FILE = HOMEAI_DATA_DIR / "openclaw_voice_listener_state.json"
+REMINDER_QUEUE_FILE = HOMEAI_DATA_DIR / "notification_queue.json"
+REMINDER_RETRY_MAX_SEC = max(30, int(os.getenv("HOMEAI_REMINDER_RETRY_MAX_SEC", "300")))
+REMINDER_DELIVERED_HISTORY = max(20, int(os.getenv("HOMEAI_REMINDER_DELIVERED_HISTORY", "200")))
 
 ASR_PROVIDER = os.getenv("ASR_PROVIDER", "volcengine").strip().lower()
 TTS_PROVIDER = os.getenv("TTS_PROVIDER", "volcengine").strip().lower()
@@ -265,6 +315,10 @@ VOLCENGINE_TTS_LOUDNESS_RATE = int(os.getenv("VOLCENGINE_TTS_LOUDNESS_RATE", "0"
 VOLCENGINE_TTS_CONNECT_TIMEOUT = float(os.getenv("VOLCENGINE_TTS_CONNECT_TIMEOUT", "8"))
 VOLCENGINE_TTS_SESSION_TIMEOUT = float(os.getenv("VOLCENGINE_TTS_SESSION_TIMEOUT", "20"))
 
+A1R7_STANDARD_TTS_RESOURCE_ID = "seed-tts-2.0"
+A1R7_STANDARD_TTS_VOICE = "zh_female_vv_uranus_bigtts"
+
+
 # Optional OpenAI speech fallback. Not required when domestic speech is selected.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
@@ -291,10 +345,310 @@ def _best_effort_write_text(path: Path, text: str) -> None:
     except OSError as exc:
         print(f"[FILE-WARN] write_text failed path={path} error={type(exc).__name__}: {exc}")
 
+
+def _iso_now() -> str:
+    return datetime.now(ZoneInfo("UTC")).isoformat()
+
+
+def _normalize_reminder_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return ""
+    text = " ".join(str(value).strip().split())
+    # Async assistant output should remain complete. Protect the TTS path from
+    # pathological transcript rows without hard-cutting a normal reminder.
+    if len(text) > 1200:
+        return ""
+    return text
+
+
+def _normalize_notification_compare_text(value: str) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def _notification_text_digest(value: str) -> str:
+    normalized = _normalize_notification_compare_text(value)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _history_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _history_message_identity(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    meta = message.get("__openclaw")
+    if not isinstance(meta, dict):
+        meta = {}
+    entry_id = str(meta.get("id") or message.get("id") or "").strip()
+    seq = meta.get("seq")
+    text = _history_message_text(message)
+    role = str(message.get("role") or "").strip().lower()
+    digest = _notification_text_digest(text)[:20] if text else "empty"
+    if entry_id:
+        return f"id:{entry_id}:seq:{seq if seq is not None else '-'}:{role}:{digest}"
+    timestamp = str(message.get("timestamp") or message.get("createdAt") or "").strip()
+    return f"fallback:{timestamp}:{role}:{digest}"
+
+
+def _is_user_visible_async_assistant_message(message: Any) -> bool:
+    if not isinstance(message, dict):
+        return False
+    if str(message.get("role") or "").strip().lower() != "assistant":
+        return False
+    meta = message.get("__openclaw")
+    if isinstance(meta, dict):
+        kind = str(meta.get("kind") or "").strip().lower()
+        if kind in {"compaction", "tool", "tool_result", "system"}:
+            return False
+    text = _normalize_reminder_text(_history_message_text(message))
+    if not text:
+        return False
+    if text.startswith("[chat.history omitted:"):
+        return False
+    return True
+
+
+NOTIFICATION_SEEN_KEYS: list[str] = []
+NOTIFICATION_SEEN_SET: set[str] = set()
+NOTIFICATION_CURSOR_INITIALIZED = False
+NOTIFICATION_CURSOR_SESSION_KEY = ""
+NOTIFICATION_CURSOR_SESSION_ID = ""
+VOICE_OPENCLAW_INFLIGHT = 0
+VOICE_REPLY_SUPPRESSIONS: list[dict[str, Any]] = []
+
+
+def _remember_notification_seen(key: str) -> None:
+    if not key or key in NOTIFICATION_SEEN_SET:
+        return
+    NOTIFICATION_SEEN_KEYS.append(key)
+    NOTIFICATION_SEEN_SET.add(key)
+    while len(NOTIFICATION_SEEN_KEYS) > NOTIFICATION_SEEN_HISTORY:
+        old = NOTIFICATION_SEEN_KEYS.pop(0)
+        NOTIFICATION_SEEN_SET.discard(old)
+
+
+def load_notification_listener_state(session_key: str) -> None:
+    global NOTIFICATION_CURSOR_INITIALIZED
+    global NOTIFICATION_CURSOR_SESSION_KEY
+    global NOTIFICATION_CURSOR_SESSION_ID
+
+    NOTIFICATION_SEEN_KEYS.clear()
+    NOTIFICATION_SEEN_SET.clear()
+    NOTIFICATION_CURSOR_INITIALIZED = False
+    NOTIFICATION_CURSOR_SESSION_KEY = session_key
+    NOTIFICATION_CURSOR_SESSION_ID = ""
+
+    if not NOTIFICATION_STATE_FILE.exists():
+        return
+    try:
+        body = json.loads(NOTIFICATION_STATE_FILE.read_text(encoding="utf-8"))
+        if str(body.get("session_key") or "") != session_key:
+            print("[NOTIFY] listener state belongs to another session; new baseline required")
+            return
+        for raw in body.get("seen_message_keys") or []:
+            key = str(raw or "").strip()
+            if key:
+                _remember_notification_seen(key)
+        NOTIFICATION_CURSOR_INITIALIZED = bool(body.get("initialized", False))
+        NOTIFICATION_CURSOR_SESSION_ID = str(body.get("session_id") or "")
+        print(
+            f"[NOTIFY] listener state loaded initialized={NOTIFICATION_CURSOR_INITIALIZED} "
+            f"seen={len(NOTIFICATION_SEEN_KEYS)}"
+        )
+    except Exception as exc:
+        print(
+            f"[NOTIFY-WARN] listener state read failed; new baseline required: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def save_notification_listener_state() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        body = {
+            "version": 1,
+            "saved_at": _iso_now(),
+            "session_key": NOTIFICATION_CURSOR_SESSION_KEY,
+            "session_id": NOTIFICATION_CURSOR_SESSION_ID,
+            "initialized": NOTIFICATION_CURSOR_INITIALIZED,
+            "seen_message_keys": NOTIFICATION_SEEN_KEYS[-NOTIFICATION_SEEN_HISTORY:],
+        }
+        tmp = NOTIFICATION_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(NOTIFICATION_STATE_FILE)
+        return True
+    except OSError as exc:
+        print(f"[NOTIFY-WARN] listener state write failed: {exc}")
+        return False
+
+
+def _register_voice_reply_suppression(text: str) -> None:
+    normalized = _normalize_notification_compare_text(text)
+    if not normalized:
+        return
+    now = time.time()
+    VOICE_REPLY_SUPPRESSIONS[:] = [
+        item for item in VOICE_REPLY_SUPPRESSIONS
+        if float(item.get("expires_at") or 0.0) > now
+    ]
+    VOICE_REPLY_SUPPRESSIONS.append({
+        "digest": _notification_text_digest(normalized),
+        "expires_at": now + 600.0,
+    })
+    del VOICE_REPLY_SUPPRESSIONS[:-24]
+
+
+def _consume_voice_reply_suppression(text: str) -> bool:
+    normalized = _normalize_notification_compare_text(text)
+    if not normalized:
+        return False
+    digest = _notification_text_digest(normalized)
+    now = time.time()
+    kept: list[dict[str, Any]] = []
+    consumed = False
+    for item in VOICE_REPLY_SUPPRESSIONS:
+        if float(item.get("expires_at") or 0.0) <= now:
+            continue
+        if not consumed and str(item.get("digest") or "") == digest:
+            consumed = True
+            continue
+        kept.append(item)
+    VOICE_REPLY_SUPPRESSIONS[:] = kept
+    return consumed
+
+
+def _notification_record_from_history_message(
+    session_key: str,
+    message: dict[str, Any],
+) -> ReminderRecord | None:
+    text = _normalize_reminder_text(_history_message_text(message))
+    if not text:
+        return None
+    message_key = _history_message_identity(message)
+    if not message_key:
+        return None
+    dedup_key = f"session:{session_key}:{message_key}"
+    reminder_id = "rem-" + hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:20]
+    return ReminderRecord(
+        reminder_id=reminder_id,
+        dedup_key=dedup_key,
+        text=text,
+        title="提醒",
+        fired_at=_iso_now(),
+        received_at=_iso_now(),
+    )
+
+
+def load_reminder_queue() -> None:
+    REMINDER_PENDING.clear()
+    REMINDER_DELIVERED.clear()
+    REMINDER_DELIVERED_KEYS.clear()
+
+    if not REMINDER_QUEUE_FILE.exists():
+        return
+
+    try:
+        body = json.loads(REMINDER_QUEUE_FILE.read_text(encoding="utf-8"))
+        for raw in body.get("pending") or []:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                record = ReminderRecord(
+                    reminder_id=str(raw.get("reminder_id") or ""),
+                    dedup_key=str(raw.get("dedup_key") or ""),
+                    text=str(raw.get("text") or ""),
+                    title=str(raw.get("title") or "提醒"),
+                    job_id=str(raw.get("job_id") or ""),
+                    run_id=str(raw.get("run_id") or ""),
+                    scheduled_at=str(raw.get("scheduled_at") or ""),
+                    fired_at=str(raw.get("fired_at") or ""),
+                    received_at=str(raw.get("received_at") or ""),
+                    attempts=max(0, int(raw.get("attempts") or 0)),
+                    next_attempt_at=max(0.0, float(raw.get("next_attempt_at") or 0.0)),
+                    last_error=str(raw.get("last_error") or ""),
+                )
+            except Exception:
+                continue
+            if record.reminder_id and record.dedup_key and record.text:
+                REMINDER_PENDING.append(record)
+
+        for raw in (body.get("delivered") or [])[-REMINDER_DELIVERED_HISTORY:]:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("dedup_key") or "")
+            if not key:
+                continue
+            item = {
+                "dedup_key": key,
+                "reminder_id": str(raw.get("reminder_id") or ""),
+                "delivered_at": str(raw.get("delivered_at") or ""),
+            }
+            REMINDER_DELIVERED.append(item)
+            REMINDER_DELIVERED_KEYS.add(key)
+
+        print(
+            f"[NOTIFY] queue loaded pending={len(REMINDER_PENDING)} "
+            f"delivered_history={len(REMINDER_DELIVERED)}"
+        )
+    except Exception as exc:
+        print(
+            f"[NOTIFY-WARN] queue read failed; starting empty: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+def save_reminder_queue() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        body = {
+            "version": 2,
+            "saved_at": _iso_now(),
+            "pending": [asdict(item) for item in REMINDER_PENDING],
+            "delivered": REMINDER_DELIVERED[-REMINDER_DELIVERED_HISTORY:],
+        }
+        tmp = REMINDER_QUEUE_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(REMINDER_QUEUE_FILE)
+        return True
+    except OSError as exc:
+        print(f"[NOTIFY-WARN] queue write failed: {exc}")
+        return False
+
+
 OPENCLAW_BASE_URL = os.getenv("OPENCLAW_BASE_URL", "http://127.0.0.1:18790").rstrip("/")
 OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "")
 OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
+OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
+
+
+def _openclaw_voice_session_key() -> str:
+    # Mirrors OpenClaw's current OpenAI-compatible resolver exactly:
+    # prefix="openai" + stable `user` -> agent:<agentId>:openai-user:<user>.
+    return f"agent:{OPENCLAW_VOICE_AGENT_ID}:openai-user:{OPENCLAW_USER}"
+
 
 # Info Skill session lifecycle. Each background request gets one exact,
 # unique OpenClaw session key so it never shares history with another refresh.
@@ -913,6 +1267,345 @@ async def _openclaw_gateway_rpc(
             )
         payload = response.get("payload")
         return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+async def _openclaw_listener_connect(*, timeout: float = 15.0) -> Any:
+    ws_url = _openclaw_gateway_ws_url()
+    ws = await websockets.connect(
+        ws_url,
+        open_timeout=min(timeout, 8.0),
+        close_timeout=3,
+        max_size=2 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=20,
+    )
+    try:
+        challenge_deadline = asyncio.get_running_loop().time() + min(timeout, 8.0)
+        challenge: dict[str, Any] | None = None
+        while challenge is None:
+            remaining = challenge_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError("OpenClaw Gateway listener connect.challenge timeout")
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            frame = json.loads(raw)
+            if (
+                isinstance(frame, dict)
+                and frame.get("type") == "event"
+                and frame.get("event") == "connect.challenge"
+                and isinstance(frame.get("payload"), dict)
+            ):
+                challenge = frame["payload"]
+
+        nonce = str(challenge.get("nonce", "") or "")
+        ts = challenge.get("ts")
+        if not nonce or not isinstance(ts, int) or ts < 0:
+            raise RuntimeError("invalid OpenClaw Gateway listener challenge")
+
+        connect_id = uuid.uuid4().hex
+        connect_params: dict[str, Any] = {
+            "minProtocol": OPENCLAW_GATEWAY_PROTOCOL,
+            "maxProtocol": OPENCLAW_GATEWAY_PROTOCOL,
+            "client": {
+                "id": "gateway-client",
+                "displayName": "HomeAIAgent Session Listener",
+                "version": "A4.6-Notification-A1",
+                "platform": sys.platform,
+                "mode": "backend",
+            },
+            "role": "operator",
+            "scopes": ["operator.read"],
+            "caps": [],
+            "commands": [],
+            "permissions": {},
+        }
+        if OPENCLAW_TOKEN:
+            connect_params["auth"] = {"token": OPENCLAW_TOKEN}
+
+        await ws.send(json.dumps({
+            "type": "req",
+            "id": connect_id,
+            "method": "connect",
+            "params": connect_params,
+        }, ensure_ascii=False))
+        connect_res = await _gateway_rpc_recv_response(
+            ws, connect_id, timeout=min(timeout, 8.0)
+        )
+        if not bool(connect_res.get("ok")):
+            raise RuntimeError(
+                f"OpenClaw Gateway listener connect failed: {connect_res.get('error')!r}"
+            )
+        return ws
+    except Exception:
+        await ws.close()
+        raise
+
+
+def _listener_event_targets_voice_session(frame: dict[str, Any], session_key: str) -> bool:
+    if frame.get("type") != "event":
+        return False
+    event_name = str(frame.get("event") or "")
+    if event_name not in {"session.message", "sessions.changed"}:
+        return False
+    payload = frame.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    target = payload.get("target")
+    target_key = target.get("sessionKey") if isinstance(target, dict) else ""
+    candidate = str(
+        payload.get("sessionKey")
+        or payload.get("key")
+        or target_key
+        or ""
+    )
+    return candidate == session_key
+
+
+async def _listener_rpc(
+    ws: Any,
+    method: str,
+    params: dict[str, Any],
+    *,
+    session_key: str,
+    timeout: float = 15.0,
+) -> tuple[dict[str, Any], bool]:
+    request_id = uuid.uuid4().hex
+    await ws.send(json.dumps({
+        "type": "req",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    }, ensure_ascii=False))
+
+    dirty = False
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError()
+        raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+        frame = json.loads(raw)
+        if not isinstance(frame, dict):
+            continue
+        if _listener_event_targets_voice_session(frame, session_key):
+            dirty = True
+        if frame.get("type") == "res" and str(frame.get("id") or "") == request_id:
+            if not bool(frame.get("ok")):
+                raise RuntimeError(
+                    f"OpenClaw Gateway listener RPC {method} failed: {frame.get('error')!r}"
+                )
+            payload = frame.get("payload")
+            return (payload if isinstance(payload, dict) else {"payload": payload}, dirty)
+
+
+async def _enqueue_async_notification(
+    session_key: str,
+    message: dict[str, Any],
+) -> bool:
+    record = _notification_record_from_history_message(session_key, message)
+    if record is None:
+        return True
+
+    assert REMINDER_LOCK is not None
+    async with REMINDER_LOCK:
+        duplicate = (
+            record.dedup_key in REMINDER_DELIVERED_KEYS
+            or any(item.dedup_key == record.dedup_key for item in REMINDER_PENDING)
+        )
+        if duplicate:
+            print(f"[NOTIFY] duplicate transcript message ignored id={record.reminder_id}")
+            return True
+        REMINDER_PENDING.append(record)
+        if not save_reminder_queue():
+            REMINDER_PENDING[:] = [
+                item for item in REMINDER_PENDING
+                if item.dedup_key != record.dedup_key
+            ]
+            return False
+
+    print(
+        f"[NOTIFY] async assistant queued id={record.reminder_id} "
+        f"text={record.text!r}"
+    )
+    return True
+
+
+async def _reconcile_voice_session_history(
+    history: dict[str, Any],
+    session_key: str,
+) -> None:
+    global NOTIFICATION_CURSOR_INITIALIZED
+    global NOTIFICATION_CURSOR_SESSION_KEY
+    global NOTIFICATION_CURSOR_SESSION_ID
+
+    messages = history.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    session_id = str(history.get("sessionId") or history.get("session_id") or "")
+    NOTIFICATION_CURSOR_SESSION_KEY = session_key
+    if session_id:
+        NOTIFICATION_CURSOR_SESSION_ID = session_id
+
+    assistant_rows = [
+        item for item in messages
+        if _is_user_visible_async_assistant_message(item)
+    ]
+
+    if not NOTIFICATION_CURSOR_INITIALIZED:
+        for message in assistant_rows:
+            _remember_notification_seen(_history_message_identity(message))
+        NOTIFICATION_CURSOR_INITIALIZED = True
+        save_notification_listener_state()
+        print(
+            f"[NOTIFY] baseline established session={session_key} "
+            f"assistant_rows={len(assistant_rows)}; old history will not be spoken"
+        )
+        return
+
+    # Never classify the synchronous HTTP response as an async notification.
+    # The event can arrive before /v1/chat/completions returns, so wait until the
+    # current voice request has registered its exact response suppression hash.
+    if VOICE_OPENCLAW_INFLIGHT > 0:
+        return
+
+    changed = False
+    for raw in assistant_rows:
+        if not isinstance(raw, dict):
+            continue
+        key = _history_message_identity(raw)
+        if not key or key in NOTIFICATION_SEEN_SET:
+            continue
+        text = _history_message_text(raw)
+        if _consume_voice_reply_suppression(text):
+            _remember_notification_seen(key)
+            changed = True
+            print("[NOTIFY] synchronous voice reply observed and suppressed")
+            continue
+
+        queued = await _enqueue_async_notification(session_key, raw)
+        if not queued:
+            print("[NOTIFY-WARN] queue persistence failed; transcript cursor not advanced")
+            break
+        _remember_notification_seen(key)
+        changed = True
+
+    if changed:
+        save_notification_listener_state()
+
+
+async def openclaw_voice_session_listener_loop() -> None:
+    if not NOTIFICATION_LISTENER_ENABLED:
+        print("[NOTIFY] OpenClaw session listener disabled")
+        return
+
+    session_key = _openclaw_voice_session_key()
+    load_notification_listener_state(session_key)
+    reconnect_delay = NOTIFICATION_RECONNECT_MIN_SEC
+
+    while True:
+        ws: Any | None = None
+        try:
+            ws = await _openclaw_listener_connect()
+            print(
+                f"[NOTIFY] OpenClaw listener connected ws={_openclaw_gateway_ws_url()} "
+                f"session={session_key}"
+            )
+
+            _, dirty = await _listener_rpc(
+                ws,
+                "sessions.messages.subscribe",
+                {"key": session_key, "agentId": OPENCLAW_VOICE_AGENT_ID},
+                session_key=session_key,
+            )
+            print(f"[NOTIFY] subscribed session={session_key}")
+
+            # A one-time session-index subscription gives us a second invalidation
+            # signal across reset/compaction without polling.
+            try:
+                _, saw_change = await _listener_rpc(
+                    ws,
+                    "sessions.subscribe",
+                    {},
+                    session_key=session_key,
+                )
+                dirty = dirty or saw_change
+            except Exception as exc:
+                print(
+                    f"[NOTIFY-WARN] sessions.subscribe unavailable; "
+                    f"message subscription remains active: {type(exc).__name__}: {exc}"
+                )
+
+            history, saw_event = await _listener_rpc(
+                ws,
+                "chat.history",
+                {
+                    "sessionKey": session_key,
+                    "agentId": OPENCLAW_VOICE_AGENT_ID,
+                    "limit": NOTIFICATION_HISTORY_LIMIT,
+                    "maxChars": 12000,
+                },
+                session_key=session_key,
+            )
+            dirty = dirty or saw_event
+            await _reconcile_voice_session_history(history, session_key)
+            reconnect_delay = NOTIFICATION_RECONNECT_MIN_SEC
+
+            while True:
+                # If a session event raced the synchronous /v1/chat/completions
+                # voice turn, do not block on the next WebSocket event. Recheck
+                # locally until openclaw_chat() has registered the exact reply
+                # suppression hash and released the in-flight gate.
+                if dirty and VOICE_OPENCLAW_INFLIGHT > 0:
+                    await asyncio.sleep(0.10)
+                    continue
+
+                if dirty and VOICE_OPENCLAW_INFLIGHT == 0:
+                    await asyncio.sleep(0.12)
+                    history, saw_event = await _listener_rpc(
+                        ws,
+                        "chat.history",
+                        {
+                            "sessionKey": session_key,
+                            "agentId": OPENCLAW_VOICE_AGENT_ID,
+                            "limit": NOTIFICATION_HISTORY_LIMIT,
+                            "maxChars": 12000,
+                        },
+                        session_key=session_key,
+                    )
+                    dirty = saw_event
+                    await _reconcile_voice_session_history(history, session_key)
+                    continue
+
+                raw = await ws.recv()
+                frame = json.loads(raw)
+                if not isinstance(frame, dict):
+                    continue
+                if frame.get("type") != "event":
+                    continue
+                event_name = str(frame.get("event") or "")
+                if event_name == "shutdown":
+                    raise RuntimeError("OpenClaw Gateway announced shutdown")
+                if _listener_event_targets_voice_session(frame, session_key):
+                    dirty = True
+
+        except asyncio.CancelledError:
+            if ws is not None:
+                await ws.close()
+            raise
+        except Exception as exc:
+            print(
+                f"[NOTIFY-WARN] OpenClaw listener disconnected: "
+                f"{type(exc).__name__}: {exc}; retry_in={reconnect_delay:.0f}s"
+            )
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(
+                NOTIFICATION_RECONNECT_MAX_SEC,
+                max(NOTIFICATION_RECONNECT_MIN_SEC, reconnect_delay * 2.0),
+            )
 
 
 async def _cleanup_openclaw_info_session(
@@ -2392,24 +3085,62 @@ def _three_line_headline(
     text: str,
     font,
 ) -> tuple[str, str, str]:
-    text = " ".join(text.strip().split())
+    # Preserve explicit line breaks supplied by OpenClaw as hard breaks.
+    # Within each logical line, normalize incidental whitespace and keep the
+    # existing width-based wrapping behavior. Glass2 layout remains frozen at
+    # three 11 px body lines in the same positions.
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    logical_lines = normalized.strip().split("\n")
 
-    line1, rest = _fit_line(draw, text, font, 124)
-    if not rest:
-        return line1, "", ""
+    rendered: list[str] = []
+    overflow = False
 
-    line2, rest = _fit_line(draw, rest, font, 124)
-    if not rest:
-        return line1, line2, ""
+    for logical_index, raw_line in enumerate(logical_lines):
+        line_text = " ".join(raw_line.strip().split())
+        if not line_text:
+            # Ignore accidental empty lines rather than consuming scarce Glass2
+            # rows; the meaningful explicit break between non-empty lines is
+            # still preserved because each logical line starts a new row.
+            continue
 
-    line3, remainder = _fit_line(draw, rest, font, 124)
-    if not remainder:
-        return line1, line2, line3
+        rest = line_text
+        while rest:
+            if len(rendered) >= 3:
+                overflow = True
+                break
 
-    ellipsis = "…"
-    while line3 and _text_width(draw, line3 + ellipsis, font) > 124:
-        line3 = line3[:-1]
-    return line1, line2, line3 + ellipsis
+            line, next_rest = _fit_line(draw, rest, font, 124)
+            if not line:
+                # Defensive progress guarantee for an unexpectedly wide glyph.
+                line = rest[0]
+                next_rest = rest[1:]
+            rendered.append(line)
+            rest = next_rest
+
+        if overflow:
+            break
+
+        # If all three display rows are already occupied, any later non-empty
+        # logical line means the title was truncated and needs an ellipsis.
+        if len(rendered) >= 3:
+            remaining = logical_lines[logical_index + 1:]
+            if any(" ".join(v.strip().split()) for v in remaining):
+                overflow = True
+                break
+
+    if not rendered:
+        return "", "", ""
+
+    if overflow:
+        ellipsis = "…"
+        last = rendered[-1]
+        while last and _text_width(draw, last + ellipsis, font) > 124:
+            last = last[:-1]
+        rendered[-1] = last + ellipsis
+
+    while len(rendered) < 3:
+        rendered.append("")
+    return rendered[0], rendered[1], rendered[2]
 
 
 def render_feed_frame(item: FeedItem, index: int, total: int) -> bytes:
@@ -2455,6 +3186,48 @@ def render_feed_frame(item: FeedItem, index: int, total: int) -> bytes:
     data = image.tobytes()
     if len(data) != INFO_FRAME_WIDTH * INFO_FRAME_HEIGHT // 8:
         raise RuntimeError(f"invalid rendered frame size={len(data)}")
+    return data
+
+
+def render_reminder_frame(record: ReminderRecord) -> bytes:
+    """Render one high-contrast Glass2 reminder frame on the Mac mini.
+
+    The device remains font-light: arbitrary Chinese reminder text is rasterized
+    here exactly like the Info feed and transferred as a 128x64 1-bit frame.
+    """
+    image = Image.new("1", (INFO_FRAME_WIDTH, INFO_FRAME_HEIGHT), 0)
+    draw = ImageDraw.Draw(image)
+    title_font = _load_cjk_font(10, bold=True)
+    body_font = _load_cjk_font(10)
+    small_font = ImageFont.load_default()
+
+    title = record.title.strip() or "提醒"
+    title_line, _ = _fit_line(draw, title, title_font, 124)
+    draw.text((2, 1), title_line or "提醒", font=title_font, fill=1)
+    draw.line((0, 13, 127, 13), fill=1)
+
+    text = " ".join(record.text.strip().split())
+    y_positions = (17, 29, 41)
+    rest = text
+    for line_index, y in enumerate(y_positions):
+        if not rest:
+            break
+        line, next_rest = _fit_line(draw, rest, body_font, 124)
+        if line_index == len(y_positions) - 1 and next_rest:
+            ellipsis = "…"
+            while line and _text_width(draw, line + ellipsis, body_font) > 124:
+                line = line[:-1]
+            line += ellipsis
+            next_rest = ""
+        draw.text((2, y), line, font=body_font, fill=1)
+        rest = next_rest
+
+    draw.line((0, 53, 127, 53), fill=1)
+    draw.text((2, 56), "HOMEAI NOTICE", font=small_font, fill=1)
+
+    data = image.tobytes()
+    if len(data) != INFO_FRAME_WIDTH * INFO_FRAME_HEIGHT // 8:
+        raise RuntimeError(f"invalid reminder frame size={len(data)}")
     return data
 
 
@@ -3167,6 +3940,8 @@ async def volcengine_tts_pcm(text: str) -> tuple[bytes, int]:
                 if frame["msg_type"] == _VOLC_TTS_MSG_ERROR:
                     raise RuntimeError(
                         f"Volcengine TTS error code={frame['error_code']} "
+                        f"resource={VOLCENGINE_TTS_RESOURCE_ID} "
+                        f"speaker={VOLCENGINE_TTS_VOICE} "
                         f"payload={frame['payload']}"
                     )
 
@@ -3304,38 +4079,50 @@ Glass2 当前资讯上下文：
 
 
 async def openclaw_chat(transcript: str, context: dict[str, Any]) -> str:
-    headers = {"Content-Type": "application/json"}
-    if OPENCLAW_TOKEN:
-        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+    global VOICE_OPENCLAW_INFLIGHT
+    VOICE_OPENCLAW_INFLIGHT += 1
+    try:
+        headers = {"Content-Type": "application/json"}
+        if OPENCLAW_TOKEN:
+            headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
 
-    payload = {
-        "model": OPENCLAW_MODEL,
-        "user": OPENCLAW_USER,
-        "stream": False,
-        "messages": [
-            {"role": "user", "content": build_agent_prompt(transcript, enrich_info_context(context))}
-        ],
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await _post_with_retry(
-            client,
-            f"{OPENCLAW_BASE_URL}/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        body = r.json()
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"OpenClaw returned no choices: {body}")
-    content = choices[0].get("message", {}).get("content", "")
-    if isinstance(content, list):
-        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-    text = str(content).strip()
-    if not text:
-        raise RuntimeError("OpenClaw returned empty assistant text")
-    if len(text) > MAX_AGENT_CHARS:
-        text = text[:MAX_AGENT_CHARS].rstrip() + "。"
-    return text
+        payload = {
+            "model": OPENCLAW_MODEL,
+            "user": OPENCLAW_USER,
+            "stream": False,
+            "messages": [
+                {"role": "user", "content": build_agent_prompt(transcript, enrich_info_context(context))}
+            ],
+        }
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await _post_with_retry(
+                client,
+                f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            body = r.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"OpenClaw returned no choices: {body}")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        full_text = str(content).strip()
+        if not full_text:
+            raise RuntimeError("OpenClaw returned empty assistant text")
+
+        # The session listener receives the same assistant row asynchronously.
+        # Register the exact stored response before releasing the in-flight gate
+        # so it can be marked seen without being spoken twice.
+        _register_voice_reply_suppression(full_text)
+
+        text = full_text
+        if len(text) > MAX_AGENT_CHARS:
+            text = text[:MAX_AGENT_CHARS].rstrip() + "。"
+        return text
+    finally:
+        VOICE_OPENCLAW_INFLIGHT = max(0, VOICE_OPENCLAW_INFLIGHT - 1)
 
 
 async def openai_tts_wav(text: str) -> bytes:
@@ -3618,6 +4405,186 @@ async def send_pcm_for_playback(
         session.playback_sequence_active = False
 
 
+def _reminder_session_available(session: ClientSession) -> bool:
+    return not (
+        session.recording
+        or session.processing
+        or session.playback_sequence_active
+    )
+
+
+def _reminder_spoken_text(text: str) -> str:
+    # OpenClaw's final user-visible assistant output is already the canonical
+    # notification wording. Do not prepend or rewrite it here.
+    return text.strip()
+
+
+async def _send_reminder_overlay(
+    session: ClientSession,
+    record: ReminderRecord,
+) -> None:
+    """Temporarily reuse the already-stable Info frame transport.
+
+    This deliberately avoids a new StickS3 protocol or firmware path. The
+    one-item reminder feed stays on Glass2 while TTS plays, then the canonical
+    Info feed is restored. During the night sleep window the display remains
+    dark, but the audible reminder still uses the same validated TTS path.
+    """
+    frame = render_reminder_frame(record)
+    revision = f"reminder-{record.reminder_id}"
+    await send_json(session.ws, {
+        "type": "info.begin",
+        "revision": revision,
+        "count": 1,
+    })
+    await send_json(session.ws, {
+        "type": "info.item",
+        "revision": revision,
+        "index": 0,
+        "id": record.reminder_id,
+        "category": "提醒",
+        "headline": record.text,
+        "frame_hex": frame.hex(),
+    })
+    await send_json(session.ws, {
+        "type": "info.end",
+        "revision": revision,
+        "count": 1,
+    })
+    print(f"[NOTIFY] overlay sent id={record.reminder_id}")
+
+
+async def _deliver_reminder_to_device(
+    session: ClientSession,
+    record: ReminderRecord,
+) -> None:
+    session.processing = True
+    overlay_sent = False
+
+    try:
+        # Prevent a new PTT turn while the reminder TTS is being prepared.
+        await send_state(session.ws, "thinking")
+        await _send_reminder_overlay(session, record)
+        overlay_sent = True
+
+        spoken = _reminder_spoken_text(record.text)
+        tts_started = time.perf_counter()
+        pcm, sample_rate, provider = await synthesize_speech(spoken)
+        tts_ms = int((time.perf_counter() - tts_started) * 1000)
+        print(
+            f"[NOTIFY] TTS ready id={record.reminder_id} "
+            f"provider={provider} bytes={len(pcm)} ms={tts_ms}"
+        )
+        await send_pcm_for_playback(session, pcm, sample_rate)
+        print(f"[NOTIFY] device playback ACK id={record.reminder_id}")
+
+    finally:
+        # Restore the real feed even if synthesis/playback failed. The reminder
+        # itself remains in the durable queue and will retry later on failure.
+        if overlay_sent:
+            try:
+                await send_info_sync(session)
+                print(f"[NOTIFY] info feed restored id={record.reminder_id}")
+            except Exception as exc:
+                print(
+                    f"[NOTIFY-WARN] feed restore failed id={record.reminder_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        try:
+            await send_state(session.ws, "idle")
+        except Exception:
+            pass
+        session.processing = False
+
+
+async def reminder_dispatch_loop() -> None:
+    while True:
+        try:
+            now = time.time()
+            record: ReminderRecord | None = None
+
+            assert REMINDER_LOCK is not None
+            async with REMINDER_LOCK:
+                for item in REMINDER_PENDING:
+                    if item.next_attempt_at <= now:
+                        record = item
+                        break
+
+            if record is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            # Prefer the newest live device connection. Reconnect races can
+            # briefly leave an older session in the list. Never broadcast a
+            # user reminder to multiple terminals.
+            session = next(
+                (s for s in reversed(ACTIVE_SESSIONS) if _reminder_session_available(s)),
+                None,
+            )
+            if session is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
+                print(
+                    f"[NOTIFY] deliver begin id={record.reminder_id} "
+                    f"attempt={record.attempts + 1} text={record.text!r}"
+                )
+                await _deliver_reminder_to_device(session, record)
+
+                async with REMINDER_LOCK:
+                    REMINDER_PENDING[:] = [
+                        item for item in REMINDER_PENDING
+                        if item.dedup_key != record.dedup_key
+                    ]
+                    delivered = {
+                        "dedup_key": record.dedup_key,
+                        "reminder_id": record.reminder_id,
+                        "delivered_at": _iso_now(),
+                    }
+                    REMINDER_DELIVERED.append(delivered)
+                    del REMINDER_DELIVERED[:-REMINDER_DELIVERED_HISTORY]
+                    REMINDER_DELIVERED_KEYS.clear()
+                    REMINDER_DELIVERED_KEYS.update(
+                        item["dedup_key"] for item in REMINDER_DELIVERED
+                        if item.get("dedup_key")
+                    )
+                    save_reminder_queue()
+
+                print(
+                    f"[NOTIFY] delivered id={record.reminder_id} "
+                    f"pending={len(REMINDER_PENDING)}"
+                )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                record.attempts += 1
+                backoff = min(REMINDER_RETRY_MAX_SEC, 2 ** min(record.attempts, 8))
+                record.next_attempt_at = time.time() + backoff
+                record.last_error = f"{type(exc).__name__}: {exc}"[:300]
+                async with REMINDER_LOCK:
+                    save_reminder_queue()
+                print(
+                    f"[NOTIFY-WARN] delivery failed id={record.reminder_id} "
+                    f"attempts={record.attempts} retry_in={backoff}s "
+                    f"error={record.last_error}"
+                )
+                try:
+                    if session.ws:
+                        await send_state(session.ws, "idle")
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0.2)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[NOTIFY-ERROR] dispatch loop: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(1.0)
+
+
 async def process_utterance(session: ClientSession) -> None:
     if session.processing:
         return
@@ -3850,6 +4817,13 @@ async def handle_connection(ws) -> None:
                     session.processing = False
                     await send_state(ws, "error")
 
+    except ConnectionClosed as exc:
+        # A device-side reconnect is recoverable.  Treat an ungraceful socket
+        # close as a normal transport event here so the server does not emit a
+        # scary handler traceback while the StickS3 reconnect loop does its job.
+        code = getattr(exc, "code", None)
+        reason = getattr(exc, "reason", "")
+        print(f"[WS] client connection closed code={code} reason={reason!r}")
     finally:
         if session.display_policy_task is not None:
             session.display_policy_task.cancel()
@@ -3860,6 +4834,19 @@ async def handle_connection(ws) -> None:
 
 async def preflight() -> int:
     print("=== HomeAIAgent Gateway persistent-config preflight ===")
+    if (
+        VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
+        or VOLCENGINE_TTS_VOICE != A1R7_STANDARD_TTS_VOICE
+    ):
+        print(
+            "[FAIL] A1R7 standard TTS guard rejected active pairing: "
+            f"resource={VOLCENGINE_TTS_RESOURCE_ID} voice={VOLCENGINE_TTS_VOICE}"
+        )
+        print(
+            "[FAIL] expected resource=seed-tts-2.0 "
+            "voice=zh_female_vv_uranus_bigtts"
+        )
+        return 4
     print(f"[CFG] persistent_config={PERSISTENT_ENV}")
     print(f"[CFG] persistent_exists={PERSISTENT_ENV.exists()}")
     print(f"[CFG] mode={MODE}")
@@ -3914,6 +4901,13 @@ async def preflight() -> int:
         f"timezone={INFO_SCHEDULE_TIMEZONE}"
     )
     print(f"[CFG] gold_quote_url={GOLD_QUOTE_URL}")
+    print(
+        f"[CFG] notification_listener enabled={NOTIFICATION_LISTENER_ENABLED} "
+        f"session={_openclaw_voice_session_key()} "
+        f"transport=gateway-ws-outbound"
+    )
+    print(f"[CFG] notification_queue={REMINDER_QUEUE_FILE}")
+    print(f"[CFG] notification_state={NOTIFICATION_STATE_FILE}")
 
     if MODE != "full":
         print("[WARN] P0_MODE is not 'full'; full AI conversation is disabled.")
@@ -3979,6 +4973,19 @@ async def preflight() -> int:
 
 
 async def main() -> None:
+    global REMINDER_LOCK
+
+    if (
+        VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
+        or VOLCENGINE_TTS_VOICE != A1R7_STANDARD_TTS_VOICE
+    ):
+        raise RuntimeError(
+            "A1R7 standard TTS guard rejected active pairing: "
+            f"resource={VOLCENGINE_TTS_RESOURCE_ID} voice={VOLCENGINE_TTS_VOICE}"
+        )
+
+    REMINDER_LOCK = asyncio.Lock()
+    load_reminder_queue()
     load_info_skill_cache()
     load_gold_quote_cache()
 
@@ -4006,6 +5013,8 @@ async def main() -> None:
         gold_task = asyncio.create_task(gold_quote_loop())
         display_task = asyncio.create_task(display_schedule_loop())
         display_reconcile_task = asyncio.create_task(display_reconcile_loop())
+        reminder_task = asyncio.create_task(reminder_dispatch_loop())
+        notification_listener_task = asyncio.create_task(openclaw_voice_session_listener_loop())
         try:
             await asyncio.Future()
         finally:
@@ -4013,6 +5022,8 @@ async def main() -> None:
             gold_task.cancel()
             display_task.cancel()
             display_reconcile_task.cancel()
+            reminder_task.cancel()
+            notification_listener_task.cancel()
 
 
 if __name__ == "__main__":

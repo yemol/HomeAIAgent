@@ -395,8 +395,13 @@ static uint32_t wakeNoiseFloor = 0;
 static uint32_t wakeLastAudioProgressMs = 0;
 static uint32_t wakeLastRecoveryMs = 0;
 static uint32_t wakeRecoveryCount = 0;
+static bool wakeFeedReady = false;
+static uint32_t wakeFeedReadyStartedMs = 0;
+static uint32_t wakeLastFeedLevel = 0;
+static uint32_t wakeLastHealthLogMs = 0;
 static constexpr uint32_t WAKE_FEED_STALL_MS = 1200;
 static constexpr uint32_t WAKE_RECOVERY_COOLDOWN_MS = 2500;
+static constexpr uint32_t WAKE_HEALTH_LOG_MS = 30000;
 
 // Hands-free capture state after a local wake event.
 static bool autoWakeCaptureActive = false;
@@ -409,9 +414,9 @@ static uint32_t autoWakeLastVadLevel = 0;
 static bool autoWakeVadVoice = false;
 static size_t autoWakeTrimOffsetBytes = 0;
 
-static constexpr uint32_t AUTO_WAKE_WAIT_SPEECH_MS = 3500;
+static constexpr uint32_t AUTO_WAKE_WAIT_SPEECH_MS = 5000;
 static constexpr uint32_t AUTO_WAKE_END_SILENCE_MS = 3000;
-static constexpr uint32_t AUTO_WAKE_MAX_CAPTURE_MS = 10000;
+static constexpr uint32_t AUTO_WAKE_MAX_CAPTURE_MS = AUDIO_MAX_PTT_MS;
 static constexpr uint32_t AUTO_WAKE_MIN_CAPTURE_MS = 700;
 static constexpr uint32_t AUTO_WAKE_PREROLL_MS = 300;
 static constexpr uint32_t AUTO_WAKE_MIN_VOICE_LEVEL = 450;
@@ -653,6 +658,10 @@ uint32_t idleBlinkStartedMs = 0;
 WebSocketsClient webSocket;
 bool gatewayConnected = false;
 bool webSocketStarted = false;
+// Set only when the transport itself dropped.  A reconnect must clear the
+// transport-originated Error state so the normal Idle -> wake-listen re-arm
+// path can run again.  Keep this separate from functional Error states.
+bool gatewayTransportFault = false;
 
 bool wifiOnline = false;
 bool wifiAttemptActive = false;
@@ -2139,8 +2148,9 @@ static CompanionState parseRemoteState(const char* value) {
 }
 
 #if COMPANION_AUDIO_ENABLE
-static bool configureStickS3MicInput() {
-  // M5Unified exposes a supported digital mic magnification setting.
+static bool configureStickS3MicInputGain(int requestedGainDb, const char* modeLabel) {
+  // Keep the validated command-capture DSP path unchanged.  A1R9 only uses a
+  // small analog PGA lift while the device is idling in wake-word listen mode.
   auto micCfg = M5.Mic.config();
   micCfg.sample_rate = AUDIO_MIC_SAMPLE_RATE;
   micCfg.magnification = AUDIO_MIC_DIGITAL_MAG;
@@ -2150,19 +2160,29 @@ static bool configureStickS3MicInput() {
 
   // StickS3 uses ES8311 at 0x18 on the internal I2C bus.
   // ES8311 REG14: bit4 selects analog MIC input; bits3:0 are PGA gain
-  // in 3 dB steps (0..30 dB). M5Unified initializes this register to
-  // 0x10, i.e. analog MIC selected with minimum PGA gain.
-  int gainDb = AUDIO_MIC_PGA_GAIN_DB;
+  // in 3 dB steps (0..30 dB).
+  int gainDb = requestedGainDb;
   if (gainDb < 0) gainDb = 0;
   if (gainDb > 30) gainDb = 30;
   const uint8_t gainSteps = static_cast<uint8_t>((gainDb + 1) / 3);
   const uint8_t reg14 = static_cast<uint8_t>(0x10 | (gainSteps > 10 ? 10 : gainSteps));
 
   const bool ok = M5.In_I2C.writeRegister(0x18, 0x14, &reg14, 1, 100000);
-  Serial.printf("[AUDIO] mic PGA request=%d dB reg14=0x%02X write=%s\n",
-                gainDb, reg14, ok ? "OK" : "FAIL");
+  Serial.printf(
+      "[AUDIO] mic PGA mode=%s request=%d dB reg14=0x%02X write=%s\n",
+      modeLabel ? modeLabel : "unknown", gainDb, reg14, ok ? "OK" : "FAIL");
   return ok;
 }
+
+static bool configureStickS3MicInput() {
+  return configureStickS3MicInputGain(AUDIO_MIC_PGA_GAIN_DB, "capture");
+}
+
+#if HOMEAI_WAKEWORD_ENABLE
+static bool configureStickS3WakeMicInput() {
+  return configureStickS3MicInputGain(AUDIO_WAKE_MIC_PGA_GAIN_DB, "wake");
+}
+#endif
 
 static void freeTtsSlot(int8_t slotIndex) {
   if (slotIndex < 0 || slotIndex >= 2) return;
@@ -2504,12 +2524,25 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_CONNECTED:
       gatewayConnected = true;
       Serial.println("[WS] connected");
+
+      // A1R10: the disconnect handler intentionally pauses the local wake
+      // recognizer and moves the UI state to Error.  Prior versions forgot to
+      // leave that transport-originated Error after the socket came back, so
+      // updateWakeWordSystem() could never re-arm listening even though hello,
+      // info sync and display traffic had already recovered.
+      if (gatewayTransportFault) {
+        gatewayTransportFault = false;
+        setState(CompanionState::Idle);
+        Serial.println("[WS-RECOVER] transport restored -> idle; wake re-arm pending");
+      }
+
       sendJsonEvent("device.hello");
       drawGlassFrame();
       break;
 
     case WStype_DISCONNECTED:
       gatewayConnected = false;
+      gatewayTransportFault = true;
       Serial.println("[WS] disconnected");
 #if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
       pauseWakeRecognizerForTurn();
@@ -2988,11 +3021,15 @@ static bool restartWakeMicPath(const char* reason, bool recovery) {
         static_cast<unsigned>(pauseOk));
     return false;
   }
-  configureStickS3MicInput();
+  configureStickS3WakeMicInput();
 
   wakeAcceptedBlocks = 0;
   wakeFedBlocks = 0;
   wakeWordDetected = false;
+  wakeFeedReady = false;
+  wakeFeedReadyStartedMs = millis();
+  wakeLastFeedLevel = 0;
+  wakeLastHealthLogMs = wakeFeedReadyStartedMs;
 
   const bool modeOk = ESP_SR_M5.setMode(SR_MODE_COMMAND);
   const bool resumeOk = ESP_SR_M5.resume();
@@ -3059,6 +3096,9 @@ static void updateWakeAudioFeed() {
       if (safeSequence >= wakeFedBlocks) {
         const size_t safeIdx = safeSequence % AUDIO_MIC_RING_BLOCKS;
 
+        wakeLastFeedLevel = meanAbsLevel(
+            wakeRing[safeIdx],
+            AUDIO_MIC_BLOCK_SAMPLES);
         updateWakeNoiseFloor(
             wakeRing[safeIdx],
             AUDIO_MIC_BLOCK_SAMPLES);
@@ -3069,7 +3109,31 @@ static void updateWakeAudioFeed() {
 
         ++wakeFedBlocks;
         wakeLastAudioProgressMs = now;
+
+        if (!wakeFeedReady && wakeFedBlocks >= 4) {
+          wakeFeedReady = true;
+          Serial.printf(
+              "[WAKE-HEALTH] ready in=%ums accepted=%u fed=%u level=%u noiseFloor=%u pga=%ddB\n",
+              static_cast<unsigned>(now - wakeFeedReadyStartedMs),
+              static_cast<unsigned>(wakeAcceptedBlocks),
+              static_cast<unsigned>(wakeFedBlocks),
+              static_cast<unsigned>(wakeLastFeedLevel),
+              static_cast<unsigned>(wakeNoiseFloor),
+              static_cast<int>(AUDIO_WAKE_MIC_PGA_GAIN_DB));
+        }
       }
+    }
+
+    if (wakeFeedReady && now - wakeLastHealthLogMs >= WAKE_HEALTH_LOG_MS) {
+      wakeLastHealthLogMs = now;
+      Serial.printf(
+          "[WAKE-HEALTH] alive accepted=%u fed=%u level=%u noiseFloor=%u micRunning=%u micRecording=%u\n",
+          static_cast<unsigned>(wakeAcceptedBlocks),
+          static_cast<unsigned>(wakeFedBlocks),
+          static_cast<unsigned>(wakeLastFeedLevel),
+          static_cast<unsigned>(wakeNoiseFloor),
+          static_cast<unsigned>(M5.Mic.isRunning()),
+          static_cast<unsigned>(M5.Mic.isRecording()));
     }
     return;
   }
@@ -3080,10 +3144,12 @@ static void updateWakeAudioFeed() {
       now - wakeLastAudioProgressMs >= WAKE_FEED_STALL_MS &&
       now - wakeLastRecoveryMs >= WAKE_RECOVERY_COOLDOWN_MS) {
     Serial.printf(
-        "[WAKE-RECOVER] feed stall ms=%u accepted=%u fed=%u micRunning=%u micRecording=%u\n",
+        "[WAKE-RECOVER] feed stall ms=%u accepted=%u fed=%u ready=%u level=%u micRunning=%u micRecording=%u\n",
         static_cast<unsigned>(now - wakeLastAudioProgressMs),
         static_cast<unsigned>(wakeAcceptedBlocks),
         static_cast<unsigned>(wakeFedBlocks),
+        static_cast<unsigned>(wakeFeedReady),
+        static_cast<unsigned>(wakeLastFeedLevel),
         static_cast<unsigned>(M5.Mic.isRunning()),
         static_cast<unsigned>(M5.Mic.isRecording()));
     restartWakeMicPath("feed-stall", true);
@@ -3113,6 +3179,9 @@ static void cancelAutoWakeCaptureNoSpeech() {
 
   if (M5.Mic.isRunning()) M5.Mic.end();
 
+  const uint32_t noSpeechLastLevel = autoWakeLastVadLevel;
+  const uint32_t noSpeechThreshold = currentAutoVadThreshold();
+
   sendJsonEvent("ptt.abort", 0, "wake_word", "no_speech");
   resetAutoWakeCaptureState();
   pttCaptureBytes = 0;
@@ -3125,7 +3194,11 @@ static void cancelAutoWakeCaptureNoSpeech() {
   endGlassVoiceIsolation();
   drawGlassFrame();
 
-  Serial.println("[WAKE] no command");
+  Serial.printf(
+      "[WAKE] no command wait=%ums lastLevel=%u threshold=%u\n",
+      static_cast<unsigned>(AUTO_WAKE_WAIT_SPEECH_MS),
+      static_cast<unsigned>(noSpeechLastLevel),
+      static_cast<unsigned>(noSpeechThreshold));
 }
 
 static void updateAutoWakeVad(
@@ -3295,7 +3368,7 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
     if (M5.Mic.isRunning()) M5.Mic.end();
   } else {
     // Give the user an immediate local acknowledgement before opening the
-    // hands-free command window.  The 3.5 s speech-start timer is armed only
+    // hands-free command window.  The speech-start timer is armed only
     // after this function returns and the microphone is running again.
     playLocalWakeAckTone();
   }
@@ -3385,6 +3458,13 @@ static void updateWakeWordSystem() {
   if (wakeWordDetected &&
       wakeListening &&
       companionState == CompanionState::Idle) {
+    Serial.printf(
+        "[WAKE-HIT] ready=%u accepted=%u fed=%u level=%u noiseFloor=%u\n",
+        static_cast<unsigned>(wakeFeedReady),
+        static_cast<unsigned>(wakeAcceptedBlocks),
+        static_cast<unsigned>(wakeFedBlocks),
+        static_cast<unsigned>(wakeLastFeedLevel),
+        static_cast<unsigned>(wakeNoiseFloor));
     if (!startAutoCaptureFromWake()) {
       wakeWordDetected = false;
     }
