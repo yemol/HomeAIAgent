@@ -13,8 +13,8 @@ homeai_source_config
 
 LOCAL_PORT="${OPENCLAW_LOCAL_PORT:-18790}"
 if ! nc -z 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then
-  echo "[FAIL] OpenClaw SSH tunnel is not running on 127.0.0.1:${LOCAL_PORT}."
-  echo "Start ./openclaw_air_tunnel.sh first."
+  echo "[FAIL] Managed OpenClaw transport is not active on 127.0.0.1:${LOCAL_PORT}."
+  echo "Start ./run_full.sh first, then run this listener check in another Terminal."
   exit 3
 fi
 

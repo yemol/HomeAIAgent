@@ -2,3 +2,6 @@ websockets>=15,<17
 httpx>=0.28,<1
 python-dotenv>=1.0,<2
 Pillow>=10.0
+# Python 3.9 on the current Mac mini runtime is supported by AsyncSSH 2.14.2.
+# Newer AsyncSSH releases require newer Python, so keep this compatibility pin.
+asyncssh==2.14.2

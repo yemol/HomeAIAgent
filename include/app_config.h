@@ -12,7 +12,7 @@
 #define GLASS2_I2C_PORT 0
 
 // Glass2 information card timing.
-#define INFO_HOLD_MS 10000
+#define INFO_HOLD_MS 15000
 
 // True voice audio transport.
 // Mic: signed PCM16 little-endian, mono, 16 kHz.
@@ -31,7 +31,8 @@
 #define AUDIO_MIC_DIGITAL_MAG 16       // keep digital stage neutral
 #define AUDIO_MIC_NOISE_FILTER_LEVEL 64 // mild first-order smoothing; 0=off, 255=strong
 #define AUDIO_SPEAKER_VOLUME 255       // validated real-voice baseline
-#define AUDIO_SPEAKER_MAGNIFICATION 4  // validated real-voice baseline
+#define AUDIO_SPEAKER_MAGNIFICATION 5  // normal assistant TTS; validated louder playback rail
+#define AUDIO_WAKE_ACK_MAGNIFICATION 6 // A1R18: full natural wake ACK on dedicated MAG6; normal TTS remains MAG5
 
 // Idle mascot micro-animation.
 #define IDLE_BLINK_INTERVAL_MS 4200

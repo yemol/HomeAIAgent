@@ -18,6 +18,7 @@
 
 #if HOMEAI_WAKEWORD_ENABLE
   #include <ESP_SR_M5Unified.h>
+  #include "wake_ack_voice_pcm.h"
 
   // Local custom trigger phrase via Chinese MultiNet.
   static const sr_cmd_t HOMEAI_WAKE_COMMANDS[] = {
@@ -3290,10 +3291,10 @@ static void updateAutoWakeVad(
   }
 }
 
-static void playLocalWakeAckTone() {
-  // StickS3 ES8311 is half-duplex.  Stop the wake microphone first, play a
-  // tiny local confirmation sound, then let startVoiceCaptureInternal()
-  // restart the microphone.  No Gateway / ASR / OpenClaw / cloud TTS is used.
+static void playLocalWakeAckVoice() {
+  // StickS3 ES8311 is half-duplex. Stop the wake microphone first, play the
+  // embedded local "在的" PCM prompt, then restart the microphone for the
+  // command window. No Gateway / ASR / OpenClaw / cloud TTS is involved.
   const uint32_t settleStarted = millis();
   while (M5.Mic.isRecording() && millis() - settleStarted < 80) {
     M5.update();
@@ -3302,17 +3303,14 @@ static void playLocalWakeAckTone() {
 
   if (M5.Mic.isRunning()) M5.Mic.end();
 
-  // The wake acknowledgement is intentionally much lower-power than normal
-  // TTS.  A full-volume speaker transition immediately after Mic shutdown can
-  // create a sharp rail transient on StickS3 and trigger the brownout detector.
-  // Give the half-duplex audio rail a moment to settle, then use a dedicated
-  // low-power speaker configuration.  Normal TTS restores its validated
-  // AUDIO_SPEAKER_* settings in ensureSpeakerForTts().
+  // A1R18: keep the wake acknowledgement prominent, but preserve the full
+  // natural "在的" waveform. Loudness comes from the dedicated MAG6 playback
+  // rail instead of A1R17 hard compression/tail trimming. Normal TTS stays MAG5.
   delay(24);
 
   if (!M5.Speaker.isRunning()) {
     auto ackCfg = M5.Speaker.config();
-    ackCfg.magnification = 1;
+    ackCfg.magnification = AUDIO_WAKE_ACK_MAGNIFICATION;
     M5.Speaker.config(ackCfg);
     if (!M5.Speaker.begin()) {
       Serial.println("[WAKE-ACK] speaker begin failed");
@@ -3320,25 +3318,54 @@ static void playLocalWakeAckTone() {
     }
   }
 
-  M5.Speaker.setVolume(80);
-  M5.Speaker.setAllChannelVolume(96);
+  M5.Speaker.setVolume(AUDIO_SPEAKER_VOLUME);
+  M5.Speaker.setAllChannelVolume(255);
   delay(12);
 
-  // Short rising two-note acknowledgement.  It is deliberately compact so
-  // the wake-to-command gap remains small and firmware flash cost stays tiny.
-  const bool tone1 = M5.Speaker.tone(1047.0f, 65, -1, true);
-  delay(78);
-  const bool tone2 = M5.Speaker.tone(1319.0f, 80, -1, true);
-  delay(96);
+  const bool ok = M5.Speaker.playRaw(
+      kWakeAckVoicePcm,
+      kWakeAckVoiceSampleCount,
+      kWakeAckVoiceSampleRate,
+      false,
+      1,
+      kTtsSpeakerChannel,
+      true);
 
-  M5.Speaker.stop();
+  if (ok) {
+    const uint32_t wakeAckDurationMs = static_cast<uint32_t>(
+        (static_cast<uint64_t>(kWakeAckVoiceSampleCount) * 1000ULL +
+         kWakeAckVoiceSampleRate - 1ULL) /
+        kWakeAckVoiceSampleRate);
+    const uint32_t playbackStarted = millis();
+    const uint32_t playbackDeadline =
+        playbackStarted + wakeAckDurationMs + 600;
+
+    // Wait for the tiny local prompt to finish before reopening Mic, otherwise
+    // the device can hear its own acknowledgement as the user's command.
+    while (M5.Speaker.isPlaying(kTtsSpeakerChannel) > 0 &&
+           static_cast<int32_t>(playbackDeadline - millis()) > 0) {
+      M5.update();
+      delay(2);
+    }
+
+    Serial.printf(
+        "[WAKE-ACK] local voice played phrase=在的 samples=%u duration=%ums mag=%u\n",
+        static_cast<unsigned>(kWakeAckVoiceSampleCount),
+        static_cast<unsigned>(wakeAckDurationMs),
+        static_cast<unsigned>(AUDIO_WAKE_ACK_MAGNIFICATION));
+  } else {
+    // Hardware-level fallback: never leave a successful wake completely
+    // silent even if playRaw unexpectedly refuses the local PCM buffer.
+    const bool fallback = M5.Speaker.tone(1319.0f, 90, -1, true);
+    delay(110);
+    Serial.printf(
+        "[WAKE-ACK-WARN] local voice playRaw failed; fallback_tone=%u\n",
+        static_cast<unsigned>(fallback));
+  }
+
+  M5.Speaker.stop(kTtsSpeakerChannel);
   M5.Speaker.end();
-
-  Serial.printf(
-      "[WAKE-ACK] local confirm tone played tone1=%u tone2=%u ms=%u\n",
-      static_cast<unsigned>(tone1),
-      static_cast<unsigned>(tone2),
-      static_cast<unsigned>(millis()));
+  delay(28);
 }
 
 static bool startVoiceCaptureInternal(bool wakeInitiated) {
@@ -3370,7 +3397,7 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
     // Give the user an immediate local acknowledgement before opening the
     // hands-free command window.  The speech-start timer is armed only
     // after this function returns and the microphone is running again.
-    playLocalWakeAckTone();
+    playLocalWakeAckVoice();
   }
 
   diagCheckpoint(CP_PTT_AUDIO_IDLE, true);

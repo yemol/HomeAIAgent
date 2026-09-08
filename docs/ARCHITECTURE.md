@@ -16,11 +16,12 @@ Responsibilities:
 - persistent NVS network/Gateway configuration
 - night display execution and acknowledgement
 
-### HomeAIAgent Gateway
+### HomeAIAgent Server
 
 Responsibilities:
 
 - persistent WebSocket session with StickS3
+- in-process managed SSH/Tailscale transport to remote OpenClaw while developing on the Mac mini
 - ASR/TTS service integration
 - OpenClaw conversational request path
 - game/finance Info Skill refresh and cache
@@ -66,3 +67,17 @@ The Gateway pre-renders each 128×64 monochrome information frame. StickS3 recei
 - require explicit display-state acknowledgement;
 - bound background OpenClaw session lifetime;
 - keep secrets and machine-local dependencies out of source control.
+
+
+## A1R11 managed OpenClaw transport
+
+During development HomeAIAgent remains on the Mac mini. The Python service owns the outbound SSH connection and local forward to the OpenClaw host using AsyncSSH. There is no separately launched `ssh -N -L` service.
+
+```text
+StickS3 -> Mac mini HomeAIAgent Server :8765
+                         |
+                         +-> embedded AsyncSSH
+                               -> OpenClaw host 127.0.0.1:18789
+```
+
+If the SSH path drops, only OpenClaw-dependent operations are temporarily unavailable. The HomeAIAgent process and StickS3-facing WebSocket stay online while the transport reconnects. A future same-host deployment can set `OPENCLAW_TRANSPORT=direct`.

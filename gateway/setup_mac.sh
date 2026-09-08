@@ -86,10 +86,15 @@ OPENCLAW_MODEL=openclaw/default
 OPENCLAW_USER=home-ai-agent:main
 MAX_AGENT_CHARS=600
 
+OPENCLAW_TRANSPORT=embedded_ssh
 OPENCLAW_SSH_USER=yuanxiang
 OPENCLAW_SSH_HOST=100.105.66.46
 OPENCLAW_LOCAL_PORT=18790
 OPENCLAW_REMOTE_PORT=18789
+OPENCLAW_SSH_CONNECT_TIMEOUT_SEC=10
+OPENCLAW_SSH_RECONNECT_MIN_SEC=2
+OPENCLAW_SSH_RECONNECT_MAX_SEC=30
+OPENCLAW_SSH_STARTUP_WAIT_SEC=15
 EOF
   chmod 600 "$TMP"
   mv "$TMP" "$HOMEAI_CONFIG_FILE"
@@ -109,5 +114,4 @@ echo " Python runtime persists at:"
 echo "   $HOMEAI_VENV"
 echo
 echo "Normal daily start:"
-echo "  Terminal 1: ./openclaw_air_tunnel.sh"
-echo "  Terminal 2: ./run_full.sh"
+echo "  ./run_full.sh"

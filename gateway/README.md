@@ -32,19 +32,13 @@ The script preserves existing credentials and prepares the persistent Python run
 
 ## Daily startup
 
-When OpenClaw is reached over the supplied tunnel:
+A1R11 requires only one service command on the Mac mini:
 
 ```bash
-# Terminal 1
-./openclaw_air_tunnel.sh
-```
-
-```bash
-# Terminal 2
 ./run_full.sh
 ```
 
-`run_full.sh` checks the tunnel and runs `companion_gateway.py --check` before starting the live Gateway.
+The Python process owns the SSH transport, startup preflight, retries, device WebSocket, speech, notifications, Info and Gold. Do not start `openclaw_air_tunnel.sh` during normal operation.
 
 ## Voice flow
 

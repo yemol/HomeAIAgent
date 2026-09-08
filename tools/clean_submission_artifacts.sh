@@ -16,6 +16,7 @@ rm -rf -- .pio __pycache__ .pytest_cache gateway/__pycache__ tools/__pycache__ s
 find . -type f \
   ! -path './.git/*' \
   ! -path './.pio-local/*' \
+  ! -path './assets/wake_ack_zaide_tts.wav' \
   \( \
     -name '*.log' -o \
     -name '*.wav' -o \

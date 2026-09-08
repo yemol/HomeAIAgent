@@ -6,7 +6,7 @@ Deliver OpenClaw reminders/background assistant outputs to the HomeAIAgent devic
 
 ## Transport
 
-HomeAIAgent already reaches OpenClaw through the existing outbound tunnel:
+HomeAIAgent reaches OpenClaw through the A1R11 managed outbound transport:
 
 `Mac mini 127.0.0.1:18790 -> SSH/Tailscale -> OpenClaw 127.0.0.1:18789`
 
@@ -70,7 +70,7 @@ This change is Gateway-only. It does not modify:
 
 ## Validation
 
-With the existing OpenClaw tunnel running:
+With the A1R11 HomeAIAgent service running:
 
 ```bash
 cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway

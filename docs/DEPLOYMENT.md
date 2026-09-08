@@ -71,21 +71,14 @@ It also prepares the persistent Python runtime used by the Gateway.
 
 ### Daily start
 
-When OpenClaw is reached through the supplied Air tunnel:
+A1R11 no longer requires a separate Air tunnel terminal. The HomeAIAgent Python service owns the SSH/Tailscale forward internally. Start only:
 
 ```bash
-# Terminal 1
-cd gateway
-./openclaw_air_tunnel.sh
-```
-
-```bash
-# Terminal 2
 cd gateway
 ./run_full.sh
 ```
 
-`run_full.sh` performs a preflight before starting `companion_gateway.py`.
+On first A1R11 start, the persistent Python runtime installs the pinned AsyncSSH dependency. The service then establishes the managed OpenClaw transport, runs its startup preflight, and opens the StickS3 WebSocket server. If the SSH path drops later, the server stays alive and retries the transport automatically.
 
 ## 3. Expected live behavior
 
@@ -99,11 +92,11 @@ Button A uses the same downstream path but reports `trigger=button_a` rather tha
 
 ### Capture timing
 
-- wait for speech after acknowledgement: 3.5 s
+- wait for speech after acknowledgement: 5.0 s
 - continuous silence to finish: 3 s
-- maximum utterance: 10 s
+- maximum utterance: 20 s
 - pre-roll: 300 ms
-- device capture buffer: 11 s
+- device capture buffer: 21 s
 
 ### TTS
 

@@ -1,3 +1,42 @@
+## A1R20 Submission Clean — Frozen local TTS wake ACK
+
+This submission freezes the user-approved local TTS wake acknowledgement `assets/wake_ack_zaide_tts.wav` and its matching firmware array `include/wake_ack_voice_pcm.h`. **No TTS generation step is required before compiling.** Runtime wake playback remains fully local and consumes no cloud TTS request.
+
+Normal device workflow:
+
+```bash
+pio run -e m5stack-sticks3-wake -t clean
+pio run -e m5stack-sticks3-wake -t upload
+pio device monitor
+```
+
+Do not Erase Flash. `generate_wake_ack_tts.sh` is retained only as an optional maintenance tool if the approved wake voice is intentionally replaced in a future version. Ordinary builds should not run it.
+
+Current approved wake asset:
+
+- Text: `在的。`
+- Voice: `zh_female_vv_uranus_bigtts`
+- Resource: `seed-tts-2.0`
+- 16 kHz / mono / PCM16
+- 9360 samples / 585 ms
+- Wake ACK playback: dedicated MAG6
+- Normal assistant TTS playback: MAG5
+
+> A1R18 audio note: local wake acknowledgement `在的` uses the full clean ~632 ms waveform at dedicated MAG6. Normal assistant TTS remains MAG5. A1R17 hard compression/tail trimming has been removed.
+# A1R15 wake acknowledgement
+
+A successful local wake (`逐光逐光`) now answers immediately with an embedded local voice prompt, `在的`, before reopening the command microphone. The prompt is stored in StickS3 firmware and does not use Gateway/OpenClaw/cloud TTS or tokens. If local PCM playback fails, firmware emits a short fallback tone instead of leaving the wake silent.
+
+A1R15 is a StickS3 firmware change and requires **Clean -> Upload -> Monitor**. Do not Erase Flash. All A1R14 Gateway behavior, embedded SSH transport, A1R12 cache-only Info startup, 15 s Info hold, standard Volcengine TTS voice, and frozen wake sensitivity settings remain unchanged.
+
+# A1R14 build note
+
+This package fixes the A1R13 PlatformIO package-resolution error. The Mac mini already downloaded and installed `toolchain-xtensa-esp-elf 14.2.0+20251107` and `tool-esptoolpy 5.1.2` during the preceding A1R12 upload attempt. A1R14 deliberately does not override those tools through the registry; PlatformIO should reuse the installed global package cache.
+
+## A1R13 PlatformIO tool pin
+
+The production wake environment keeps the frozen local pioarduino platform and now explicitly pins the two tool packages already installed on the Mac mini: `toolchain-xtensa-esp-elf@14.2.0+20251107` and `tool-esptoolpy@5.1.2`. This avoids re-resolving the pioarduino GitHub registry URLs during normal rebuilds on this machine. `.pio-local` is neither deleted nor overwritten.
+
 A1R10 reconnect recovery: a transient Companion WebSocket drop can no longer leave the device permanently deaf. Disconnect still pauses wake listening and enters Error, but a successful reconnect now clears only the transport-originated fault, returns to Idle, and lets the existing wake-mic canonical restart path re-arm MultiNet. The Gateway also treats `ConnectionClosed` as a recoverable transport event instead of printing a handler traceback.
 
 A1R9 listening reliability: idle wake-word listening now uses a modest 9 dB ES8311 PGA while the validated command-capture path remains at 6 dB. The post-wake speech-start window is 5.0 s, and new WAKE-HEALTH / WAKE-HIT diagnostics expose whether audio is genuinely reaching MultiNet. The wake phrase and MultiNet default threshold remain frozen and unchanged.
@@ -12,7 +51,7 @@ TTS restore A1R6: restored the previously device-verified standard voice pairing
 
 # HomeAIAgent A4.6 Notification A1 — OpenClaw Session Listener
 
-Current feature baseline: **A4.6 Notification A1R10 WebSocket Reconnect Wake Recovery on the frozen A3R9 wake/24 FPS baseline**.
+Current feature baseline: **A4.6 Notification A1R11 Managed OpenClaw Transport on the frozen A1R10/A3R9 device baseline**.
 
 ## Preserved frozen behavior
 
@@ -25,7 +64,7 @@ Current feature baseline: **A4.6 Notification A1R10 WebSocket Reconnect Wake Rec
 ## Notification A1
 
 - No webhook, no reverse SSH tunnel, no new inbound port.
-- Reuses the existing Mac mini -> OpenClaw SSH/Tailscale tunnel at `127.0.0.1:18790`.
+- A1R11 owns the Mac mini -> OpenClaw SSH/Tailscale local forward inside the HomeAIAgent Python service; no separately started tunnel process is required.
 - Gateway opens an outbound OpenClaw Gateway WebSocket and subscribes to the exact stable voice session derived from `OPENCLAW_USER`.
 - `session.message` / `sessions.changed` are treated as invalidation signals; bounded `chat.history` is the authoritative source.
 - First deployment establishes a transcript baseline and never speaks old assistant messages.
@@ -39,14 +78,14 @@ See `docs/NOTIFICATION_SESSION_LISTENER_A1.md`.
 
 ## Deployment
 
-A1R10 includes a StickS3 state-machine fix and therefore **requires a firmware rebuild/upload**. Preserve `.pio-local`; never Erase Flash. Use the verified sequence **Clean -> Upload -> Monitor** for environment `m5stack-sticks3-wake`, then restart the Gateway.
+A1R11 is **server-side only**. StickS3 firmware is byte-identical to the A1R10 submission baseline, so no firmware rebuild/upload is required. Stop the legacy `openclaw_air_tunnel.sh` terminal once, then start only:
 
 ```bash
-cd /Volumes/yemol_HDDisk/HomeAIAgent
-pio run -e m5stack-sticks3-wake -t clean
-pio run -e m5stack-sticks3-wake -t upload
-pio device monitor
+cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway
+./run_full.sh
 ```
+
+`run_full.sh` synchronizes the persistent Python runtime, starts the embedded AsyncSSH transport, verifies OpenClaw when available, and then keeps the HomeAIAgent device server alive. SSH loss degrades only OpenClaw-dependent functions; the StickS3 WebSocket/server process remains alive and the transport reconnects automatically.
 
 In a second terminal, restart the Gateway:
 
@@ -79,3 +118,18 @@ On the very first run, one additional line is expected:
 ## Build / upload
 
 A1R10 requires a device rebuild because the reconnect recovery state machine is in `src/main.cpp`. Use **Clean -> Upload -> Monitor**, never Erase Flash, and preserve `.pio-local`.
+## A1R12 restart/cache and display timing
+
+- Gateway restart no longer forces a game + finance Info Skill refresh. It serves the existing last-good cache immediately and waits for the fixed wall-clock slots `09,11,13,15,17,19,21,23,01` for the next real refresh.
+- Glass2 information-card hold time is now 15 seconds per item.
+- This release changes StickS3 firmware timing, so deploy with Clean -> Upload -> Monitor. Do not Erase Flash and do not modify `.pio-local`.
+
+
+## A1R17 audio level
+
+Assistant TTS and the local wake acknowledgement share the same StickS3 speaker setting (master 255 / channel 255 / MAG5). The local `在的` clip is normalized in Flash so wake feedback is not quieter than ordinary answers.
+
+
+### A1R17 wake acknowledgement level
+
+The local `在的` wake acknowledgement uses a dedicated MAG6 path and a loudness-mastered embedded PCM. Normal assistant TTS remains on MAG5.

@@ -13,15 +13,15 @@ homeai_source_config
 
 LOCAL_PORT="${OPENCLAW_LOCAL_PORT:-18790}"
 
-echo "=== HomeAIAgent persistent runtime connectivity check ==="
+echo "=== HomeAIAgent managed OpenClaw connectivity check ==="
 echo "[CONFIG]  $HOMEAI_CONFIG_FILE"
 echo "[RUNTIME] $HOMEAI_VENV"
 
-if ! nc -z 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then
-  echo "[FAIL] 127.0.0.1:${LOCAL_PORT} is closed."
-  echo "Start ./openclaw_air_tunnel.sh in another Terminal."
-  exit 3
+if nc -z 127.0.0.1 "$LOCAL_PORT" >/dev/null 2>&1; then
+  echo "[INFO] 127.0.0.1:${LOCAL_PORT} is already open."
+  echo "[INFO] If HomeAIAgent is already running, the embedded transport is already owned by that service."
+  echo "[INFO] Stop the running service before using this standalone connectivity check."
+  exit 0
 fi
-echo "[OK] SSH tunnel endpoint 127.0.0.1:${LOCAL_PORT} is open."
 
 python companion_gateway.py --check

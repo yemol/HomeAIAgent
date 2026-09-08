@@ -1,3 +1,96 @@
+# A1R20 Submission Clean — Frozen wake ACK asset
+
+- Bundled the user-approved production-TTS `assets/wake_ack_zaide_tts.wav` directly in the submission.
+- Bundled the matching `include/wake_ack_voice_pcm.h`; ordinary builds no longer require a one-time cloud TTS generation step.
+- Updated `.gitignore` and `tools/clean_submission_artifacts.sh` so the approved wake asset is preserved while ordinary runtime WAV/log/cache artifacts are still removed.
+- `generate_wake_ack_tts.sh` remains available only as an optional maintenance tool for an intentional future voice replacement.
+- No change to Gateway behavior, embedded SSH transport, Info schedule/cache policy, wake recognizer, audio gains, normal TTS voice, or display behavior.
+
+# A1R20
+
+- Fixed A1R19 wake-ACK TTS asset compile failure: generated header omitted `kWakeAckVoiceDurationMs`.
+- `main.cpp` now derives wake-ACK duration directly from sample count/rate, removing runtime dependence on that generated constant.
+- Generator now also emits `kWakeAckVoiceDurationMs` for completeness.
+- No changes to wake model, ASR/TTS voice, audio gain, Gateway transport, Info schedule, or display behavior.
+
+## A1R19 - Production-TTS local wake acknowledgement
+
+- Replaced the hand-processed/mechanical `在的` asset workflow with a one-time generator using the same frozen production voice as normal answers: `seed-tts-2.0 + zh_female_vv_uranus_bigtts`.
+- Added root `./generate_wake_ack_tts.sh` and `gateway/generate_wake_ack_tts.py`. The generator reads the existing persistent `~/.config/HomeAIAgent/gateway.env`; API credentials are never copied into the repository or firmware.
+- Synthesizes `在的。`, preserves natural TTS timing, uses no dynamic compression, keeps 35 ms pre-roll and 180 ms post-roll, and applies only linear peak/RMS normalization plus tiny anti-click fades.
+- Generates both `assets/wake_ack_zaide_tts.wav` for Mac preview and `include/wake_ack_voice_pcm.h` for fully local StickS3 playback.
+- A1R19 deliberately refuses to compile until the one-time TTS asset has been generated, preventing accidental fallback to the older mechanical PCM.
+- Runtime wake playback remains local-only at dedicated MAG6; normal assistant TTS remains MAG5. No wake-time cloud request or token use is introduced.
+
+
+## A1R18 - Full-length clean local wake acknowledgement
+
+- Restored the complete natural-duration local `在的` PCM (about 632 ms).
+- Removed A1R17 hard compression and aggressive tail trimming which caused audible breakup.
+- Kept dedicated wake acknowledgement playback at MAG6 for immediate audibility.
+- Normal assistant TTS remains MAG5.
+- Gateway, OpenClaw transport, Info scheduling/cache policy, notifications, wake recognizer behavior, and all other device logic remain unchanged.
+## A1R17 - 2026-09-08 - Wake ACK loudness master
+
+- Kept normal assistant TTS at `AUDIO_SPEAKER_VOLUME=255`, channel volume 255, `MAG5`.
+- Raised only the brief local wake acknowledgement "在的" to dedicated `MAG6`.
+- Re-mastered the embedded wake PCM with compression + limiter:
+  - duration: 632 ms -> 507 ms
+  - peak: -1.82 dBFS -> -0.45 dBFS
+  - active RMS: -18.70 dBFS -> -12.00 dBFS
+- Removed excess pre/post silence so successful wake acknowledgement starts sooner.
+- No Gateway/OpenClaw/ASR/TTS/network behavior changes.
+
+# A1R16 - Wake ACK + answer volume lift (2026-09-08)
+
+- Normal assistant playback speaker magnification: MAG4 -> MAG5.
+- Wake acknowledgement now uses the exact same speaker rail as normal TTS: master 255, channel 255, MAG5.
+- Embedded `在的` PCM normalized by 1.8x (+5.1 dB); source peak remains below full scale, so no sample clipping is introduced.
+- No Gateway/OpenClaw/Info/Notification behavior changes.
+
+## A1R15 — Local Wake Voice ACK “在的” (2026-09-08)
+
+- Restored the immediate local acknowledgement after a successful `逐光逐光` wake hit.
+- Replaced the previous two-note wake confirmation with an embedded 16 kHz mono PCM voice prompt: `在的`.
+- The acknowledgement is fully local on StickS3: no Gateway, OpenClaw, ASR, TTS request, token usage, or network round trip.
+- Playback completes before Mic restart so the command microphone does not capture the device's own acknowledgement.
+- Added a short fallback tone if local `playRaw()` unexpectedly fails, so a successful wake is never silent.
+- Wake phrase, MultiNet default threshold, wake-listen PGA 9 dB, command-capture PGA 6 dB, 5 s post-wake speech-start window, A1R10 reconnect recovery, A1R12 Info cache-only startup / 15 s hold, and A1R14 PlatformIO behavior remain unchanged.
+
+
+## A1R14 — Reuse Installed PIO Tools (2026-09-08)
+
+- Fix A1R13 `UnknownPackageError` caused by treating pioarduino tool packages as normal registry packages.
+- Removed explicit registry-style pins for `toolchain-xtensa-esp-elf` and `tool-esptoolpy`.
+- The wake environment continues to use the local pioarduino platform and project-local Arduino framework packages.
+- PlatformIO now reuses the tool packages already installed under the Mac mini global package cache.
+- No firmware logic, Gateway logic, Info behavior, TTS/ASR behavior, wake behavior, or 15 s Info hold timing changed.
+# A1R13 - Pinned Local PlatformIO Tool Packages (2026-09-08)
+
+- Pinned `toolchain-xtensa-esp-elf@14.2.0+20251107` and `tool-esptoolpy@5.1.2`, matching the versions just installed successfully on the Mac mini.
+- Keeps the verified local pioarduino platform symlink and the preserved `.pio-local` Arduino framework sources unchanged.
+- No HomeAIAgent runtime, Gateway, wake, ASR/TTS, Notification, Info, Gold, display layout, or 15 s hold behavior changes.
+- Device firmware source is unchanged from A1R12; this package only makes PlatformIO tool resolution deterministic for the current Mac mini installation.
+
+# A1R12 - Info Startup Cache-Only + 15s Hold (2026-09-08)
+
+- Gateway restart no longer triggers an immediate OpenClaw Info Skill refresh; startup serves the persisted last-good cache only.
+- Fixed Info refresh slots remain `09:00,11:00,13:00,15:00,17:00,19:00,21:00,23:00,01:00` in `Asia/Taipei`.
+- Glass2 per-item information hold increased from 10 s to 15 s.
+- No changes to wake phrase, MultiNet threshold, ASR/TTS, Notification, 20 s capture, Gapless playback, Gold, night policy, Brownout protection, or Wi-Fi TX power.
+- Local offline PlatformIO sources remain unchanged.
+
+# A4.6 Notification A1R11 Managed OpenClaw Transport
+
+- Replaced the separately started `ssh -N -L` / `openclaw_air_tunnel.sh` normal runtime with an in-process AsyncSSH local-forward manager owned by `companion_gateway.py`.
+- `./run_full.sh` is now the only service command required on the Mac mini. It no longer requires an external tunnel or a separate `--check` process before launch.
+- Added bounded SSH connect/reconnect with keepalive and exponential retry. OpenClaw transport loss does not terminate the StickS3-facing HomeAIAgent server.
+- Startup can enter a degraded mode with last-good Info cache while SSH reconnects; scheduled Info refreshes skip cleanly while the transport is unavailable.
+- Notification listener waits for managed transport readiness instead of generating repeated connection errors.
+- Added `OPENCLAW_TRANSPORT=embedded_ssh`; future same-host deployment may use `direct` without changing the StickS3 protocol.
+- Pinned `asyncssh==2.14.2` because the current persistent Gateway runtime uses Python 3.9.
+- A1R10 StickS3 firmware, wake reliability, Notification/TTS, explicit headline newlines, Info/Gold behavior, local offline PlatformIO paths and `.pio-local` policy remain unchanged. No firmware flash is required for A1R11.
+
 # 2026-09-07 Submission Clean
 
 - No functional behavior change from A1R10.

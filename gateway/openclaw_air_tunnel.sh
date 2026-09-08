@@ -1,6 +1,13 @@
 #!/bin/zsh
 set -euo pipefail
 cd "$(dirname "$0")"
+
+if [ "${HOMEAI_ALLOW_LEGACY_TUNNEL:-0}" != "1" ]; then
+  echo "[DEPRECATED] A1R11 manages the OpenClaw SSH transport inside ./run_full.sh."
+  echo "Start only: ./run_full.sh"
+  echo "For emergency manual fallback only: HOMEAI_ALLOW_LEGACY_TUNNEL=1 ./openclaw_air_tunnel.sh"
+  exit 2
+fi
 source ./homeai_env.sh
 homeai_migrate_legacy_env "./.env"
 homeai_source_config

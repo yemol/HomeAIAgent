@@ -48,6 +48,8 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from dotenv import load_dotenv
 
+from openclaw_transport import OpenClawTransportConfig, OpenClawTransportManager
+
 BASE_DIR = Path(__file__).resolve().parent
 
 # HomeAIAgent machine configuration is intentionally OUTSIDE the project tree.
@@ -642,6 +644,48 @@ OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "")
 OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
 OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
+
+# A1R11: OpenClaw transport is owned by this Python service. On the Mac mini
+# the default is an in-process AsyncSSH local forward. A future deployment on
+# the OpenClaw host can switch OPENCLAW_TRANSPORT=direct without changing the
+# StickS3 protocol.
+OPENCLAW_TRANSPORT = os.getenv("OPENCLAW_TRANSPORT", "embedded_ssh").strip().lower()
+OPENCLAW_SSH_USER = os.getenv("OPENCLAW_SSH_USER", "yuanxiang").strip() or "yuanxiang"
+OPENCLAW_SSH_HOST = os.getenv("OPENCLAW_SSH_HOST", "100.105.66.46").strip()
+OPENCLAW_LOCAL_PORT = int(os.getenv("OPENCLAW_LOCAL_PORT", "18790"))
+OPENCLAW_REMOTE_PORT = int(os.getenv("OPENCLAW_REMOTE_PORT", "18789"))
+OPENCLAW_SSH_CONNECT_TIMEOUT_SEC = max(2.0, float(os.getenv("OPENCLAW_SSH_CONNECT_TIMEOUT_SEC", "10")))
+OPENCLAW_SSH_RECONNECT_MIN_SEC = max(0.5, float(os.getenv("OPENCLAW_SSH_RECONNECT_MIN_SEC", "2")))
+OPENCLAW_SSH_RECONNECT_MAX_SEC = max(OPENCLAW_SSH_RECONNECT_MIN_SEC, float(os.getenv("OPENCLAW_SSH_RECONNECT_MAX_SEC", "30")))
+OPENCLAW_SSH_STARTUP_WAIT_SEC = max(1.0, float(os.getenv("OPENCLAW_SSH_STARTUP_WAIT_SEC", "15")))
+OPENCLAW_TRANSPORT_MANAGER: OpenClawTransportManager | None = None
+
+
+def _openclaw_transport_config() -> OpenClawTransportConfig:
+    return OpenClawTransportConfig(
+        mode=OPENCLAW_TRANSPORT,
+        ssh_user=OPENCLAW_SSH_USER,
+        ssh_host=OPENCLAW_SSH_HOST,
+        local_port=OPENCLAW_LOCAL_PORT,
+        remote_port=OPENCLAW_REMOTE_PORT,
+        connect_timeout_sec=OPENCLAW_SSH_CONNECT_TIMEOUT_SEC,
+        reconnect_min_sec=OPENCLAW_SSH_RECONNECT_MIN_SEC,
+        reconnect_max_sec=OPENCLAW_SSH_RECONNECT_MAX_SEC,
+    )
+
+
+async def _wait_for_openclaw_transport(timeout: float | None = None) -> bool:
+    manager = OPENCLAW_TRANSPORT_MANAGER
+    if manager is None or OPENCLAW_TRANSPORT == "direct":
+        return True
+    return await manager.wait_ready(timeout)
+
+
+def _openclaw_transport_ready() -> bool:
+    manager = OPENCLAW_TRANSPORT_MANAGER
+    if manager is None or OPENCLAW_TRANSPORT == "direct":
+        return True
+    return manager.ready.is_set()
 
 
 def _openclaw_voice_session_key() -> str:
@@ -1504,6 +1548,8 @@ async def openclaw_voice_session_listener_loop() -> None:
     while True:
         ws: Any | None = None
         try:
+            if not await _wait_for_openclaw_transport():
+                continue
             ws = await _openclaw_listener_connect()
             print(
                 f"[NOTIFY] OpenClaw listener connected ws={_openclaw_gateway_ws_url()} "
@@ -2861,6 +2907,12 @@ async def startup_info_refresh_before_ws() -> None:
     # device connections. This guarantees the first device sync observes the
     # freshly fetched feed when refresh succeeds, rather than racing against
     # the startup polling task and receiving stale last-good first.
+    if not _openclaw_transport_ready():
+        print(
+            "[INFO-SKILL-WARN] OpenClaw transport unavailable at startup; "
+            "opening server with last-good cache and leaving SSH reconnect active"
+        )
+        return
     startup_now = datetime.now(_info_schedule_tz())
     startup_label = startup_now.strftime("startup-%Y-%m-%dT%H:%M:%S")
     _begin_startup_info_snapshot(
@@ -2928,9 +2980,10 @@ async def startup_info_refresh_before_ws() -> None:
 
 
 async def info_skill_poll_loop() -> None:
-    # Startup refresh is completed by startup_info_refresh_before_ws()
-    # before websockets.serve() opens. This loop owns only the fixed wall-clock
-    # schedule below, preventing a startup/device-sync race.
+    # A1R12: Gateway restart is cache-only for Info. Do NOT spend tokens on a
+    # forced startup refresh. The already-loaded last-good cache is served to
+    # the device immediately, and this loop owns all real refreshes at the
+    # fixed wall-clock schedule below.
 
     # Fixed wall-clock schedule remains:
     # 09:00,11:00,13:00,15:00,17:00,19:00,21:00,23:00,01:00.
@@ -2950,6 +3003,12 @@ async def info_skill_poll_loop() -> None:
                 print(
                     "[INFO-SKILL] scheduled poll skipped: "
                     "voice path busy too long"
+                )
+                continue
+            if not _openclaw_transport_ready():
+                print(
+                    "[INFO-SKILL-WARN] scheduled poll skipped: "
+                    "OpenClaw transport unavailable; last-good retained"
                 )
                 continue
 
@@ -4832,7 +4891,7 @@ async def handle_connection(ws) -> None:
         print("[WS] client disconnected")
 
 
-async def preflight() -> int:
+async def preflight(*, require_openclaw: bool = True) -> int:
     print("=== HomeAIAgent Gateway persistent-config preflight ===")
     if (
         VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
@@ -4866,6 +4925,11 @@ async def preflight() -> int:
         f"rate={VOLCENGINE_TTS_SAMPLE_RATE}"
     )
     print(f"[CFG] OpenClaw={OPENCLAW_BASE_URL} model={OPENCLAW_MODEL}")
+    print(
+        f"[CFG] OpenClaw transport={OPENCLAW_TRANSPORT} "
+        f"ssh={OPENCLAW_SSH_USER}@{OPENCLAW_SSH_HOST} "
+        f"local=127.0.0.1:{OPENCLAW_LOCAL_PORT} remote=127.0.0.1:{OPENCLAW_REMOTE_PORT}"
+    )
     print(f"[CFG] session user={OPENCLAW_USER}")
     print(f"[CFG] info_skill_protocol={INFO_SKILL_PROTOCOL}")
     print("[CFG] info_skill_transport=structured_tool_call fallback=strict_text")
@@ -4878,11 +4942,11 @@ async def preflight() -> int:
         f"ws={_openclaw_gateway_ws_url()} method=sessions.delete "
         f"scope=operator.admin ssh=disabled"
     )
-    print("[CFG] info_startup_refresh=barrier-before-ws game+finance; wall_clock_schedule=unchanged")
+    print("[CFG] info_startup_refresh=disabled(cache-only); wall_clock_schedule=09,11,13,15,17,19,21,23,01")
     print(f"[CFG] info_skill_cache={INFO_SKILL_CACHE_FILE}")
     print(
         f"[CFG] info_refresh_snapshots={INFO_SKILL_STARTUP_SNAPSHOT_DIR} "
-        f"triggers=startup+scheduled keep={INFO_SKILL_STARTUP_SNAPSHOT_KEEP}"
+        f"triggers=scheduled keep={INFO_SKILL_STARTUP_SNAPSHOT_KEEP}"
     )
     print(
         f"[CFG] info_skill_feed={INFO_GAME_LIMIT} game + "
@@ -4956,8 +5020,13 @@ async def preflight() -> int:
             r.raise_for_status()
             body = r.json()
     except Exception as exc:
-        print(f"[FAIL] OpenClaw /v1/models: {type(exc).__name__}: {exc}")
-        return 3
+        level = "FAIL" if require_openclaw else "WARN"
+        print(f"[{level}] OpenClaw /v1/models: {type(exc).__name__}: {exc}")
+        if require_openclaw:
+            return 3
+        print("[DEGRADED] HomeAIAgent will stay online while embedded SSH reconnects.")
+        print("[READY] Speech/device services are ready; OpenClaw is temporarily unavailable.")
+        return 0
 
     model_ids = [
         str(item.get("id", ""))
@@ -4974,6 +5043,7 @@ async def preflight() -> int:
 
 async def main() -> None:
     global REMINDER_LOCK
+    global OPENCLAW_TRANSPORT_MANAGER
 
     if (
         VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
@@ -4989,11 +5059,39 @@ async def main() -> None:
     load_info_skill_cache()
     load_gold_quote_cache()
 
-    # Hard startup ordering. Do not accept a terminal connection
-    # until the forced game + finance refresh has completed (or failed safely
-    # back to last-good). Therefore the very first device sync after Gateway
-    # startup cannot race ahead of the startup refresh.
-    await startup_info_refresh_before_ws()
+    OPENCLAW_TRANSPORT_MANAGER = OpenClawTransportManager(_openclaw_transport_config())
+    transport_task = asyncio.create_task(OPENCLAW_TRANSPORT_MANAGER.run())
+
+    transport_ready = await _wait_for_openclaw_transport(OPENCLAW_SSH_STARTUP_WAIT_SEC)
+    if transport_task.done():
+        exc = transport_task.exception()
+        if exc is not None:
+            raise RuntimeError(f"OpenClaw transport manager stopped: {type(exc).__name__}: {exc}")
+    if transport_ready:
+        print("[OPENCLAW-TRANSPORT] ready before startup preflight")
+    else:
+        detail = OPENCLAW_TRANSPORT_MANAGER.last_error or "still connecting"
+        print(
+            f"[OPENCLAW-TRANSPORT-WARN] not ready after "
+            f"{OPENCLAW_SSH_STARTUP_WAIT_SEC:.0f}s ({detail}); "
+            "starting HomeAIAgent in degraded mode"
+        )
+
+    preflight_status = await preflight(require_openclaw=False)
+    if preflight_status != 0:
+        transport_task.cancel()
+        await OPENCLAW_TRANSPORT_MANAGER.close()
+        raise RuntimeError(f"HomeAIAgent startup preflight failed status={preflight_status}")
+
+    # A1R12: restart is cache-only for Info. The cache was already loaded by
+    # load_info_skill_cache(); do not call OpenClaw/Info Skill here. This avoids
+    # spending tokens every time the Gateway is restarted during development.
+    # The next real refresh is owned exclusively by info_skill_poll_loop() at
+    # the fixed wall-clock slots.
+    print(
+        f"[INFO-SKILL] startup cache-only count={len(FEED_ITEMS)} "
+        f"revision={FEED_REVISION}; next refresh follows wall-clock schedule"
+    )
 
     if MODE == "full":
         print(f"[MODE] full: {ASR_PROVIDER} ASR2 streaming -> OpenClaw -> {TTS_PROVIDER} TTS")
@@ -5024,6 +5122,32 @@ async def main() -> None:
             display_reconcile_task.cancel()
             reminder_task.cancel()
             notification_listener_task.cancel()
+            transport_task.cancel()
+            if OPENCLAW_TRANSPORT_MANAGER is not None:
+                await OPENCLAW_TRANSPORT_MANAGER.close()
+            await asyncio.gather(transport_task, return_exceptions=True)
+
+
+async def check_main() -> int:
+    global OPENCLAW_TRANSPORT_MANAGER
+    OPENCLAW_TRANSPORT_MANAGER = OpenClawTransportManager(_openclaw_transport_config())
+    transport_task = asyncio.create_task(OPENCLAW_TRANSPORT_MANAGER.run())
+    try:
+        ready = await _wait_for_openclaw_transport(OPENCLAW_SSH_STARTUP_WAIT_SEC)
+        if transport_task.done():
+            exc = transport_task.exception()
+            if exc is not None:
+                print(f"[FAIL] OpenClaw transport manager stopped: {type(exc).__name__}: {exc}")
+                return 3
+        if not ready:
+            detail = OPENCLAW_TRANSPORT_MANAGER.last_error or "still connecting"
+            print(f"[FAIL] OpenClaw transport not ready: {detail}")
+            return 3
+        return await preflight(require_openclaw=True)
+    finally:
+        transport_task.cancel()
+        await OPENCLAW_TRANSPORT_MANAGER.close()
+        await asyncio.gather(transport_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
@@ -5036,5 +5160,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.check:
-        raise SystemExit(asyncio.run(preflight()))
+        raise SystemExit(asyncio.run(check_main()))
     asyncio.run(main())
