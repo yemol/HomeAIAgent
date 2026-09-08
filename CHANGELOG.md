@@ -1,3 +1,13 @@
+# A1R21 - Gateway Voice-Turn Ordering Fix
+
+- Added a transcript-native Voice Turn Fence around synchronous `/v1/chat/completions` voice turns.
+- When OpenClaw writes several assistant progress rows before the exact final synchronous reply, Gateway now marks all assistant rows between the nearest preceding user row and that final reply as consumed. They never enter the Notification queue.
+- If the final reply has not yet been committed to `chat.history`, reconciliation is deferred rather than prematurely queueing progress rows.
+- Assistant messages before the voice-turn user row and genuinely later assistant messages remain eligible for normal asynchronous notification delivery.
+- Reconnect/history replay is safe because consumed progress/final rows are written into the existing seen-message cursor.
+- Added offline regression coverage for progress-row suppression, pre-turn async preservation, post-turn async preservation, delayed final-row commit, and reconnect replay.
+- Firmware, wake recognition, local `在的` asset, TTS volume, 15-second Info hold, Info cache-only startup, embedded SSH transport, and all A1R20 frozen behavior are unchanged.
+
 # A1R20 Submission Clean — Frozen wake ACK asset
 
 - Bundled the user-approved production-TTS `assets/wake_ack_zaide_tts.wav` directly in the submission.

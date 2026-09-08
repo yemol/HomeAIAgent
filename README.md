@@ -1,3 +1,9 @@
+## A1R21 Gateway Voice-Turn Ordering Fix
+
+This release keeps the A1R20 Submission Clean firmware and frozen local TTS wake ACK unchanged, and fixes one Gateway-side ordering defect: OpenClaw progress messages emitted during a synchronous voice turn are no longer replayed afterward as asynchronous notifications.
+
+No StickS3 flash is required for this release. Replace the project/Gateway files and restart `gateway/run_full.sh`.
+
 ## A1R20 Submission Clean — Frozen local TTS wake ACK
 
 This submission freezes the user-approved local TTS wake acknowledgement `assets/wake_ack_zaide_tts.wav` and its matching firmware array `include/wake_ack_voice_pcm.h`. **No TTS generation step is required before compiling.** Runtime wake playback remains fully local and consumes no cloud TTS request.

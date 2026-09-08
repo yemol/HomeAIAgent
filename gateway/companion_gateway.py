@@ -434,6 +434,15 @@ NOTIFICATION_CURSOR_SESSION_KEY = ""
 NOTIFICATION_CURSOR_SESSION_ID = ""
 VOICE_OPENCLAW_INFLIGHT = 0
 VOICE_REPLY_SUPPRESSIONS: list[dict[str, Any]] = []
+# A1R21 Voice Turn Fence. OpenClaw may append multiple assistant progress rows
+# to the same voice session while one synchronous /v1/chat/completions request
+# is running. The HTTP response is the authoritative spoken answer. Keep a
+# fence for each completed synchronous turn so transcript reconciliation marks
+# every unseen assistant row up to and including that exact final reply as
+# consumed instead of replaying progress rows later as notifications.
+VOICE_TURN_FENCES: list[dict[str, Any]] = []
+VOICE_TURN_FENCE_TTL_SEC = 600.0
+VOICE_TURN_FENCE_MAX = 12
 
 
 def _remember_notification_seen(key: str) -> None:
@@ -535,6 +544,113 @@ def _consume_voice_reply_suppression(text: str) -> bool:
         kept.append(item)
     VOICE_REPLY_SUPPRESSIONS[:] = kept
     return consumed
+
+
+def _prune_voice_turn_fences() -> None:
+    now = time.time()
+    VOICE_TURN_FENCES[:] = [
+        item for item in VOICE_TURN_FENCES
+        if float(item.get("expires_at") or 0.0) > now
+    ][-VOICE_TURN_FENCE_MAX:]
+
+
+def _register_voice_turn_fence(final_text: str) -> None:
+    normalized = _normalize_notification_compare_text(final_text)
+    if not normalized:
+        return
+    _prune_voice_turn_fences()
+    VOICE_TURN_FENCES.append({
+        "final_digest": _notification_text_digest(normalized),
+        "expires_at": time.time() + VOICE_TURN_FENCE_TTL_SEC,
+    })
+    del VOICE_TURN_FENCES[:-VOICE_TURN_FENCE_MAX]
+    print("[VOICE-FENCE] armed for synchronous turn completion")
+
+
+def _resolve_voice_turn_fences(messages: list[Any]) -> set[str] | None:
+    """Resolve completed synchronous voice turns against chat.history.
+
+    Returns a set of assistant message identities which belong to synchronous
+    voice-turn progress/final output and therefore must be marked seen without
+    entering the async notification queue. If the active fence's exact final
+    reply is not present in history yet, return None to hold reconciliation
+    until OpenClaw has committed the complete turn.
+
+    The boundary is transcript-native: find the exact final assistant reply,
+    then walk backward to the nearest user row. Only assistant rows between
+    that user row and the final reply are suppressed. This preserves genuinely
+    asynchronous assistant messages which arrived before the voice turn.
+    """
+    _prune_voice_turn_fences()
+    if not VOICE_TURN_FENCES:
+        return set()
+
+    suppressed: set[str] = set()
+    resolved_count = 0
+
+    for fence in list(VOICE_TURN_FENCES):
+        final_digest = str(fence.get("final_digest") or "")
+        if not final_digest:
+            resolved_count += 1
+            continue
+
+        final_idx = -1
+        for idx in range(len(messages) - 1, -1, -1):
+            row = messages[idx]
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role") or "").strip().lower() != "assistant":
+                continue
+            text = _history_message_text(row)
+            if _notification_text_digest(_normalize_notification_compare_text(text)) == final_digest:
+                final_idx = idx
+                break
+
+        if final_idx < 0:
+            # The HTTP response can return a fraction before the session
+            # transcript has committed its final row. Do not queue any new
+            # assistant rows in this tiny window; retry on the next event/poll.
+            return None
+
+        user_idx = -1
+        for idx in range(final_idx - 1, -1, -1):
+            row = messages[idx]
+            if isinstance(row, dict) and str(row.get("role") or "").strip().lower() == "user":
+                user_idx = idx
+                break
+
+        if user_idx < 0:
+            # A very small chat.history window could omit the preceding user
+            # row. Fall back to the beginning of the returned window rather
+            # than replaying known voice-turn progress as reminders.
+            user_idx = -1
+            print("[VOICE-FENCE-WARN] preceding user row missing; using history-window boundary")
+
+        rows = 0
+        final_text = ""
+        for idx in range(user_idx + 1, final_idx + 1):
+            row = messages[idx]
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("role") or "").strip().lower() != "assistant":
+                continue
+            if not _is_user_visible_async_assistant_message(row):
+                continue
+            key = _history_message_identity(row)
+            if key:
+                suppressed.add(key)
+                rows += 1
+            if idx == final_idx:
+                final_text = _history_message_text(row)
+
+        if final_text:
+            _consume_voice_reply_suppression(final_text)
+        resolved_count += 1
+        print(f"[VOICE-FENCE] closed at synchronous reply; suppressed_rows={rows}")
+
+    if resolved_count:
+        del VOICE_TURN_FENCES[:resolved_count]
+    return suppressed
 
 
 def _notification_record_from_history_message(
@@ -1511,6 +1627,11 @@ async def _reconcile_voice_session_history(
     if VOICE_OPENCLAW_INFLIGHT > 0:
         return
 
+    fenced_keys = _resolve_voice_turn_fences(messages)
+    if fenced_keys is None:
+        print("[VOICE-FENCE] waiting for synchronous reply commit; reconciliation deferred")
+        return
+
     changed = False
     for raw in assistant_rows:
         if not isinstance(raw, dict):
@@ -1519,6 +1640,13 @@ async def _reconcile_voice_session_history(
         if not key or key in NOTIFICATION_SEEN_SET:
             continue
         text = _history_message_text(raw)
+
+        if key in fenced_keys:
+            _remember_notification_seen(key)
+            changed = True
+            print("[VOICE-FENCE] synchronous progress/final row consumed")
+            continue
+
         if _consume_voice_reply_suppression(text):
             _remember_notification_seen(key)
             changed = True
@@ -4175,6 +4303,7 @@ async def openclaw_chat(transcript: str, context: dict[str, Any]) -> str:
         # Register the exact stored response before releasing the in-flight gate
         # so it can be marked seen without being spoken twice.
         _register_voice_reply_suppression(full_text)
+        _register_voice_turn_fence(full_text)
 
         text = full_text
         if len(text) > MAX_AGENT_CHARS:
