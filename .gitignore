@@ -60,3 +60,4 @@ dist/
 *.tmp
 *.bak
 *.swp
+gateway/latest_input_normal.wav
