@@ -48,6 +48,7 @@ gateway/latest_input.wav
 gateway/latest_tts.wav
 gateway/latest_transcript.txt
 gateway/latest_answer.txt
+gateway/latest_input_normal.wav
 gateway/*.pid
 gateway/*.log
 
@@ -60,4 +61,4 @@ dist/
 *.tmp
 *.bak
 *.swp
-gateway/latest_input_normal.wav
+

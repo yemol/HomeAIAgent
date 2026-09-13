@@ -1,3 +1,18 @@
+## A1R23 Capability Guard
+
+Gateway now distinguishes "has a screen" from "implements HomeAIAgent display
+sleep/wake policy". Mini is no longer sent Glass2 display-policy or Info-feed
+traffic unless it explicitly opts in. A1R22 session/speaker routing is retained.
+
+## A1R22 Multi-Device Session Router
+
+Gateway-only architecture update. HomeAIAgent and HomeAIAgent Mini now resolve
+different OpenClaw conversation users by `device_id`. The same router also
+defines scalable NetworkSpeaker bindings through `parent_device_id`; the
+planned Mini charging-dock speaker is reserved for `homeai-mini-bedroom-01`.
+
+No StickS3 firmware flash is required for the session-isolation change.
+
 ## A1R21 Gateway Voice-Turn Ordering Fix
 
 This release keeps the A1R20 Submission Clean firmware and frozen local TTS wake ACK unchanged, and fixes one Gateway-side ordering defect: OpenClaw progress messages emitted during a synchronous voice turn are no longer replayed afterward as asynchronous notifications.

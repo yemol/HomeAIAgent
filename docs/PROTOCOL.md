@@ -57,7 +57,75 @@ A playback failure is reported with `playback.error`.
 
 ### `device.hello`
 
-Announces the terminal and includes the current/previous/next information context.
+Announces one Gateway client.
+
+Companion terminal example:
+
+```json
+{
+  "type": "device.hello",
+  "device_id": "homeai-mini-bedroom-01",
+  "device_role": "companion",
+  "capabilities": {
+    "ptt": true,
+    "speaker_pcm16": true
+  }
+}
+```
+
+`device_role` is optional; omitted means `companion`. For backward compatibility,
+the current StickS3 may omit `device_id`; Gateway assigns it the configured
+`HOMEAI_PRIMARY_DEVICE_ID`.
+
+Optional companion capabilities are protocol-specific:
+
+```json
+{
+  "capabilities": {
+    "display": "135x240",
+    "display_policy": false,
+    "info_feed": false
+  }
+}
+```
+
+`display` only describes the physical screen. It does **not** mean the terminal
+implements `display.sleep` / `display.wake` / `display.ack`.
+
+`display_policy=true` explicitly opts into that sleep/wake handshake.
+
+`info_feed=true` explicitly opts into the Glass2-style `info.begin` /
+`info.item` / `info.end` feed.
+
+The current primary HomeAIAgent remains backward-compatible and is treated as
+supporting both services even without capability flags. HomeAIAgent Mini does
+not currently opt into either service.
+
+NetworkSpeaker example:
+
+```json
+{
+  "type": "device.hello",
+  "device_id": "speaker-mini-dock-01",
+  "device_role": "speaker",
+  "parent_device_id": "homeai-mini-bedroom-01",
+  "audio_priority": 100,
+  "capabilities": {
+    "speaker_pcm16": true
+  }
+}
+```
+
+A speaker owns no OpenClaw conversation. `parent_device_id` binds it to exactly
+one companion. Multiple speakers can coexist when each binds to a different
+parent. If more than one live speaker binds to the same parent, the highest
+`audio_priority` wins; equal priority uses the newest connection.
+
+The dedicated Mini charging-dock speaker should bind to:
+
+```text
+parent_device_id = homeai-mini-bedroom-01
+```
 
 ### `ptt.start`
 
@@ -104,6 +172,19 @@ Reports display-policy execution with:
 ### `gateway.ready`
 
 Sent after `device.hello`.
+
+For a companion it confirms the resolved device identity and whether its
+conversation is isolated from the primary HomeAIAgent session.
+
+For a speaker it includes `parent_device_id` and:
+
+```text
+audio_protocol = homeai-tts-pcm16/1
+```
+
+Speaker clients consume the existing `tts.start` -> binary PCM16 -> `tts.end`
+stream and return the existing `playback.slot_ready`, `playback.done` and
+`playback.error` acknowledgements.
 
 ### `assistant.state`
 

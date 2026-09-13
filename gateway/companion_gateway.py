@@ -27,6 +27,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import array
 import struct
@@ -147,6 +148,11 @@ DISPLAY_ACK_TIMEOUT_SEC = 5.0
 DISPLAY_APPLY_TIMEOUT_SEC = 180.0
 DISPLAY_COMMAND_MAX_ATTEMPTS = 3
 DISPLAY_STATUS_RECHECK_SEC = 300
+
+# NetworkSpeaker runtime volume control. Relative voice commands use a fixed
+# 10-point step so "大声一点 / 轻一点" is predictable instead of model-dependent.
+SPEAKER_VOLUME_STEP_PERCENT = 10
+SPEAKER_VOLUME_ACK_TIMEOUT_SEC = 2.5
 
 INFO_FRAME_WIDTH = 128
 INFO_FRAME_HEIGHT = 64
@@ -761,6 +767,87 @@ OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
 OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
 
+# A1R22 multi-device conversation router.
+#
+# The existing StickS3 does not currently send a device_id, so a missing id is
+# intentionally treated as the primary HomeAIAgent. HomeAIAgent Mini already
+# announces HOMEAI_DEVICE_ID=homeai-mini-bedroom-01 and therefore receives a
+# separate OpenClaw `user`, which resolves to a separate OpenAI-compatible
+# conversation session.
+HOMEAI_PRIMARY_DEVICE_ID = (
+    os.getenv("HOMEAI_PRIMARY_DEVICE_ID", "homeai-agent-main-01").strip()
+    or "homeai-agent-main-01"
+)
+HOMEAI_MINI_DEVICE_ID = (
+    os.getenv("HOMEAI_MINI_DEVICE_ID", "homeai-mini-bedroom-01").strip()
+    or "homeai-mini-bedroom-01"
+)
+OPENCLAW_MINI_USER = (
+    os.getenv("OPENCLAW_MINI_USER", "home-ai-agent-mini:main").strip()
+    or "home-ai-agent-mini:main"
+)
+HOMEAI_AUTO_ISOLATE_UNKNOWN_COMPANIONS = (
+    os.getenv("HOMEAI_AUTO_ISOLATE_UNKNOWN_COMPANIONS", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+HOMEAI_DEVICE_OPENCLAW_USERS_JSON = os.getenv(
+    "HOMEAI_DEVICE_OPENCLAW_USERS_JSON", ""
+).strip()
+
+
+def _safe_device_key(device_id: str) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in {"-", "_", "."}) else "-"
+        for ch in str(device_id or "").strip().lower()
+    ).strip("-")
+    if not cleaned:
+        cleaned = hashlib.sha256(
+            str(device_id or "unknown").encode("utf-8")
+        ).hexdigest()[:12]
+    return cleaned[:96]
+
+
+def _load_device_openclaw_users() -> dict[str, str]:
+    mapping: dict[str, str] = {
+        HOMEAI_PRIMARY_DEVICE_ID: OPENCLAW_USER,
+        HOMEAI_MINI_DEVICE_ID: OPENCLAW_MINI_USER,
+    }
+    if not HOMEAI_DEVICE_OPENCLAW_USERS_JSON:
+        return mapping
+
+    try:
+        raw = json.loads(HOMEAI_DEVICE_OPENCLAW_USERS_JSON)
+        if not isinstance(raw, dict):
+            raise ValueError("mapping must be a JSON object")
+        for device_id, user in raw.items():
+            did = str(device_id or "").strip()
+            target = str(user or "").strip()
+            if did and target:
+                mapping[did] = target
+    except Exception as exc:
+        print(
+            "[CONFIG-WARN] HOMEAI_DEVICE_OPENCLAW_USERS_JSON ignored: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    return mapping
+
+
+DEVICE_OPENCLAW_USERS = _load_device_openclaw_users()
+
+
+def _openclaw_user_for_device(device_id: str) -> str:
+    did = str(device_id or "").strip() or HOMEAI_PRIMARY_DEVICE_ID
+    mapped = DEVICE_OPENCLAW_USERS.get(did)
+    if mapped:
+        return mapped
+
+    if HOMEAI_AUTO_ISOLATE_UNKNOWN_COMPANIONS:
+        # Stable per-device namespace: unknown future companion terminals do not
+        # silently collapse back into the primary conversation.
+        return f"home-ai-agent-device:{_safe_device_key(did)}"
+
+    return OPENCLAW_USER
+
 # A1R11: OpenClaw transport is owned by this Python service. On the Mac mini
 # the default is an in-process AsyncSSH local forward. A future deployment on
 # the OpenClaw host can switch OPENCLAW_TRANSPORT=direct without changing the
@@ -804,10 +891,11 @@ def _openclaw_transport_ready() -> bool:
     return manager.ready.is_set()
 
 
-def _openclaw_voice_session_key() -> str:
+def _openclaw_voice_session_key(openclaw_user: str | None = None) -> str:
     # Mirrors OpenClaw's current OpenAI-compatible resolver exactly:
     # prefix="openai" + stable `user` -> agent:<agentId>:openai-user:<user>.
-    return f"agent:{OPENCLAW_VOICE_AGENT_ID}:openai-user:{OPENCLAW_USER}"
+    user = str(openclaw_user or OPENCLAW_USER)
+    return f"agent:{OPENCLAW_VOICE_AGENT_ID}:openai-user:{user}"
 
 
 # Info Skill session lifecycle. Each background request gets one exact,
@@ -2908,7 +2996,11 @@ async def broadcast_display_policy(
     *,
     reason: str = "night_schedule",
 ) -> None:
-    sessions = list(ACTIVE_SESSIONS)
+    sessions = [
+        s
+        for s in ACTIVE_SESSIONS
+        if _is_companion_session(s) and _supports_display_policy(s)
+    ]
     if not sessions:
         print(
             f"[DISPLAY] no connected device for policy "
@@ -2973,7 +3065,11 @@ async def display_reconcile_loop() -> None:
     while True:
         await asyncio.sleep(DISPLAY_STATUS_RECHECK_SEC)
 
-        for session in list(ACTIVE_SESSIONS):
+        for session in [
+            s
+            for s in list(ACTIVE_SESSIONS)
+            if _is_companion_session(s) and _supports_display_policy(s)
+        ]:
             try:
                 start_display_policy_task(
                     session,
@@ -3008,7 +3104,11 @@ async def broadcast_info_sync_when_idle() -> None:
         print("[INFO-SKILL] device sync deferred: voice path still busy")
         return
 
-    for session in list(ACTIVE_SESSIONS):
+    for session in [
+        s
+        for s in list(ACTIVE_SESSIONS)
+        if _is_companion_session(s) and _supports_info_feed(s)
+    ]:
         try:
             await send_info_sync(session)
         except Exception as exc:
@@ -3461,6 +3561,19 @@ async def send_info_sync(session: "ClientSession") -> None:
 @dataclass
 class ClientSession:
     ws: Any
+
+    # A1R22 device identity/routing.
+    # - companion: owns an OpenClaw conversation
+    # - speaker: owns no LLM session; it is an audio sink bound to parent_device_id
+    device_id: str = HOMEAI_PRIMARY_DEVICE_ID
+    device_role: str = "companion"
+    parent_device_id: str = ""
+    openclaw_user: str = OPENCLAW_USER
+    audio_priority: int = 0
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    hello_received: bool = False
+    connected_at: float = field(default_factory=time.time)
+
     audio: bytearray = field(default_factory=bytearray)
     context: dict[str, Any] = field(default_factory=dict)
     diag_glass_mode: str = "GLASS NORMAL"
@@ -3472,12 +3585,344 @@ class ClientSession:
     playback_error_event: asyncio.Event = field(default_factory=asyncio.Event)
     playback_slot_ready_event: asyncio.Event = field(default_factory=asyncio.Event)
 
+    # NetworkSpeaker control ACKs. Commands are serialized by one companion
+    # turn, but the request_id check still protects against stale frames.
+    speaker_volume_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+
     # Display policy handshake.
     display_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     display_expected_command_id: str = ""
     display_last_ack: dict[str, Any] = field(default_factory=dict)
     display_last_confirmed_sleeping: bool | None = None
     display_policy_task: Any = None
+
+
+def _is_speaker_session(session: ClientSession) -> bool:
+    return session.device_role == "speaker"
+
+
+def _is_companion_session(session: ClientSession) -> bool:
+    return session.device_role == "companion"
+
+
+def _is_primary_companion_session(session: ClientSession) -> bool:
+    return (
+        _is_companion_session(session)
+        and session.openclaw_user == OPENCLAW_USER
+    )
+
+
+def _capability_enabled(
+    session: ClientSession,
+    key: str,
+    *,
+    default: bool = False,
+) -> bool:
+    value = session.capabilities.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return default
+
+
+def _supports_display_policy(session: ClientSession) -> bool:
+    # Current primary StickS3 is legacy and already implements display.sleep /
+    # display.wake + display.ack, even if it does not advertise capabilities.
+    if _is_primary_companion_session(session):
+        return True
+
+    # A generic `display: "135x240"` only describes that a device has a screen.
+    # It does NOT imply support for the HomeAIAgent night sleep/wake protocol.
+    return _capability_enabled(session, "display_policy")
+
+
+def _supports_info_feed(session: ClientSession) -> bool:
+    # Current primary Glass2 path is legacy and already consumes info.* frames.
+    if _is_primary_companion_session(session):
+        return True
+    return _capability_enabled(session, "info_feed")
+
+
+def _apply_device_hello(session: ClientSession, msg: dict[str, Any]) -> None:
+    role = str(
+        msg.get("device_role")
+        or msg.get("role")
+        or "companion"
+    ).strip().lower()
+    if role not in {"companion", "speaker"}:
+        role = "companion"
+
+    device_id = str(msg.get("device_id") or "").strip()
+    if not device_id:
+        # Backward compatibility for the current StickS3 firmware.
+        device_id = (
+            HOMEAI_PRIMARY_DEVICE_ID
+            if role == "companion"
+            else f"speaker-unidentified-{int(session.connected_at * 1000)}"
+        )
+
+    parent = str(
+        msg.get("parent_device_id")
+        or msg.get("parent_device")
+        or ""
+    ).strip()
+
+    priority_raw = msg.get("audio_priority", 0)
+    try:
+        priority = max(-100, min(100, int(priority_raw)))
+    except (TypeError, ValueError):
+        priority = 0
+
+    capabilities = msg.get("capabilities")
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+
+    session.device_id = device_id
+    session.device_role = role
+    session.parent_device_id = parent
+    session.audio_priority = priority
+    session.capabilities = dict(capabilities)
+    session.hello_received = True
+    session.openclaw_user = (
+        ""
+        if role == "speaker"
+        else _openclaw_user_for_device(device_id)
+    )
+
+
+def _speaker_candidates_for(parent_device_id: str) -> list[ClientSession]:
+    parent = str(parent_device_id or "").strip()
+    if not parent:
+        return []
+
+    candidates = [
+        item
+        for item in ACTIVE_SESSIONS
+        if (
+            _is_speaker_session(item)
+            and item.hello_received
+            and item.parent_device_id == parent
+            and not item.playback_sequence_active
+        )
+    ]
+    candidates.sort(
+        key=lambda item: (item.audio_priority, item.connected_at),
+        reverse=True,
+    )
+    return candidates
+
+
+def _select_audio_sink(source: ClientSession) -> ClientSession:
+    """Resolve one live audio sink for one companion.
+
+    NetworkSpeaker devices bind themselves with parent_device_id. This supports
+    multiple speakers in the same Gateway without cross-routing:
+      speaker-A -> companion-A
+      speaker-B -> companion-B
+      Mini Dock -> homeai-mini-bedroom-01
+
+    If no bound speaker is live, audio falls back to the companion itself.
+    """
+    if not _is_companion_session(source):
+        return source
+
+    candidates = _speaker_candidates_for(source.device_id)
+    if not candidates:
+        return source
+    return candidates[0]
+
+
+@dataclass(frozen=True)
+class SpeakerVolumeIntent:
+    operation: str
+    value: int = 0
+
+
+def _parse_zh_number_0_100(text: str) -> int | None:
+    """Parse the small Chinese-number subset useful for spoken percentages."""
+    value = str(text or "").strip()
+    if not value:
+        return None
+    if value == "一百":
+        return 100
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+              "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if value in digits:
+        return digits[value]
+    if "十" in value:
+        left, right = value.split("十", 1)
+        tens = 1 if left == "" else digits.get(left)
+        ones = 0 if right == "" else digits.get(right)
+        if tens is None or ones is None:
+            return None
+        result = tens * 10 + ones
+        return result if 0 <= result <= 99 else None
+    return None
+
+
+def _parse_speaker_volume_intent(transcript: str) -> SpeakerVolumeIntent | None:
+    text = str(transcript or "").strip()
+    if not text:
+        return None
+
+    compact = re.sub(r"[\s，。,.！!？?、：:；;“”\"'（）()]+", "", text).lower()
+    has_volume_context = any(
+        token in compact for token in ("逐光", "音量", "声音", "喇叭")
+    )
+    standalone_followups = {
+        "大声一点", "小声一点", "轻一点", "再大一点", "再小一点", "再轻一点",
+        "调大一点", "调小一点", "调高一点", "调低一点",
+    }
+    if compact in standalone_followups:
+        has_volume_context = True
+
+    # Explicit absolute percentage, e.g. “音量调到 50% / 百分之五十”.
+    if has_volume_context:
+        m = re.search(
+            r"(?:音量|声音|喇叭).{0,8}?(?:调到|调成|调整到|设为|设置为|到)"
+            r"\s*(?:百分之)?\s*(\d{1,3})\s*%?",
+            text,
+        )
+        if m:
+            level = int(m.group(1))
+            if 0 <= level <= 100:
+                return SpeakerVolumeIntent("set", level)
+
+        m = re.search(
+            r"(?:音量|声音|喇叭).{0,8}?(?:调到|调成|调整到|设为|设置为|到)"
+            r"\s*百分之\s*([零〇一二两三四五六七八九十百]+)",
+            text,
+        )
+        if m:
+            level = _parse_zh_number_0_100(m.group(1))
+            if level is not None:
+                return SpeakerVolumeIntent("set", level)
+
+        if any(token in compact for token in ("最大音量", "声音最大", "开到最大", "调到最大")):
+            return SpeakerVolumeIntent("set", 100)
+
+        if any(token in compact for token in ("音量多少", "现在音量", "当前音量", "声音多大")):
+            return SpeakerVolumeIntent("get", 0)
+
+    louder = (
+        "大声一点", "声音大一点", "音量大一点", "调大一点", "调高一点",
+        "音量调高", "声音调高", "再大一点", "再响一点", "响一点",
+    )
+    softer = (
+        "轻一点", "小声一点", "声音小一点", "音量小一点", "调小一点",
+        "调低一点", "音量调低", "声音调低", "再小一点", "再轻一点",
+    )
+    if has_volume_context and any(token in compact for token in louder):
+        return SpeakerVolumeIntent("adjust", SPEAKER_VOLUME_STEP_PERCENT)
+    if has_volume_context and any(token in compact for token in softer):
+        return SpeakerVolumeIntent("adjust", -SPEAKER_VOLUME_STEP_PERCENT)
+    return None
+
+
+def _speaker_supports_volume_control(session: ClientSession) -> bool:
+    return (
+        _is_speaker_session(session)
+        and _capability_enabled(session, "volume_control", default=False)
+    )
+
+
+async def _wait_speaker_volume_ack(
+    speaker: ClientSession,
+    request_id: str,
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + SPEAKER_VOLUME_ACK_TIMEOUT_SEC
+    while True:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise TimeoutError("NetworkSpeaker volume ACK timeout")
+        ack = await asyncio.wait_for(
+            speaker.speaker_volume_ack_queue.get(),
+            timeout=remaining,
+        )
+        if str(ack.get("request_id") or "") == request_id:
+            return ack
+        print(
+            f"[VOLUME-WARN] stale ACK ignored expected={request_id} "
+            f"got={ack.get('request_id')!r}"
+        )
+
+
+async def _apply_speaker_volume_voice_command(
+    source: ClientSession,
+    transcript: str,
+) -> str | None:
+    intent = _parse_speaker_volume_intent(transcript)
+    if intent is None:
+        return None
+
+    sink = _select_audio_sink(source)
+    if sink is source or not _speaker_supports_volume_control(sink):
+        print(f"[VOLUME] command requested but no controllable speaker source={source.device_id}")
+        return "现在没有连接可调音量的网络喇叭。"
+
+    request_id = f"volume-{uuid.uuid4()}"
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "device_id": sink.device_id,
+    }
+    if intent.operation == "set":
+        payload.update({
+            "type": "speaker.volume.set",
+            "volume_percent": max(0, min(100, intent.value)),
+        })
+    elif intent.operation == "adjust":
+        payload.update({
+            "type": "speaker.volume.adjust",
+            "delta_percent": intent.value,
+        })
+    else:
+        payload["type"] = "speaker.volume.get"
+
+    try:
+        await send_json(sink.ws, payload)
+        ack = await _wait_speaker_volume_ack(sink, request_id)
+    except Exception as exc:
+        print(f"[VOLUME-ERROR] {type(exc).__name__}: {exc}")
+        return "网络喇叭这次没有响应音量调整。"
+
+    status = str(ack.get("status") or "")
+    try:
+        level = max(0, min(100, int(ack.get("volume_percent"))))
+    except (TypeError, ValueError):
+        return "网络喇叭返回的音量状态不正确。"
+
+    sink.capabilities["volume_percent"] = level
+    if status not in {"applied", "applied_not_persisted"}:
+        return "网络喇叭没有接受这次音量调整。"
+
+    if intent.operation == "get":
+        return f"网络喇叭现在音量是百分之{level}。"
+    if intent.operation == "adjust":
+        direction = "大" if intent.value > 0 else "小"
+        return f"好的，调{direction}了一点，现在是百分之{level}。"
+    return f"好的，网络喇叭音量已经调到百分之{level}。"
+
+
+def _device_ready_payload(session: ClientSession) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "gateway.ready",
+        "mode": MODE,
+        "device_id": session.device_id,
+        "device_role": session.device_role,
+    }
+    if _is_speaker_session(session):
+        payload["parent_device_id"] = session.parent_device_id
+        payload["audio_protocol"] = "homeai-tts-pcm16/1"
+    else:
+        payload["conversation_isolated"] = (
+            session.openclaw_user != OPENCLAW_USER
+        )
+        payload["display_policy"] = _supports_display_policy(session)
+        payload["info_feed"] = _supports_info_feed(session)
+    return payload
 
 
 async def send_json(ws, payload: dict[str, Any]) -> None:
@@ -4265,9 +4710,19 @@ Glass2 当前资讯上下文：
 """
 
 
-async def openclaw_chat(transcript: str, context: dict[str, Any]) -> str:
+async def openclaw_chat(
+    transcript: str,
+    context: dict[str, Any],
+    *,
+    openclaw_user: str = OPENCLAW_USER,
+) -> str:
     global VOICE_OPENCLAW_INFLIGHT
-    VOICE_OPENCLAW_INFLIGHT += 1
+
+    # The notification listener subscribes only to the primary HomeAIAgent
+    # session. Mini/other companion turns must not pause or alter that listener.
+    notification_tracked = openclaw_user == OPENCLAW_USER
+    if notification_tracked:
+        VOICE_OPENCLAW_INFLIGHT += 1
     try:
         headers = {"Content-Type": "application/json"}
         if OPENCLAW_TOKEN:
@@ -4275,7 +4730,7 @@ async def openclaw_chat(transcript: str, context: dict[str, Any]) -> str:
 
         payload = {
             "model": OPENCLAW_MODEL,
-            "user": OPENCLAW_USER,
+            "user": openclaw_user,
             "stream": False,
             "messages": [
                 {"role": "user", "content": build_agent_prompt(transcript, enrich_info_context(context))}
@@ -4299,18 +4754,20 @@ async def openclaw_chat(transcript: str, context: dict[str, Any]) -> str:
         if not full_text:
             raise RuntimeError("OpenClaw returned empty assistant text")
 
-        # The session listener receives the same assistant row asynchronously.
-        # Register the exact stored response before releasing the in-flight gate
-        # so it can be marked seen without being spoken twice.
-        _register_voice_reply_suppression(full_text)
-        _register_voice_turn_fence(full_text)
+        # Only the primary HomeAIAgent conversation is subscribed by the
+        # notification listener. Mini and future isolated companion sessions
+        # therefore do not participate in the primary suppression/fence state.
+        if notification_tracked:
+            _register_voice_reply_suppression(full_text)
+            _register_voice_turn_fence(full_text)
 
         text = full_text
         if len(text) > MAX_AGENT_CHARS:
             text = text[:MAX_AGENT_CHARS].rstrip() + "。"
         return text
     finally:
-        VOICE_OPENCLAW_INFLIGHT = max(0, VOICE_OPENCLAW_INFLIGHT - 1)
+        if notification_tracked:
+            VOICE_OPENCLAW_INFLIGHT = max(0, VOICE_OPENCLAW_INFLIGHT - 1)
 
 
 async def openai_tts_wav(text: str) -> bytes:
@@ -4519,6 +4976,8 @@ async def send_pcm_for_playback(
     session: ClientSession,
     pcm: bytes,
     sample_rate: int,
+    *,
+    emit_state: bool = True,
 ) -> None:
     segments = split_pcm_for_device(pcm, sample_rate)
     if not segments:
@@ -4542,7 +5001,8 @@ async def send_pcm_for_playback(
     session.playback_slot_ready_event.clear()
 
     try:
-        await send_state(session.ws, "speaking")
+        if emit_state:
+            await send_state(session.ws, "speaking")
 
         # Fill both M5Unified speaker queue slots before the first segment can
         # finish. This removes the old "playback.done -> transfer next segment"
@@ -4593,7 +5053,48 @@ async def send_pcm_for_playback(
         session.playback_sequence_active = False
 
 
+async def send_pcm_to_routed_sink(
+    source: ClientSession,
+    pcm: bytes,
+    sample_rate: int,
+) -> ClientSession:
+    """Play one reply on the speaker bound to `source`, if one is online.
+
+    The companion remains the owner of UI/conversation state. The speaker only
+    receives the existing TTS PCM protocol and playback acknowledgements.
+    """
+    sink = _select_audio_sink(source)
+    if sink is source:
+        await send_pcm_for_playback(source, pcm, sample_rate)
+        return source
+
+    print(
+        f"[AUDIO-ROUTE] source={source.device_id} "
+        f"-> speaker={sink.device_id} priority={sink.audio_priority}"
+    )
+    try:
+        await send_state(source.ws, "speaking")
+        await send_pcm_for_playback(
+            sink,
+            pcm,
+            sample_rate,
+            emit_state=False,
+        )
+        return sink
+    except Exception as exc:
+        # A dock/speaker disappearing must not lose the answer. Fall back to the
+        # companion's existing speaker path for this turn.
+        print(
+            f"[AUDIO-ROUTE-WARN] speaker={sink.device_id} failed; "
+            f"fallback={source.device_id}: {type(exc).__name__}: {exc}"
+        )
+        await send_pcm_for_playback(source, pcm, sample_rate)
+        return source
+
+
 def _reminder_session_available(session: ClientSession) -> bool:
+    if not _is_primary_companion_session(session):
+        return False
     return not (
         session.recording
         or session.processing
@@ -4663,8 +5164,11 @@ async def _deliver_reminder_to_device(
             f"[NOTIFY] TTS ready id={record.reminder_id} "
             f"provider={provider} bytes={len(pcm)} ms={tts_ms}"
         )
-        await send_pcm_for_playback(session, pcm, sample_rate)
-        print(f"[NOTIFY] device playback ACK id={record.reminder_id}")
+        sink = await send_pcm_to_routed_sink(session, pcm, sample_rate)
+        print(
+            f"[NOTIFY] device playback ACK id={record.reminder_id} "
+            f"sink={sink.device_id}"
+        )
 
     finally:
         # Restore the real feed even if synthesis/playback failed. The reminder
@@ -4834,13 +5338,22 @@ async def process_utterance(session: ClientSession) -> None:
 
         await send_json(session.ws, {"type": "asr.result", "text": transcript})
 
-        print(
-            f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
-            f"model={OPENCLAW_MODEL} user={OPENCLAW_USER}"
-        )
         agent_started = time.perf_counter()
-        answer = await openclaw_chat(transcript, session.context)
-        print("[STAGE] OpenClaw returned")
+        answer = await _apply_speaker_volume_voice_command(session, transcript)
+        if answer is None:
+            print(
+                f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
+                f"model={OPENCLAW_MODEL} device={session.device_id} "
+                f"user={session.openclaw_user}"
+            )
+            answer = await openclaw_chat(
+                transcript,
+                session.context,
+                openclaw_user=session.openclaw_user,
+            )
+            print("[STAGE] OpenClaw returned")
+        else:
+            print(f"[VOLUME-VOICE] handled locally transcript={transcript!r}")
         agent_ms = int((time.perf_counter() - agent_started) * 1000)
         print(f"[AGENT] {answer}")
         _best_effort_write_text(BASE_DIR / "latest_answer.txt", answer + "\n")
@@ -4861,7 +5374,8 @@ async def process_utterance(session: ClientSession) -> None:
             f"[LATENCY] asr={asr_ms}ms agent={agent_ms}ms "
             f"tts={tts_ms}ms total_before_playback={total_ms}ms"
         )
-        await send_pcm_for_playback(session, pcm_out, sample_rate)
+        sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
+        print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
         session.processing = False
         await send_state(session.ws, "idle")
 
@@ -4905,17 +5419,62 @@ async def handle_connection(ws) -> None:
 
             kind = msg.get("type")
             if kind == "device.hello":
-                print("[DEVICE] hello")
-                await send_json(ws, {"type": "gateway.ready", "mode": MODE})
+                _apply_device_hello(session, msg)
+
+                if _is_speaker_session(session):
+                    print(
+                        f"[DEVICE] hello id={session.device_id} role=speaker "
+                        f"parent={session.parent_device_id or '-'} "
+                        f"priority={session.audio_priority}"
+                    )
+                    await send_json(ws, _device_ready_payload(session))
+                    if not session.parent_device_id:
+                        await send_json(ws, {
+                            "type": "speaker.error",
+                            "message": "parent_device_id required",
+                        })
+                    continue
+
+                print(
+                    f"[DEVICE] hello id={session.device_id} role=companion "
+                    f"openclaw_user={session.openclaw_user}"
+                )
+                await send_json(ws, _device_ready_payload(session))
                 await send_state(ws, "idle")
 
-                # Do not await here: this coroutine must keep receiving so the
-                # device's display.ack can be processed.
-                start_display_policy_task(
-                    session,
-                    reason="device_hello",
+                if _supports_display_policy(session):
+                    # Do not await here: this coroutine must keep receiving so
+                    # the device's display.ack can be processed.
+                    start_display_policy_task(
+                        session,
+                        reason="device_hello",
+                    )
+                else:
+                    print(
+                        f"[DISPLAY] policy unsupported; skip id={session.device_id}"
+                    )
+
+                if _supports_info_feed(session):
+                    await send_info_sync(session)
+                else:
+                    print(
+                        f"[INFO] feed unsupported; skip id={session.device_id}"
+                    )
+
+            elif kind == "speaker.volume.ack":
+                if not _is_speaker_session(session):
+                    continue
+                try:
+                    level = max(0, min(100, int(msg.get("volume_percent"))))
+                    session.capabilities["volume_percent"] = level
+                except (TypeError, ValueError):
+                    level = -1
+                print(
+                    f"[VOLUME] ACK speaker={session.device_id} "
+                    f"status={msg.get('status')} volume={level}% "
+                    f"request={msg.get('request_id')}"
                 )
-                await send_info_sync(session)
+                session.speaker_volume_ack_queue.put_nowait(dict(msg))
 
             elif kind == "display.ack":
                 command_id = str(msg.get("command_id") or "")
@@ -4937,6 +5496,18 @@ async def handle_connection(ws) -> None:
                     and command_id == session.display_expected_command_id
                 ):
                     session.display_ack_queue.put_nowait(dict(msg))
+                elif (
+                    command_id
+                    and command_id
+                    == str(session.display_last_ack.get("command_id") or "")
+                ):
+                    # Some existing firmware paths can emit the same final
+                    # applied ACK twice. It is already confirmed, so this is
+                    # benign and should not pollute logs as a stale warning.
+                    print(
+                        f"[DISPLAY] duplicate ACK ignored "
+                        f"command_id={command_id}"
+                    )
                 else:
                     print(
                         f"[DISPLAY-WARN] unexpected/stale device ACK "
@@ -4948,6 +5519,12 @@ async def handle_connection(ws) -> None:
                 print(f"[INFO] device ack revision={FEED_REVISION}")
 
             elif kind == "ptt.start":
+                if _is_speaker_session(session):
+                    await send_json(ws, {
+                        "type": "gateway.error",
+                        "message": "speaker role cannot start PTT",
+                    })
+                    continue
                 if session.processing:
                     continue
                 session.audio.clear()
@@ -5017,7 +5594,10 @@ async def handle_connection(ws) -> None:
             session.display_policy_task.cancel()
         if session in ACTIVE_SESSIONS:
             ACTIVE_SESSIONS.remove(session)
-        print("[WS] client disconnected")
+        print(
+            f"[WS] client disconnected id={session.device_id} "
+            f"role={session.device_role}"
+        )
 
 
 async def preflight(*, require_openclaw: bool = True) -> int:
@@ -5059,7 +5639,12 @@ async def preflight(*, require_openclaw: bool = True) -> int:
         f"ssh={OPENCLAW_SSH_USER}@{OPENCLAW_SSH_HOST} "
         f"local=127.0.0.1:{OPENCLAW_LOCAL_PORT} remote=127.0.0.1:{OPENCLAW_REMOTE_PORT}"
     )
-    print(f"[CFG] session user={OPENCLAW_USER}")
+    print(f"[CFG] primary session user={OPENCLAW_USER}")
+    print(
+        f"[CFG] device router primary={HOMEAI_PRIMARY_DEVICE_ID}->{OPENCLAW_USER} "
+        f"mini={HOMEAI_MINI_DEVICE_ID}->{OPENCLAW_MINI_USER} "
+        f"auto_isolate_unknown={HOMEAI_AUTO_ISOLATE_UNKNOWN_COMPANIONS}"
+    )
     print(f"[CFG] info_skill_protocol={INFO_SKILL_PROTOCOL}")
     print("[CFG] info_skill_transport=structured_tool_call fallback=strict_text")
     print(

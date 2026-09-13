@@ -1,3 +1,37 @@
+# Changelog
+
+## 2026-09-12 — A1R23 Capability Guard / Display ACK noise fix
+
+- Fixed HomeAIAgent Mini receiving primary Glass2 display-policy commands.
+- `display` screen dimensions no longer imply support for the HomeAIAgent
+  `display.sleep` / `display.wake` / `display.ack` protocol.
+- Added explicit `display_policy` and `info_feed` capability gates.
+- Current primary HomeAIAgent remains backward-compatible and continues to
+  receive display policy + Info feed without firmware changes.
+- HomeAIAgent Mini now receives neither service unless it explicitly opts in.
+- Benign duplicate final `display.ack` packets are recognized and ignored
+  instead of logged as stale warnings.
+- Multi-device OpenClaw session routing and NetworkSpeaker routing from A1R22
+  are unchanged.
+
+
+## 2026-09-12 — A1R22 Multi-Device Session Router
+
+- Added stable per-device OpenClaw conversation routing.
+- Current primary StickS3 remains on `OPENCLAW_USER=home-ai-agent:main`.
+- HomeAIAgent Mini `homeai-mini-bedroom-01` now uses `home-ai-agent-mini:main`.
+- Unknown future companion ids are isolated automatically by default.
+- OpenClaw Notification listener/suppression remains pinned to the primary
+  HomeAIAgent conversation only.
+- Reminder delivery now targets the primary companion instead of whichever
+  WebSocket client connected most recently.
+- Added speaker-role clients with `parent_device_id` binding and priority-based
+  audio-sink resolution.
+- Multiple NetworkSpeaker clients can coexist and bind to different companions.
+- Planned Network Speaker Dock binds only to `homeai-mini-bedroom-01`.
+- Display policy and Info sync no longer target speaker-only clients.
+- Existing voice/TTS transport remains the fallback when no bound speaker is online.
+
 # A1R21 - Gateway Voice-Turn Ordering Fix
 
 - Added a transcript-native Voice Turn Fence around synchronous `/v1/chat/completions` voice turns.
@@ -192,7 +226,6 @@
 - Added one-shot persistent config migration so existing Mac mini `gateway.env` adopts the new voice without touching API keys/tokens.
 - StickS3 firmware, 24 FPS, wake path, Glass2, Info Skill, Gold, and notification session-listener transport unchanged.
 
-# Changelog
 
 ## 2026-09-07 — A4.6 Notification A1 — OpenClaw Session Listener
 

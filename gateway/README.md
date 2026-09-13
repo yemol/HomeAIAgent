@@ -1,5 +1,23 @@
 # HomeAIAgent Gateway
 
+## A1R22 multi-device conversation/audio router
+
+Gateway now resolves OpenClaw voice identity per companion `device_id`.
+
+- legacy/current StickS3 (missing `device_id`) -> `OPENCLAW_USER`
+- `homeai-mini-bedroom-01` -> `home-ai-agent-mini:main`
+- unknown future companion ids -> isolated per-device user by default
+- speaker-role clients own no LLM session and bind to one `parent_device_id`
+
+This keeps HomeAIAgent and HomeAIAgent Mini conversation histories separate.
+The primary OpenClaw notification listener remains pinned to the primary
+`OPENCLAW_USER`, so Mini turns cannot become primary-device notifications.
+
+NetworkSpeaker routing is parent-based. Multiple speaker clients may coexist
+without cross-routing. The planned Mini charging dock should advertise
+`parent_device_id=homeai-mini-bedroom-01`.
+
+
 The Gateway is the local service layer between StickS3 and OpenClaw.
 
 ## Responsibilities
