@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIBROOT="$ROOT/.pio-local/framework-arduinoespressif32/libraries"
 
-echo "=== HomeAIAgent A4.4.7 explicit Arduino library check ==="
+echo "=== HomeAIAgent explicit Arduino library check ==="
 
 checks=(
   "Network/library.properties"

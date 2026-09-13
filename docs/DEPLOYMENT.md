@@ -1,28 +1,46 @@
 # Deployment
 
-This document describes the A4.5 Cyber Expression A3R4 PCM-Synced Voice Wave evaluation deployment path.
+## 1. StickS3 固件
 
-## 1. StickS3 firmware
-
-### Production PlatformIO environment
+生产 PlatformIO 环境：
 
 ```text
 m5stack-sticks3-wake
 ```
 
-The production build uses project-local Arduino/ESP-SR dependencies under `.pio-local/`. Those machine-local packages are deliberately not committed.
+工程依赖 `.pio-local/` 中已经准备好的 Arduino 3.3.7 / ESP-SR 本地依赖。源码包不包含 `.pio-local/`。
 
-Useful preparation/diagnostic helpers are available under `tools/` and `scripts/`.
+### 构建和刷写
 
-### Device configuration
+```bash
+pio run -e m5stack-sticks3-wake -t clean
+pio run -e m5stack-sticks3-wake -t upload
+pio device monitor
+```
 
-Real Wi-Fi and Gateway settings are stored in StickS3 NVS. `include/secrets.h` is optional and ignored by git. If no NVS configuration exists, configure the terminal with:
+不要 Erase Flash。
+
+当前启动 banner：
+
+```text
+=== HomeAIAgent A1R24 / Wake=你好逐光 ===
+```
+
+唤醒初始化成功应看到：
+
+```text
+[WAKE] local keyword engine ready: 你好逐光
+```
+
+### NVS 配置
+
+Wi-Fi 和 Gateway 地址优先从 StickS3 NVS 读取。需要配置时可使用：
 
 ```bash
 python tools/configure_terminal.py
 ```
 
-or use the serial commands:
+或串口命令：
 
 ```text
 CFG SHOW
@@ -30,97 +48,94 @@ CFG {json}
 CFG RESET
 ```
 
-### Build / upload / monitor
+`include/secrets.h` 仅用于本地可选 fallback，不进入提交包。
 
-Use PlatformIO:
-
-1. Clean
-2. Upload
-3. Monitor
-
-Expected boot banner:
-
-```text
-=== HomeAIAgent A4.5 Cyber Expression A3R4 PCM-Synced Voice Wave / base A4.4.18 RC1R9 ===
-```
-
-Expected renderer line:
-
-```text
-[UI] Cyber canvas ready: 135x240 RGB565, 64800 bytes
-```
-
-`srmodels.bin` and `esp_sr_8.csv` are part of the production wake-word/ESP-SR flash flow and are included in the repository.
-
-## 2. Gateway setup
-
-Enter the Gateway directory:
+## 2. Gateway 首次准备
 
 ```bash
-cd gateway
+cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway
 ./setup_mac.sh
 ```
 
-The setup script creates/retains persistent configuration at:
+持久配置：
 
 ```text
 ~/.config/HomeAIAgent/gateway.env
 ```
 
-It also prepares the persistent Python runtime used by the Gateway.
+持久 runtime：
 
-### Daily start
+```text
+~/.local/share/HomeAIAgent/
+```
 
-A1R11 no longer requires a separate Air tunnel terminal. The HomeAIAgent Python service owns the SSH/Tailscale forward internally. Start only:
+### 日常启动
 
 ```bash
-cd gateway
+cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway
 ./run_full.sh
 ```
 
-On first A1R11 start, the persistent Python runtime installs the pinned AsyncSSH dependency. The service then establishes the managed OpenClaw transport, runs its startup preflight, and opens the StickS3 WebSocket server. If the SSH path drops later, the server stays alive and retries the transport automatically.
+不要同时运行旧的手工 OpenClaw tunnel。
 
-## 3. Expected live behavior
-
-A normal hands-free turn is:
+正常 transport 日志应包含：
 
 ```text
-local wake -> Listening -> capture -> Thinking -> ASR/OpenClaw/TTS -> Speaking -> Idle
+[OPENCLAW-SSH] SSH connected
+[OPENCLAW-SSH] tunnel ready 127.0.0.1:18790 -> 127.0.0.1:18789
+[OPENCLAW-TRANSPORT] ready before startup preflight
 ```
 
-Button A uses the same downstream path but reports `trigger=button_a` rather than `wake_word`.
+## 3. 正常语音行为
 
-### Capture timing
+```text
+你好逐光
+  -> 本地“在的”
+  -> command capture
+  -> Thinking
+  -> ASR / OpenClaw / TTS
+  -> Speaking
+  -> Idle
+```
 
-- wait for speech after acknowledgement: 5.0 s
-- continuous silence to finish: 3 s
-- maximum utterance: 20 s
-- pre-roll: 300 ms
-- device capture buffer: 21 s
+固定采集参数：
 
-### TTS
+- Wake listen PGA：9 dB
+- Command capture PGA：6 dB
+- Wake 后等待说话：5 秒
+- 连续静音结束：3 秒
+- 最大 utterance：20 秒
+- PSRAM capture buffer：21 秒
 
-Long TTS is divided into device-safe segments. StickS3 keeps two playback slots so the next segment can be queued before the current segment ends. Final `playback.done` is sent only after the final segment has completed.
+## 4. Info / Glass2
 
-## 4. Information feed
+Gateway 启动时只加载 last-good cache，不主动触发 Info refresh。
 
-The Gateway maintains separate game/finance last-good state and sends up to 20 pre-rendered Glass2 frames to the terminal.
-
-Scheduled refresh hours are:
+固定刷新时段（Asia/Taipei）：
 
 ```text
 01:00, 09:00, 11:00, 13:00, 15:00, 17:00, 19:00, 21:00, 23:00
 ```
 
-The Gateway also saves bounded diagnostic refresh snapshots under its HomeAIAgent data directory.
+Glass2 每条信息默认停留 15 秒。
 
-## 5. Night display policy
+## 5. 夜间显示
 
-The Gateway is the wall-clock authority:
+Gateway 负责时间策略：
 
-- sleep window begins: 01:05
-- normal wake: 09:00
-- manual button activity can temporarily wake the displays
-- device reports `display.ack` only when the requested state is actually applied or pending
+- 01:05：进入 display sleep
+- 09:00：恢复正常显示
+- 手动按键可临时唤醒显示
+- 音频、Wi-Fi、Gateway 连接保持工作
 
-Audio, Wi-Fi and Gateway connectivity remain active while displays sleep.
+## 6. Direct Overwrite 规则
+
+覆盖源码时保留：
+
+```text
+.pio-local/
+~/.config/HomeAIAgent/gateway.env
+~/.local/share/HomeAIAgent/
+```
+
+不要把 Gateway runtime capture、token、API key 或 `.DS_Store/__MACOSX` 带进提交包。

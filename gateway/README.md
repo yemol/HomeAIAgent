@@ -1,104 +1,80 @@
 # HomeAIAgent Gateway
 
-## A1R22 multi-device conversation/audio router
-
-Gateway now resolves OpenClaw voice identity per companion `device_id`.
-
-- legacy/current StickS3 (missing `device_id`) -> `OPENCLAW_USER`
-- `homeai-mini-bedroom-01` -> `home-ai-agent-mini:main`
-- unknown future companion ids -> isolated per-device user by default
-- speaker-role clients own no LLM session and bind to one `parent_device_id`
-
-This keeps HomeAIAgent and HomeAIAgent Mini conversation histories separate.
-The primary OpenClaw notification listener remains pinned to the primary
-`OPENCLAW_USER`, so Mini turns cannot become primary-device notifications.
-
-NetworkSpeaker routing is parent-based. Multiple speaker clients may coexist
-without cross-routing. The planned Mini charging dock should advertise
-`parent_device_id=homeai-mini-bedroom-01`.
-
-
-The Gateway is the local service layer between StickS3 and OpenClaw.
+Gateway 是 StickS3 / HomeAIAgent Mini / NetworkSpeaker 与 OpenClaw 之间的本地服务层。
 
 ## Responsibilities
 
-- persistent StickS3 WebSocket connection
-- Volcengine ASR/TTS by default
-- OpenClaw conversational requests
-- segmented/gapless TTS delivery
-- game/finance Info Skill refresh
-- Glass2 frame rendering and sync
-- OpenClaw transient Info-session cleanup
-- night display scheduling and acknowledgement
-- diagnostic runtime captures
+- 设备 WebSocket
+- 火山 ASR/TTS
+- OpenClaw 对话调用
+- 内嵌 SSH/Tailscale transport
+- 多设备 voice session 路由
+- NetworkSpeaker parent binding、音频 sink 路由和音量控制
+- Gapless TTS 分段传输
+- Notification listener + Voice Turn Fence
+- Info Skill / Gold
+- Glass2 预渲染与同步
+- 夜间 display policy / ACK
 
-## Persistent configuration
+## Persistent paths
 
-Canonical configuration:
+配置：
 
 ```text
 ~/.config/HomeAIAgent/gateway.env
 ```
 
-Initial setup:
+运行状态：
+
+```text
+~/.local/share/HomeAIAgent/
+```
+
+工程整体替换不会删除这两处数据。
+
+## First setup
 
 ```bash
 ./setup_mac.sh
 ```
 
-The script preserves existing credentials and prepares the persistent Python runtime.
-
-## Daily startup
-
-A1R11 requires only one service command on the Mac mini:
+## Daily start
 
 ```bash
 ./run_full.sh
 ```
 
-The Python process owns the SSH transport, startup preflight, retries, device WebSocket, speech, notifications, Info and Gold. Do not start `openclaw_air_tunnel.sh` during normal operation.
+只启动这一项。`companion_gateway.py` 自己负责 OpenClaw transport、preflight、retry、device server、speech、notification 和 Info。
+
+不要同时启动旧的手工 `openclaw_air_tunnel.sh`。
+
+## Device/session routing
+
+- 主 StickS3：`OPENCLAW_USER`
+- HomeAIAgent Mini：独立 voice user
+- 未知 companion：按 `device_id` 自动隔离
+- `device_role=speaker`：不拥有 LLM session，只通过 `parent_device_id` 绑定 companion
+
+同一 parent 有多个 speaker 时，优先 `audio_priority` 较高者；同优先级使用更新连接。
+
+## Audio routing
+
+Gateway 可以在本机 speaker 与绑定 NetworkSpeaker 之间路由 TTS。相对音量命令使用固定 10% step，NetworkSpeaker 负责 ACK 当前音量。
 
 ## Voice flow
 
 ```text
-StickS3 PCM16/16k
-  -> ASR
-  -> OpenClaw
-  -> TTS
-  -> device-safe PCM segments
-  -> StickS3 two-slot playback queue
+PCM16/16k
+ -> ASR
+ -> OpenClaw
+ -> TTS
+ -> segmented PCM16
+ -> selected audio sink
+ -> playback.done
 ```
 
-The Gateway waits for `playback.slot_ready` to keep the next segment queued before the current segment ends. The final turn completes on `playback.done`.
+## Runtime diagnostics
 
-## Info Skill
+运行时可能生成 `latest_*` 音频/文本捕获，用于排查 ASR/TTS，但这些文件不属于源码提交包。
 
-Game and finance are independent refresh categories with independent last-good fallback. Background OpenClaw requests:
-
-- omit the normal conversational `user` field;
-- use one unique `x-openclaw-session-key` per request;
-- delete that exact transient session through OpenClaw Gateway WebSocket RPC after the request;
-- never use the voice conversation session for background Info refreshes.
-
-Diagnostic Info refresh snapshots are stored under the HomeAIAgent data directory and are bounded by the configured retention count.
-
-## Generated debug captures
-
-The live Gateway may generate:
-
-```text
-latest_input.wav
-latest_input_normal.wav
-latest_transcript.txt
-latest_answer.txt
-latest_tts.wav
-```
-
-These files are runtime diagnostics and are intentionally ignored by git. They are useful when isolating ASR, agent or TTS problems.
-
-## Configuration templates
-
-- `.env.example`: local example/migration source
-- `gateway.env.example`: persistent configuration template
-
-Do not commit real tokens or API keys.
+真实 token / API key 不得放入工程目录。

@@ -25,7 +25,7 @@ required = {
 missing = [f"{name}: {path}" for name, path in required.items() if not path.is_dir()]
 if missing:
     raise RuntimeError(
-        "A4.4.8 local Arduino library path missing:\n  "
+        "local Arduino library path missing:\n  "
         + "\n  ".join(missing)
     )
 

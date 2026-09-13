@@ -1,85 +1,78 @@
-# HomeAIAgent Notification A1 — OpenClaw voice-session listener
+# OpenClaw Notification Listener
 
-## Goal
+## 目标
 
-Deliver OpenClaw reminders/background assistant outputs to the HomeAIAgent device without a reverse SSH tunnel, webhook port, or second inbound network service.
+把 OpenClaw reminder / background assistant output 送到 HomeAIAgent，同时不增加 webhook、反向 SSH 或额外入站端口。
 
 ## Transport
 
-HomeAIAgent reaches OpenClaw through the A1R11 managed outbound transport:
+Gateway 通过自身管理的本地 OpenClaw endpoint：
 
-`Mac mini 127.0.0.1:18790 -> SSH/Tailscale -> OpenClaw 127.0.0.1:18789`
+```text
+Mac mini 127.0.0.1:18790
+  -> SSH/Tailscale
+  -> OpenClaw 127.0.0.1:18789
+```
 
-Notification A1 opens a second outbound WebSocket through that same local endpoint. It never asks OpenClaw to connect back to the Mac mini.
+Notification listener 复用这条 outbound transport。
 
-## Voice session key
+## 主 voice session
 
-HomeAIAgent voice requests continue to use the existing OpenAI-compatible request body:
+默认 voice user：
 
-`user=home-ai-agent:main`
+```text
+home-ai-agent:main
+```
 
-OpenClaw's current OpenAI-compatible resolver maps a stable user to:
+默认 OpenClaw session key：
 
-`agent:<agentId>:openai-user:<user>`
+```text
+agent:main:openai-user:home-ai-agent:main
+```
 
-The default HomeAIAgent key is therefore:
-
-`agent:main:openai-user:home-ai-agent:main`
-
-No voice-session migration is performed.
+Notification listener 只跟踪主 HomeAIAgent 会话，不把 HomeAIAgent Mini 的对话当成主设备通知。
 
 ## Listener lifecycle
 
-1. Connect to the OpenClaw Gateway WebSocket with `operator.read`.
-2. Subscribe with `sessions.messages.subscribe` for the exact voice session.
-3. Use `session.message` / `sessions.changed` only as invalidation signals.
-4. Re-read bounded authoritative `chat.history` after an invalidation.
-5. Persist transcript identities in `~/.local/share/HomeAIAgent/openclaw_voice_listener_state.json`.
-6. On first deployment, baseline the existing transcript and do not replay old assistant messages.
-7. On reconnect, reconcile history so events missed during a network outage are recovered.
-8. New asynchronous assistant messages enter the durable local notification queue.
-9. Existing HomeAIAgent TTS + device playback sends the notification when StickS3 is available.
+1. 连接 OpenClaw Gateway WebSocket。
+2. 订阅主 voice session。
+3. `session.message` / `sessions.changed` 仅作为 invalidation signal。
+4. 重新读取有界 `chat.history` 作为权威数据源。
+5. 第一次部署先建立 baseline，不播报历史消息。
+6. 重连后做 history reconciliation，补回断线期间真正遗漏的 async message。
+7. 新 async assistant message 进入 durable notification queue。
+8. 设备空闲且音频 sink 可用时再通过现有 TTS/playback 链路投递。
 
-## Duplicate protection
+## Voice Turn Fence
 
-Normal voice replies are already returned synchronously by `/v1/chat/completions`. The listener therefore gates reconciliation while a voice OpenClaw request is in flight and registers the exact synchronous assistant reply as a short-lived suppression fingerprint. When the same transcript row later appears in `chat.history`, it is marked seen and is not spoken twice.
+同步语音请求执行期间，OpenClaw 可能先写入多条 assistant progress row，再写最终回复。
 
-Each asynchronous transcript message also has a durable identity key based on OpenClaw transcript metadata plus text digest. The queue and delivered history provide a second deduplication layer.
+Gateway 会在当前 user row 与最终同步 assistant row 之间建立 fence：
 
-## Offline behavior
+- progress row 标记为 consumed，不进入 notification queue；
+- 最终同步回复也不会被 listener 再播一次；
+- user row 之前或该轮结束之后真正异步产生的 assistant message 仍可正常投递；
+- 如果最终行尚未写入 history，listener 会等待，不提前把 progress 当通知。
 
-If StickS3 is offline or busy, the notification remains in:
+## Durable state
 
-`~/.local/share/HomeAIAgent/notification_queue.json`
+```text
+~/.local/share/HomeAIAgent/openclaw_voice_listener_state.json
+~/.local/share/HomeAIAgent/notification_queue.json
+```
 
-The listener state and queue are outside the project tree, so direct-overwrite project updates do not erase them.
+这些文件位于工程目录之外，Direct Overwrite 不会删除。
 
-## Frozen areas
+## 验证
 
-This change is Gateway-only. It does not modify:
-
-- `src/main.cpp`
-- `platformio.ini`
-- StickS3 wake-word path
-- 24 FPS expression rendering
-- Glass2 fonts/layout
-- Gapless TTS device pipeline
-- Info Skill schedule/session cleanup
-- Gold refresh
-- night display policy
-
-## Validation
-
-With the A1R11 HomeAIAgent service running:
+只读 listener 检查：
 
 ```bash
 cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway
 ./check_notification_listener.sh
 ```
 
-This is read-only: it subscribes to the exact voice session and reads a bounded `chat.history` sample without modifying the transcript.
-
-Offline reconciliation regression:
+离线 reconciliation regression：
 
 ```bash
 python test_notification_listener_offline.py

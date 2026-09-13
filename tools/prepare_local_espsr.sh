@@ -10,7 +10,7 @@ ZIP_FILE="$SRC_DIR/ESP-SR-For-M5Unified-95903511.zip"
 ZIP_FALLBACK="$SRC_DIR/ESP-SR-For-M5Unified.zip"
 DIR_FALLBACK="$SRC_DIR/ESP-SR-For-M5Unified"
 
-echo "=== HomeAIAgent A4.4.4 local ESP-SR bootstrap ==="
+echo "=== HomeAIAgent local ESP-SR bootstrap ==="
 echo "Project: $PROJECT_ROOT"
 echo "Source : $SRC_DIR"
 echo

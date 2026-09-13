@@ -8,7 +8,7 @@ LOCAL_DIR="$PROJECT_ROOT/.pio-local"
 CORE_ARCHIVE="$SRC_DIR/esp32-core-3.3.7.tar.xz"
 LIBS_ARCHIVE="$SRC_DIR/esp32-core-3.3.7-libs.tar.xz"
 
-echo "=== HomeAIAgent A4.4.3 local Arduino 3.3.7 bootstrap ==="
+echo "=== HomeAIAgent local Arduino 3.3.7 bootstrap ==="
 echo "Project: $PROJECT_ROOT"
 echo "Source : $SRC_DIR"
 echo

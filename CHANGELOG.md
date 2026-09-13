@@ -1,4 +1,67 @@
+# A1R25B1.1 Glass2 Half Brightness
+
+- Glass2 active brightness changed from 255 to 128 (about 50%).
+- Screen off remains 0.
+- No Gateway/OpenClaw/NetworkSpeaker changes.
+- Wake PGA remains 6 dB.
+
+# A1R25B1 - Glass2 Local Voice Control (2026-09-13)
+
+- Added local voice commands `关闭屏幕` and `打开屏幕` for Glass2 only.
+- Added Gateway-local intent handling, so recognized screen commands do not enter OpenClaw.
+- Added ACK-confirmed `glass2.sleep` / `glass2.wake` device protocol.
+- Added independent Glass2 manual visibility override; StickS3 display behavior is unchanged.
+- Manual Glass2 on/off overrides automatic night blanking for Glass2 until the opposite command or device reboot.
+- Preserved A1R25B0 wake experiment unchanged: `你好逐光`, MultiNet acceptance, wake PGA 6 dB.
+
+# A1R25B0 - Wake Front-End A/B (2026-09-13)
+
+- Keep wake phrase `你好逐光 / ni hao zhu guang`.
+- Change wake-listening analog PGA from 9 dB to 6 dB to test whether clipping is reducing MultiNet recall.
+- Keep command-capture PGA at 6 dB.
+- Keep MultiNet default threshold and wake acceptance behavior unchanged.
+- Reset Wake Observatory segment/ring state whenever wake listening is paused/restarted, preventing stale multi-turn speech segments such as the observed 16-second diagnostic burst.
+- Keep A-button manual PTT, local `在的`, Gateway, OpenClaw, TTS, Glass2, NetworkSpeaker and Wi-Fi behavior unchanged.
+- Gateway source remains unchanged.
+
+# A1R25A.1 - Wake Evidence Refinement (2026-09-13)
+
+- Keep wake phrase `你好逐光 / ni hao zhu guang`.
+- Keep MultiNet threshold, wake PGA 9 dB, capture PGA 6 dB and wake acceptance behavior unchanged.
+- Fix observatory log newlines so each record is parseable on its own line.
+- Add `[WAKE-EVENT] id=...` and carry the same ID into `[WAKE-OBS]` and `[WAKE-HIT]`.
+- Replace whole-window candidate statistics with current/recent speech-segment statistics.
+- Merge short pauses up to 240 ms inside one observed speech segment.
+- Preserve A-button manual PTT behavior and add `[WAKE-MISS-SUSPECT]` diagnostics when manual PTT follows recent unmatched speech.
+- Gateway source remains unchanged.
+
+# A1R25A - Wake Observatory (2026-09-13)
+
+- Keep wake phrase `你好逐光 / ni hao zhu guang`.
+- Keep current MultiNet default threshold and wake acceptance behavior unchanged.
+- Add two-second compact acoustic observation ring for wake diagnostics.
+- Add `[WAKE-OBS]` accepted-hit summaries: noise floor, threshold, level/RMS/peak, active ratio, speech-run timing and clipping.
+- Add `[WAKE-OBS-SPEECH]` speech-burst logs so failed wake attempts can be observed without changing recognition.
+- Add optional `.pio-local` MultiNet probability logging `[WAKE-MN]`; if the local wrapper anchor differs, build continues with app-level observability instead of failing.
+
 # Changelog
+
+## 2026-09-13 — A1R24 Clean Source Package
+
+- Cleaned duplicated/outdated README and deployment notes around the current A1R24 baseline.
+- Removed project-local Gateway runtime captures and Mac archive metadata from the source package.
+- Added a current `.gitignore` and strengthened `tools/clean_submission_artifacts.sh`.
+- Simplified version-history comments in active source without changing runtime logic.
+- Updated the firmware boot banner to `HomeAIAgent A1R24 / Wake=你好逐光`.
+- Frozen wake ACK WAV/PCM, `srmodels.bin`, partition table and runtime behavior remain unchanged.
+
+## 2026-09-13 — A1R24 Wake Phrase Test: 你好逐光
+
+- Changed the local Chinese MultiNet command phrase from `逐光逐光` to `你好逐光`.
+- Pinyin command changed from `zhu guang zhu guang` to `ni hao zhu guang`.
+- This project uses command-only Chinese MultiNet (`mn5q8_cn`) with runtime `sr_cmd_t` commands, so no new WakeNet model is required for this phrase change.
+- Kept the existing MultiNet model, default threshold, wake-listen PGA 9 dB, command-capture PGA 6 dB, local `在的` acknowledgement, PTT/VAD, Gateway, TTS, Glass2, Info and all other behavior unchanged.
+- This is an A/B test build intended to measure missed wakes and false wakes before any threshold or confirmation logic is changed.
 
 ## 2026-09-12 — A1R23 Capability Guard / Display ACK noise fix
 

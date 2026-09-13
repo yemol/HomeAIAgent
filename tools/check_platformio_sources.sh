@@ -2,7 +2,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-echo "=== HomeAIAgent A4.4.2 PlatformIO source check ==="
+echo "=== HomeAIAgent PlatformIO source check ==="
 echo
 grep -E '^default_envs' platformio.ini || true
 echo

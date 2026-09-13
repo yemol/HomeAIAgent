@@ -34,7 +34,7 @@ homeai_source_config() {
 }
 
 homeai_apply_a46_voice_migration() {
-  # A1R7: standard-voice convergence guard.
+  # Standard-voice convergence guard.
   # Do not rely on a one-time marker: every Gateway start verifies the persisted
   # values and rewrites only the TTS resource/voice fields when they drift.
   local desired_voice="zh_female_vv_uranus_bigtts"

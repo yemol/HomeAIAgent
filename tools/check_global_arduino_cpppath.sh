@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIBROOT="$ROOT/.pio-local/framework-arduinoespressif32/libraries"
 
-echo "=== HomeAIAgent A4.4.8 global Arduino CPPPATH check ==="
+echo "=== HomeAIAgent global Arduino CPPPATH check ==="
 
 checks=(
   "Network/src/Network.h"

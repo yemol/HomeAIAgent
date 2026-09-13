@@ -22,7 +22,7 @@
 
   // Local custom trigger phrase via Chinese MultiNet.
   static const sr_cmd_t HOMEAI_WAKE_COMMANDS[] = {
-      {0, "逐光逐光", "zhu guang zhu guang"},
+      {0, "你好逐光", "ni hao zhu guang"},
   };
   static constexpr size_t HOMEAI_WAKE_COMMAND_COUNT =
       sizeof(HOMEAI_WAKE_COMMANDS) / sizeof(HOMEAI_WAKE_COMMANDS[0]);
@@ -33,9 +33,7 @@
   #include <WebSocketsClient.h>
   #include <ArduinoJson.h>
 
-  // Submission-safe configuration: prefer a local, gitignored secrets.h when
-  // present. Clean/source-control builds fall back to placeholder defaults;
-  // provisioned devices load the real Wi-Fi/Gateway values from NVS.
+  // Local secrets are optional; provisioned devices use persistent NVS.
   #if __has_include("secrets.h")
     #include "secrets.h"
   #else
@@ -376,9 +374,7 @@ static float ttsPcmVisualLevelAt(uint32_t now) {
 }
 
 #if HOMEAI_WAKEWORD_ENABLE
-// Local wake-word path.
-// Local command-only MultiNet wake phrase: "逐光逐光".
-// Wake listening stays entirely local.
+// Local command-only Chinese MultiNet wake path. Listening stays on-device.
 static volatile bool wakeWordDetected = false;
 static bool wakeEngineReady = false;
 static bool wakeListening = false;
@@ -400,6 +396,49 @@ static bool wakeFeedReady = false;
 static uint32_t wakeFeedReadyStartedMs = 0;
 static uint32_t wakeLastFeedLevel = 0;
 static uint32_t wakeLastHealthLogMs = 0;
+
+// A1R25B0 Wake Front-End A/B keeps the existing MultiNet acceptance behavior.
+// The only recognition-path change is wake analog PGA 9 -> 6 dB to reduce
+// clipping observed during repeated "你好逐光" trials. Observatory metrics stay
+// enabled so recall and waveform headroom can be compared against A1R25A.1.
+static constexpr uint32_t WAKE_OBS_WINDOW_MS = 2000;
+static constexpr uint32_t WAKE_OBS_BLOCK_MS =
+    (AUDIO_MIC_BLOCK_SAMPLES * 1000u) / AUDIO_MIC_SAMPLE_RATE;
+static constexpr size_t WAKE_OBS_BLOCK_COUNT =
+    (WAKE_OBS_WINDOW_MS + WAKE_OBS_BLOCK_MS - 1u) / WAKE_OBS_BLOCK_MS;
+
+struct WakeObserveBlock {
+  uint32_t level = 0;
+  uint32_t rms = 0;
+  uint32_t threshold = 0;
+  uint16_t peak = 0;
+  uint16_t clipped = 0;
+  bool active = false;
+};
+
+static WakeObserveBlock wakeObserveRing[WAKE_OBS_BLOCK_COUNT];
+static uint32_t wakeObserveWriteCount = 0;
+static volatile int wakeObservedCommandId = -1;
+static volatile int wakeObservedPhraseId = -1;
+static volatile uint32_t wakeObservedEventMs = 0;
+static volatile uint32_t wakeObservedEventId = 0;
+static uint32_t wakeObserveEventCounter = 0;
+
+static bool wakeObsSpeechBurstActive = false;
+static uint32_t wakeObsSpeechBurstStartedMs = 0;
+static uint32_t wakeObsSpeechBurstLastActiveMs = 0;
+static uint32_t wakeObsSpeechBurstMaxLevel = 0;
+static uint16_t wakeObsSpeechBurstPeak = 0;
+static bool wakeObsSpeechBurstSawWake = false;
+
+static uint32_t wakeObsLastSpeechEndedMs = 0;
+static uint32_t wakeObsLastSpeechDurationMs = 0;
+static uint32_t wakeObsLastSpeechMaxLevel = 0;
+static uint16_t wakeObsLastSpeechPeak = 0;
+static bool wakeObsLastSpeechSawWake = false;
+static constexpr uint32_t WAKE_OBS_SEGMENT_GAP_MS = 240;
+static constexpr uint32_t WAKE_OBS_EVENT_LOOKBACK_MS = 420;
+static constexpr uint32_t WAKE_OBS_MISS_MARK_WINDOW_MS = 5000;
 static constexpr uint32_t WAKE_FEED_STALL_MS = 1200;
 static constexpr uint32_t WAKE_RECOVERY_COOLDOWN_MS = 2500;
 static constexpr uint32_t WAKE_HEALTH_LOG_MS = 30000;
@@ -634,6 +673,13 @@ bool infoPaused = false;
 bool nightScreenWindowActive = false;
 bool displaysSleeping = false;
 uint32_t manualWakeUntilMs = 0;
+
+enum class Glass2ManualMode : uint8_t {
+  Auto = 0,
+  ForceOff = 1,
+  ForceOn = 2,
+};
+Glass2ManualMode glass2ManualMode = Glass2ManualMode::Auto;
 static constexpr uint32_t NIGHT_MANUAL_WAKE_MS = 120000;
 
 // Display execution handshake.
@@ -645,7 +691,7 @@ bool displayPolicyTargetSleep = false;
 
 static void sendDisplayPolicyAck(const char* status);
 static constexpr uint8_t STICKS3_ACTIVE_BRIGHTNESS = 140;
-static constexpr uint8_t GLASS2_ACTIVE_BRIGHTNESS = 255;
+static constexpr uint8_t GLASS2_ACTIVE_BRIGHTNESS = 96;
 
 bool lastBtnA = false;
 bool lastBtnB = false;
@@ -959,9 +1005,7 @@ static void cyberDrawWake(M5Canvas& d, int cx, int cy, uint32_t elapsedMs) {
   const uint16_t mid = rgb565(41, 154, 232);
   const uint16_t dim = rgb565(5, 50, 95);
 
-  // End the wake animation on the same basic pose used by Listening.  The A3
-  // wake used to finish wider/brighter than Listening, which created a small
-  // but visible snap on the first normal Listening frame.
+  // End the wake animation on the Listening pose to avoid a visible snap.
   const int visorHalf = 20 + static_cast<int>(21.0f * visorT);
   const float ignitionPulse = 0.18f + coreT * 0.66f;
   const float corePulse = ignitionPulse + (0.50f - ignitionPulse) * settleT;
@@ -1052,8 +1096,6 @@ static void cyberDrawStateMorph(M5Canvas& d, int cx, int cy,
                 cyberLerp565(rgb565(82, 199, 244), accent, 0.30f));
 
   // Moving bridge arcs preserve rotational momentum through the handoff.
-  // They are intentionally time-driven rather than fixed "re-lock" brackets,
-  // which removes the tiny visual pause that remained in A3R1-A3R4.
   const float bridge = 1.0f - fabsf(0.5f - t) * 2.0f;
   if (bridge > 0.05f) {
     const float phase = fmodf(now * 0.090f, 360.0f);
@@ -1063,9 +1105,7 @@ static void cyberDrawStateMorph(M5Canvas& d, int cx, int cy,
     cyberDrawRotArc(d, cx, cy, 43, 2, phase + 180.0f, sweep, bridgeColor);
   }
 
-  // Preserve outgoing motion during the first half, and begin the incoming
-  // state's signature motion almost immediately.  This is the key difference
-  // from A3R1-A3R4: the morph no longer suppresses state motion for ~300 ms.
+  // Blend outgoing and incoming motion during the same transition window.
   const float outPresence = 1.0f - t;
   const float inPresence = t;
 
@@ -1301,9 +1341,7 @@ static void cyberDrawError(M5Canvas& d, int cx, int cy, uint32_t now) {
 static uint32_t cyberFrameIntervalMs(uint32_t now) {
   const uint32_t elapsed = now - stateSinceMs;
 
-  // State changes use a short high-cadence bridge.  The canvas remains
-  // double-buffered, so the extra frames improve motion continuity without
-  // reintroducing the old clear/redraw flicker.
+  // State changes use a short high-cadence bridge while remaining double-buffered.
   const bool wakeIntro = companionState == CompanionState::Listening &&
                          cyberPreviousState == CompanionState::Idle &&
                          elapsed < 560U;
@@ -1321,9 +1359,7 @@ static uint32_t cyberFrameIntervalMs(uint32_t now) {
     }
   }
 
-  // Steady-state caps.  Speaking is raised from 20 FPS to ~24 FPS for a smoother
-  // PCM-synced waveform while still keeping a bounded display load
-  // on the gapless TTS path.
+  // Steady-state frame caps keep UI load bounded around the audio path.
   switch (companionState) {
     case CompanionState::Listening: return 160;  // ~6 FPS during Mic capture
     case CompanionState::Speaking:  return 42;   // ~24 FPS during gapless TTS
@@ -1671,6 +1707,12 @@ static void makeTwoLineHeadline(const char* raw, String& line1, String& line2) {
 // before drawGlassFrame() is defined later in this translation unit.
 static void drawGlassFrame();
 
+static bool glass2VisibleWanted() {
+  if (glass2ManualMode == Glass2ManualMode::ForceOff) return false;
+  if (glass2ManualMode == Glass2ManualMode::ForceOn) return true;
+  return !displaysSleeping;
+}
+
 static int hexNibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -1808,7 +1850,7 @@ static bool commitInfoSync() {
 }
 
 static void drawGlassFrame() {
-  if (displaysSleeping || !glass2Ready || glassUiFrozen || infoItemCount == 0) return;
+  if (!glass2VisibleWanted() || !glass2Ready || glassUiFrozen || infoItemCount == 0) return;
   if (currentItem >= infoItemCount) currentItem = 0;
 
   const InfoItem& item = infoItems[currentItem];
@@ -1858,9 +1900,14 @@ static bool initGlass2AfterPowerOn() {
 
   if (glass2Ready) {
     glass2.setRotation(1);
-    glass2.setBrightness(GLASS2_ACTIVE_BRIGHTNESS);
     itemShownSinceMs = millis();
-    drawGlassFrame();
+    if (glass2VisibleWanted()) {
+      glass2.setBrightness(GLASS2_ACTIVE_BRIGHTNESS);
+      drawGlassFrame();
+    } else {
+      glass2.fillScreen(TFT_BLACK);
+      glass2.setBrightness(0);
+    }
     Serial.println("[GLASS-DIAG] Glass2 reinitialized");
     return true;
   }
@@ -1882,10 +1929,11 @@ static void enterNightScreenSleep() {
   if (!nightScreenWindowActive) return;
   if (nightConversationBusy()) return;
 
-  // Keep Glass2 powered so no shared-rail power cycling is needed. OLED pixels
-  // are black and brightness is zero, which removes burn-in load while keeping
-  // the controller/Gateway path alive.
-  if (glass2Ready && !glassUiFrozen && !glassPowerCutForVoice) {
+  // Keep Glass2 powered so no shared-rail power cycling is needed. An explicit
+  // Glass2 ForceOn voice command overrides the automatic night blanking for
+  // Glass2 only; the StickS3 display still follows the night policy.
+  if (glass2Ready && !glassUiFrozen && !glassPowerCutForVoice &&
+      glass2ManualMode != Glass2ManualMode::ForceOn) {
     glass2.fillScreen(TFT_BLACK);
     glass2.setBrightness(0);
   }
@@ -1912,8 +1960,13 @@ static void wakeDisplays(bool manualWake) {
   drawMascotFace(companionState, idleBlink);
 
   if (glass2Ready && !glassUiFrozen && !glassPowerCutForVoice) {
-    glass2.setBrightness(GLASS2_ACTIVE_BRIGHTNESS);
-    drawGlassFrame();
+    if (glass2VisibleWanted()) {
+      glass2.setBrightness(GLASS2_ACTIVE_BRIGHTNESS);
+      drawGlassFrame();
+    } else {
+      glass2.fillScreen(TFT_BLACK);
+      glass2.setBrightness(0);
+    }
   }
 
   itemShownSinceMs = millis();
@@ -2044,7 +2097,7 @@ static void moveToItem(int delta) {
 }
 
 static void updateInfoCycle() {
-  if (displaysSleeping || !glass2Ready || infoPaused) return;
+  if (!glass2VisibleWanted() || !glass2Ready || infoPaused) return;
   const uint32_t now = millis();
   if (now - itemShownSinceMs >= INFO_HOLD_MS) {
     moveToItem(+1);
@@ -2139,6 +2192,55 @@ static void sendDisplayPolicyAck(const char* status) {
       displayPolicyCommandId.c_str());
 }
 
+static void setGlass2ManualMode(Glass2ManualMode mode) {
+  glass2ManualMode = mode;
+
+  if (!glass2Ready || glassUiFrozen || glassPowerCutForVoice) {
+    Serial.printf("[GLASS2-CONTROL] deferred mode=%u ready=%u frozen=%u powerCut=%u\n",
+                  static_cast<unsigned>(mode),
+                  glass2Ready ? 1u : 0u,
+                  glassUiFrozen ? 1u : 0u,
+                  glassPowerCutForVoice ? 1u : 0u);
+    return;
+  }
+
+  if (glass2VisibleWanted()) {
+    glass2.setBrightness(GLASS2_ACTIVE_BRIGHTNESS);
+    itemShownSinceMs = millis();
+    drawGlassFrame();
+  } else {
+    glass2.fillScreen(TFT_BLACK);
+    glass2.setBrightness(0);
+  }
+
+  Serial.printf("[GLASS2-CONTROL] mode=%u visible=%u nightSleeping=%u\n",
+                static_cast<unsigned>(mode),
+                glass2VisibleWanted() ? 1u : 0u,
+                displaysSleeping ? 1u : 0u);
+}
+
+static void sendGlass2ControlAck(const char* commandId, const char* requested) {
+  if (!gatewayConnected || !commandId || !commandId[0]) return;
+
+  JsonDocument doc;
+  doc["type"] = "glass2.ack";
+  doc["protocol"] = 2;
+  doc["command_id"] = commandId;
+  doc["requested"] = requested ? requested : "";
+  doc["status"] = "applied";
+  doc["visible"] = glass2VisibleWanted();
+  doc["manual_mode"] = static_cast<unsigned>(glass2ManualMode);
+
+  String json;
+  serializeJson(doc, json);
+  webSocket.sendTXT(json);
+
+  Serial.printf("[GLASS2-ACK] requested=%s visible=%u id=%s\n",
+                requested ? requested : "",
+                glass2VisibleWanted() ? 1u : 0u,
+                commandId);
+}
+
 static CompanionState parseRemoteState(const char* value) {
   if (!strcmp(value, "listening")) return CompanionState::Listening;
   if (!strcmp(value, "thinking"))  return CompanionState::Thinking;
@@ -2150,8 +2252,7 @@ static CompanionState parseRemoteState(const char* value) {
 
 #if COMPANION_AUDIO_ENABLE
 static bool configureStickS3MicInputGain(int requestedGainDb, const char* modeLabel) {
-  // Keep the validated command-capture DSP path unchanged.  A1R9 only uses a
-  // small analog PGA lift while the device is idling in wake-word listen mode.
+  // Wake listening gets a small analog PGA lift; command capture keeps its validated baseline.
   auto micCfg = M5.Mic.config();
   micCfg.sample_rate = AUDIO_MIC_SAMPLE_RATE;
   micCfg.magnification = AUDIO_MIC_DIGITAL_MAG;
@@ -2526,11 +2627,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       gatewayConnected = true;
       Serial.println("[WS] connected");
 
-      // A1R10: the disconnect handler intentionally pauses the local wake
-      // recognizer and moves the UI state to Error.  Prior versions forgot to
-      // leave that transport-originated Error after the socket came back, so
-      // updateWakeWordSystem() could never re-arm listening even though hello,
-      // info sync and display traffic had already recovered.
+      // A reconnect clears only transport-originated Error so wake listening can re-arm.
       if (gatewayTransportFault) {
         gatewayTransportFault = false;
         setState(CompanionState::Idle);
@@ -2617,6 +2714,16 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
         } else {
           sendDisplayPolicyAck("pending");
         }
+      }
+      else if (!strcmp(msgType, "glass2.sleep")) {
+        const char* commandId = doc["command_id"] | "";
+        setGlass2ManualMode(Glass2ManualMode::ForceOff);
+        sendGlass2ControlAck(commandId, "sleep");
+      }
+      else if (!strcmp(msgType, "glass2.wake")) {
+        const char* commandId = doc["command_id"] | "";
+        setGlass2ManualMode(Glass2ManualMode::ForceOn);
+        sendGlass2ControlAck(commandId, "wake");
       }
       else if (!strcmp(msgType, "assistant.state")) {
         const char* state = doc["state"] | "idle";
@@ -2934,6 +3041,312 @@ static uint32_t currentAutoVadThreshold() {
              : AUTO_WAKE_MIN_VOICE_LEVEL;
 }
 
+static WakeObserveBlock analyzeWakeObserveBlock(
+    const int16_t* samples,
+    size_t count,
+    uint32_t threshold) {
+  WakeObserveBlock obs;
+  if (!samples || count == 0) return obs;
+
+  uint64_t sumAbs = 0;
+  uint64_t sumSq = 0;
+  uint32_t peak = 0;
+  uint32_t clipped = 0;
+
+  for (size_t i = 0; i < count; ++i) {
+    const int32_t value = static_cast<int32_t>(samples[i]);
+    const uint32_t mag = static_cast<uint32_t>(value < 0 ? -value : value);
+    sumAbs += mag;
+    sumSq += static_cast<uint64_t>(value) * static_cast<int64_t>(value);
+    if (mag > peak) peak = mag;
+    if (mag >= 32000u) ++clipped;
+  }
+
+  obs.level = static_cast<uint32_t>(sumAbs / count);
+  obs.rms = static_cast<uint32_t>(sqrtf(static_cast<float>(sumSq / count)));
+  obs.threshold = threshold;
+  obs.peak = static_cast<uint16_t>(peak > 32767u ? 32767u : peak);
+  obs.clipped = static_cast<uint16_t>(
+      clipped > 65535u ? 65535u : clipped);
+  obs.active = obs.level >= threshold;
+  return obs;
+}
+
+static void resetWakeObserveSessionState() {
+  memset(wakeObserveRing, 0, sizeof(wakeObserveRing));
+  wakeObserveWriteCount = 0;
+  wakeObservedCommandId = -1;
+  wakeObservedPhraseId = -1;
+  wakeObservedEventMs = 0;
+  wakeObservedEventId = 0;
+
+  wakeObsSpeechBurstActive = false;
+  wakeObsSpeechBurstStartedMs = 0;
+  wakeObsSpeechBurstLastActiveMs = 0;
+  wakeObsSpeechBurstMaxLevel = 0;
+  wakeObsSpeechBurstPeak = 0;
+  wakeObsSpeechBurstSawWake = false;
+
+  wakeObsLastSpeechEndedMs = 0;
+  wakeObsLastSpeechDurationMs = 0;
+  wakeObsLastSpeechMaxLevel = 0;
+  wakeObsLastSpeechPeak = 0;
+  wakeObsLastSpeechSawWake = false;
+}
+
+static void completeWakeObserveSpeechBurst(uint32_t now) {
+  if (!wakeObsSpeechBurstActive) return;
+
+  const uint32_t durationMs =
+      wakeObsSpeechBurstLastActiveMs >= wakeObsSpeechBurstStartedMs
+          ? wakeObsSpeechBurstLastActiveMs - wakeObsSpeechBurstStartedMs + WAKE_OBS_BLOCK_MS
+          : 0;
+
+  if (durationMs >= 240u) {
+    Serial.printf(
+        "[WAKE-OBS-SPEECH] duration=%ums maxLevel=%u peak=%u noiseFloor=%u threshold=%u wakeHit=%u\n",
+        static_cast<unsigned>(durationMs),
+        static_cast<unsigned>(wakeObsSpeechBurstMaxLevel),
+        static_cast<unsigned>(wakeObsSpeechBurstPeak),
+        static_cast<unsigned>(wakeNoiseFloor),
+        static_cast<unsigned>(currentAutoVadThreshold()),
+        static_cast<unsigned>(wakeObsSpeechBurstSawWake));
+
+    wakeObsLastSpeechEndedMs = wakeObsSpeechBurstLastActiveMs;
+    wakeObsLastSpeechDurationMs = durationMs;
+    wakeObsLastSpeechMaxLevel = wakeObsSpeechBurstMaxLevel;
+    wakeObsLastSpeechPeak = wakeObsSpeechBurstPeak;
+    wakeObsLastSpeechSawWake = wakeObsSpeechBurstSawWake;
+  }
+
+  wakeObsSpeechBurstActive = false;
+  wakeObsSpeechBurstStartedMs = 0;
+  wakeObsSpeechBurstLastActiveMs = 0;
+  wakeObsSpeechBurstMaxLevel = 0;
+  wakeObsSpeechBurstPeak = 0;
+  wakeObsSpeechBurstSawWake = false;
+}
+
+static void recordWakeObserveBlock(
+    const int16_t* samples,
+    size_t count,
+    uint32_t now) {
+  const uint32_t threshold = currentAutoVadThreshold();
+  const WakeObserveBlock obs =
+      analyzeWakeObserveBlock(samples, count, threshold);
+
+  wakeObserveRing[wakeObserveWriteCount % WAKE_OBS_BLOCK_COUNT] = obs;
+  ++wakeObserveWriteCount;
+
+  if (obs.active) {
+    if (!wakeObsSpeechBurstActive) {
+      wakeObsSpeechBurstActive = true;
+      wakeObsSpeechBurstStartedMs = now;
+      wakeObsSpeechBurstMaxLevel = obs.level;
+      wakeObsSpeechBurstPeak = obs.peak;
+      wakeObsSpeechBurstSawWake = false;
+    }
+
+    wakeObsSpeechBurstLastActiveMs = now;
+    if (obs.level > wakeObsSpeechBurstMaxLevel) {
+      wakeObsSpeechBurstMaxLevel = obs.level;
+    }
+    if (obs.peak > wakeObsSpeechBurstPeak) {
+      wakeObsSpeechBurstPeak = obs.peak;
+    }
+    return;
+  }
+
+  if (wakeObsSpeechBurstActive &&
+      now - wakeObsSpeechBurstLastActiveMs >= WAKE_OBS_SEGMENT_GAP_MS) {
+    completeWakeObserveSpeechBurst(now);
+  }
+}
+
+static bool findWakeObserveSegment(
+    uint32_t& segmentStartSeq,
+    uint32_t& segmentEndSeq,
+    uint32_t& quietBeforeMs,
+    uint32_t& tailQuietMs) {
+  const uint32_t total = wakeObserveWriteCount;
+  const uint32_t count = total < WAKE_OBS_BLOCK_COUNT
+      ? total
+      : static_cast<uint32_t>(WAKE_OBS_BLOCK_COUNT);
+  if (count == 0) return false;
+
+  const uint32_t firstSeq = total - count;
+  const uint32_t maxLookbackBlocks =
+      (WAKE_OBS_EVENT_LOOKBACK_MS + WAKE_OBS_BLOCK_MS - 1u) / WAKE_OBS_BLOCK_MS;
+
+  bool foundRecentActive = false;
+  uint32_t latestActiveSeq = 0;
+  uint32_t looked = 0;
+  for (uint32_t seq = total; seq > firstSeq && looked <= maxLookbackBlocks; ++looked) {
+    --seq;
+    const WakeObserveBlock& obs = wakeObserveRing[seq % WAKE_OBS_BLOCK_COUNT];
+    if (obs.active) {
+      latestActiveSeq = seq;
+      foundRecentActive = true;
+      break;
+    }
+  }
+  if (!foundRecentActive) return false;
+
+  segmentEndSeq = latestActiveSeq;
+  tailQuietMs = (total - 1u - latestActiveSeq) * WAKE_OBS_BLOCK_MS;
+
+  const uint32_t gapBlocks =
+      (WAKE_OBS_SEGMENT_GAP_MS + WAKE_OBS_BLOCK_MS - 1u) / WAKE_OBS_BLOCK_MS;
+  uint32_t quietRun = 0;
+  segmentStartSeq = firstSeq;
+
+  for (uint32_t seq = latestActiveSeq + 1u; seq > firstSeq;) {
+    --seq;
+    const WakeObserveBlock& obs = wakeObserveRing[seq % WAKE_OBS_BLOCK_COUNT];
+    if (obs.active) {
+      quietRun = 0;
+      segmentStartSeq = seq;
+      continue;
+    }
+
+    ++quietRun;
+    if (quietRun >= gapBlocks) {
+      segmentStartSeq = seq + quietRun;
+      break;
+    }
+  }
+
+  quietBeforeMs = 0;
+  if (segmentStartSeq > firstSeq) {
+    uint32_t quietBlocks = 0;
+    for (uint32_t seq = segmentStartSeq; seq > firstSeq;) {
+      --seq;
+      const WakeObserveBlock& obs = wakeObserveRing[seq % WAKE_OBS_BLOCK_COUNT];
+      if (obs.active) break;
+      ++quietBlocks;
+    }
+    quietBeforeMs = quietBlocks * WAKE_OBS_BLOCK_MS;
+  }
+
+  return true;
+}
+
+static void logWakeObservatoryCandidate() {
+  uint32_t segmentStartSeq = 0;
+  uint32_t segmentEndSeq = 0;
+  uint32_t quietBeforeMs = 0;
+  uint32_t tailQuietMs = 0;
+
+  if (!findWakeObserveSegment(
+          segmentStartSeq,
+          segmentEndSeq,
+          quietBeforeMs,
+          tailQuietMs)) {
+    Serial.printf(
+        "[WAKE-OBS] id=%u candidate segment unavailable command=%d phrase=%d age=%ums\n",
+        static_cast<unsigned>(wakeObservedEventId),
+        wakeObservedCommandId,
+        wakeObservedPhraseId,
+        static_cast<unsigned>(wakeObservedEventMs > 0 ? millis() - wakeObservedEventMs : 0));
+    return;
+  }
+
+  uint64_t sumLevel = 0;
+  uint64_t sumRms = 0;
+  uint32_t maxLevel = 0;
+  uint32_t maxPeak = 0;
+  uint32_t clippedSamples = 0;
+  uint32_t activeBlocks = 0;
+  uint32_t totalBlocks = 0;
+
+  for (uint32_t seq = segmentStartSeq; seq <= segmentEndSeq; ++seq) {
+    const WakeObserveBlock& obs = wakeObserveRing[seq % WAKE_OBS_BLOCK_COUNT];
+    ++totalBlocks;
+    sumLevel += obs.level;
+    sumRms += obs.rms;
+    if (obs.level > maxLevel) maxLevel = obs.level;
+    if (obs.peak > maxPeak) maxPeak = obs.peak;
+    clippedSamples += obs.clipped;
+    if (obs.active) ++activeBlocks;
+  }
+
+  if (totalBlocks == 0) {
+    Serial.printf("[WAKE-OBS] id=%u empty candidate segment\n",
+                  static_cast<unsigned>(wakeObservedEventId));
+    return;
+  }
+
+  const uint32_t avgLevel = static_cast<uint32_t>(sumLevel / totalBlocks);
+  const uint32_t avgRms = static_cast<uint32_t>(sumRms / totalBlocks);
+  const uint32_t activePermille = static_cast<uint32_t>(
+      (static_cast<uint64_t>(activeBlocks) * 1000u) / totalBlocks);
+  const uint32_t sampleCount = totalBlocks * AUDIO_MIC_BLOCK_SAMPLES;
+  const uint32_t clipPermille = sampleCount > 0
+      ? static_cast<uint32_t>(
+            (static_cast<uint64_t>(clippedSamples) * 1000u) / sampleCount)
+      : 0;
+  const uint32_t eventAge = wakeObservedEventMs > 0
+      ? millis() - wakeObservedEventMs
+      : 0;
+
+  Serial.printf(
+      "[WAKE-OBS] id=%u command=%d phrase=%d age=%ums segment=%ums active=%ums quietBefore=%ums tailQuiet=%ums noiseFloor=%u threshold=%u\n",
+      static_cast<unsigned>(wakeObservedEventId),
+      wakeObservedCommandId,
+      wakeObservedPhraseId,
+      static_cast<unsigned>(eventAge),
+      static_cast<unsigned>(totalBlocks * WAKE_OBS_BLOCK_MS),
+      static_cast<unsigned>(activeBlocks * WAKE_OBS_BLOCK_MS),
+      static_cast<unsigned>(quietBeforeMs),
+      static_cast<unsigned>(tailQuietMs),
+      static_cast<unsigned>(wakeNoiseFloor),
+      static_cast<unsigned>(currentAutoVadThreshold()));
+  Serial.printf(
+      "[WAKE-OBS] id=%u avgLevel=%u avgRms=%u maxLevel=%u peak=%u active=%u.%u%% clip=%u.%u%%\n",
+      static_cast<unsigned>(wakeObservedEventId),
+      static_cast<unsigned>(avgLevel),
+      static_cast<unsigned>(avgRms),
+      static_cast<unsigned>(maxLevel),
+      static_cast<unsigned>(maxPeak),
+      static_cast<unsigned>(activePermille / 10u),
+      static_cast<unsigned>(activePermille % 10u),
+      static_cast<unsigned>(clipPermille / 10u),
+      static_cast<unsigned>(clipPermille % 10u));
+}
+
+static void logManualPttWakeMissSuspect() {
+  const uint32_t now = millis();
+
+  if (wakeObsSpeechBurstActive &&
+      !wakeObsSpeechBurstSawWake &&
+      now - wakeObsSpeechBurstStartedMs <= WAKE_OBS_MISS_MARK_WINDOW_MS) {
+    const uint32_t durationMs =
+        wakeObsSpeechBurstLastActiveMs >= wakeObsSpeechBurstStartedMs
+            ? wakeObsSpeechBurstLastActiveMs - wakeObsSpeechBurstStartedMs + WAKE_OBS_BLOCK_MS
+            : 0;
+    if (durationMs >= 240u) {
+      Serial.printf(
+          "[WAKE-MISS-SUSPECT] source=button_a state=current_speech duration=%ums age=%ums maxLevel=%u peak=%u\n",
+          static_cast<unsigned>(durationMs),
+          static_cast<unsigned>(now - wakeObsSpeechBurstLastActiveMs),
+          static_cast<unsigned>(wakeObsSpeechBurstMaxLevel),
+          static_cast<unsigned>(wakeObsSpeechBurstPeak));
+      return;
+    }
+  }
+
+  if (wakeObsLastSpeechEndedMs > 0 &&
+      !wakeObsLastSpeechSawWake &&
+      now - wakeObsLastSpeechEndedMs <= WAKE_OBS_MISS_MARK_WINDOW_MS) {
+    Serial.printf(
+        "[WAKE-MISS-SUSPECT] source=button_a state=recent_speech duration=%ums age=%ums maxLevel=%u peak=%u\n",
+        static_cast<unsigned>(wakeObsLastSpeechDurationMs),
+        static_cast<unsigned>(now - wakeObsLastSpeechEndedMs),
+        static_cast<unsigned>(wakeObsLastSpeechMaxLevel),
+        static_cast<unsigned>(wakeObsLastSpeechPeak));
+  }
+}
+
 static void updateWakeNoiseFloor(const int16_t* samples, size_t count) {
   const uint32_t level = meanAbsLevel(samples, count);
   if (level == 0) return;
@@ -2950,7 +3363,18 @@ static void updateWakeNoiseFloor(const int16_t* samples, size_t count) {
 }
 
 static void onWakeSrEvent(sr_event_t event, int commandId, int phraseId) {
-  (void)phraseId;
+  if (event == SR_EVENT_COMMAND) {
+    wakeObservedCommandId = commandId;
+    wakeObservedPhraseId = phraseId;
+    wakeObservedEventMs = millis();
+    wakeObservedEventId = ++wakeObserveEventCounter;
+    wakeObsSpeechBurstSawWake = true;
+    Serial.printf(
+        "[WAKE-EVENT] id=%u command=%d phrase=%d\n",
+        static_cast<unsigned>(wakeObservedEventId),
+        commandId,
+        phraseId);
+  }
 
   if (event == SR_EVENT_COMMAND && commandId == 0) {
     wakeWordDetected = true;
@@ -2979,7 +3403,8 @@ static bool initLocalWakeWordEngine() {
   wakeRecognizerPaused = true;
   wakeEngineReady = true;
 
-  Serial.println("[WAKE] local keyword engine ready: 逐光逐光");
+  Serial.println("[WAKE] local keyword engine ready: 你好逐光");
+  Serial.println("[WAKE-OBS] A1R25B1 keeps A1R25B0 wake front-end: PGA=6dB; MultiNet acceptance unchanged");
   return true;
 }
 
@@ -2992,6 +3417,7 @@ static void pauseWakeRecognizerForTurn() {
   }
 
   wakeListening = false;
+  resetWakeObserveSessionState();
 }
 
 static bool restartWakeMicPath(const char* reason, bool recovery) {
@@ -3023,6 +3449,7 @@ static bool restartWakeMicPath(const char* reason, bool recovery) {
     return false;
   }
   configureStickS3WakeMicInput();
+  resetWakeObserveSessionState();
 
   wakeAcceptedBlocks = 0;
   wakeFedBlocks = 0;
@@ -3103,6 +3530,10 @@ static void updateWakeAudioFeed() {
         updateWakeNoiseFloor(
             wakeRing[safeIdx],
             AUDIO_MIC_BLOCK_SAMPLES);
+        recordWakeObserveBlock(
+            wakeRing[safeIdx],
+            AUDIO_MIC_BLOCK_SAMPLES,
+            now);
 
         ESP_SR_M5.feedAudio(
             wakeRing[safeIdx],
@@ -3303,9 +3734,7 @@ static void playLocalWakeAckVoice() {
 
   if (M5.Mic.isRunning()) M5.Mic.end();
 
-  // A1R18: keep the wake acknowledgement prominent, but preserve the full
-  // natural "在的" waveform. Loudness comes from the dedicated MAG6 playback
-  // rail instead of A1R17 hard compression/tail trimming. Normal TTS stays MAG5.
+  // Wake ACK uses the full clean waveform on dedicated MAG6; normal TTS stays MAG5.
   delay(24);
 
   if (!M5.Speaker.isRunning()) {
@@ -3485,8 +3914,10 @@ static void updateWakeWordSystem() {
   if (wakeWordDetected &&
       wakeListening &&
       companionState == CompanionState::Idle) {
+    logWakeObservatoryCandidate();
     Serial.printf(
-        "[WAKE-HIT] ready=%u accepted=%u fed=%u level=%u noiseFloor=%u\n",
+        "[WAKE-HIT] id=%u ready=%u accepted=%u fed=%u level=%u noiseFloor=%u\n",
+        static_cast<unsigned>(wakeObservedEventId),
         static_cast<unsigned>(wakeFeedReady),
         static_cast<unsigned>(wakeAcceptedBlocks),
         static_cast<unsigned>(wakeFedBlocks),
@@ -3744,6 +4175,9 @@ static void updateTtsPlayback() {}
 
 static void onPttStart() {
 #if COMPANION_AUDIO_ENABLE && COMPANION_GATEWAY_ENABLE
+#if HOMEAI_WAKEWORD_ENABLE
+  logManualPttWakeMissSuspect();
+#endif
   startPttCapture();
 #else
   infoPaused = true;
@@ -3828,7 +4262,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== HomeAIAgent A4.5 Cyber Expression A3R9 24FPS WAKE RECOVERY / base A4.4.18 RC1R9 ===");
+  Serial.println("=== HomeAIAgent A1R25B1 / Glass2 Local Voice + Wake Front-End 6dB / Wake=你好逐光 ===");
 
   auto cfg = M5.config();
   M5.begin(cfg);

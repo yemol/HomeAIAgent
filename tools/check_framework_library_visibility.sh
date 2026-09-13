@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIBROOT="$ROOT/.pio-local/framework-arduinoespressif32/libraries"
 
-echo "=== HomeAIAgent A4.4.6 framework-library visibility check ==="
+echo "=== HomeAIAgent framework-library visibility check ==="
 
 [[ -d "$LIBROOT" ]] || {
   echo "[FAIL] missing framework libraries directory:"

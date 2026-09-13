@@ -4,12 +4,15 @@ from pathlib import Path
 import shutil
 
 PROJECT = Path(env["PROJECT_DIR"])
-print("[ESP-SR-CN] patcher=A4.5-A3R9 WAKE-RECOVERY")
+print("[ESP-SR-CN] patcher=guarded-cn-multinet+a1r25a1-evidence")
 TARGET = PROJECT / ".pio-local" / "ESP-SR-For-M5Unified" / "src" / "esp32-hal-sr-m5.c"
 BACKUP = TARGET.with_name(TARGET.name + ".homeai-a4.4.12.prepatch")
 CN_MARKER = "HOMEAI_A4_4_10_MULTINET_CN"
 GUARD_MARKER = "HOMEAI_A4_4_12_MULTINET_ONLY_GUARDED"
 LEGACY_GUARD_MARKER = "HOMEAI_A4_4_11_MULTINET_ONLY_GUARDED"
+OBS_MARKER = "HOMEAI_A1R25A_MULTINET_OBSERVATORY"
+OBS_RESULT_ANCHOR = "int sr_command_id = mn_result->command_id[0];"
+
 
 START_ANCHOR = "esp_err_t sr_start_m5(\n"
 INIT_ANCHOR = "  // Init Model\n"
@@ -177,38 +180,34 @@ if not TARGET.is_file():
 
 text = TARGET.read_text(encoding="utf-8")
 
-# A4.5 A3R9 recovery migration. A3R8 injected an explicit MultiNet
-# candidate threshold into the persistent .pio-local wrapper. The stable
-# A3R7 path never overrode MultiNet's model/default threshold. Remove only
-# the A3R8 block if it is present; never replace or delete .pio-local.
-A3R8_THRESHOLD_MARKER = "HOMEAI_A4_5_WAKE_CANDIDATE_THRESHOLD"
-if A3R8_THRESHOLD_MARKER in text:
+# Remove the withdrawn candidate-threshold experiment if it is still present.
+# Never replace or delete .pio-local; only remove the known marked block.
+WITHDRAWN_THRESHOLD_MARKER = "HOMEAI_A4_5_WAKE_CANDIDATE_THRESHOLD"
+if WITHDRAWN_THRESHOLD_MARKER in text:
     threshold_start_token = "    /* HOMEAI_A4_5_WAKE_CANDIDATE_THRESHOLD"
-    threshold_start = require_once(text, threshold_start_token, "A3R8-threshold-start")
+    threshold_start = require_once(text, threshold_start_token, "candidate-threshold-start")
     threshold_end = text.find(ADD_COMMANDS_ANCHOR, threshold_start)
     if threshold_end < 0:
-        raise RuntimeError("[ESP-SR-CN] A3R8 threshold block end anchor not found; refusing unsafe edit")
+        raise RuntimeError("[ESP-SR-CN] candidate-threshold block end anchor not found; refusing unsafe edit")
     text = text[:threshold_start] + text[threshold_end:]
     TARGET.write_text(text, encoding="utf-8")
-    print("[ESP-SR-CN] A3R9 removed A3R8 candidate-threshold override; MultiNet default restored")
+    print("[ESP-SR-CN] removed withdrawn candidate-threshold override; MultiNet default restored")
 else:
-    print("[ESP-SR-CN] A3R9 candidate-threshold override absent; MultiNet default unchanged")
+    print("[ESP-SR-CN] candidate-threshold override absent; MultiNet default unchanged")
 
-if A3R8_THRESHOLD_MARKER in TARGET.read_text(encoding="utf-8"):
-    raise RuntimeError("[ESP-SR-CN] A3R9 recovery validation failed: threshold override still present")
+if WITHDRAWN_THRESHOLD_MARKER in TARGET.read_text(encoding="utf-8"):
+    raise RuntimeError("[ESP-SR-CN] validation failed: withdrawn threshold override still present")
 
 if GUARD_MARKER in text:
     validate(text)
-    print("[ESP-SR-CN] A4.4.12 guarded CN patch already applied")
+    print("[ESP-SR-CN] guarded CN patch already applied")
 else:
     if not BACKUP.exists():
         shutil.copy2(TARGET, BACKUP)
         print(f"[ESP-SR-CN] backup={BACKUP}")
 
-    # Accept all expected incoming states:
-    # 1) untouched pinned upstream wrapper
-    # 2) CN-selector-only wrapper
-    # 3) partial/legacy wrapper text, as long as sr_start_m5 anchors remain intact
+    # Accept upstream, CN-selector-only, or previously patched wrappers as long as
+    # the sr_start_m5 structural anchors remain intact.
     start_pos = require_once(text, START_ANCHOR, "sr_start_m5")
 
     if GUARD_MARKER not in text:
@@ -227,8 +226,7 @@ else:
     if init_pos < 0 or command_comment_pos < 0 or command_comment_pos <= init_pos:
         raise RuntimeError("[ESP-SR-CN] sr_start_m5 model-init structure not found")
 
-    # Replace by structural boundaries, not exact upstream block text. This is
-    # which allows clean migration from an already-patched source.
+    # Replace by structural boundaries so already-patched sources migrate safely.
     text = text[:init_pos] + AFE_BLOCK + text[command_comment_pos:]
 
     # Locate command block again after AFE replacement.
@@ -245,9 +243,43 @@ else:
 
     validate(text)
     TARGET.write_text(text, encoding="utf-8")
-    print("[ESP-SR-CN] A4.4.12 migrated wrapper by structural anchors")
+    print("[ESP-SR-CN] migrated wrapper by structural anchors")
+
+# A1R25A.1 diagnostics-only probability tap. This runs after the guarded CN
+# migration and only adds log output when MultiNet has already detected a
+# command. It does not change thresholds, candidates, phrase tables, or mode.
+verify = TARGET.read_text(encoding="utf-8")
+if OBS_MARKER not in verify:
+    obs_pos = verify.find(OBS_RESULT_ANCHOR)
+    if obs_pos >= 0:
+        line_start = verify.rfind("\n", 0, obs_pos) + 1
+        indent = verify[line_start:obs_pos]
+        obs_block = (
+            f"{indent}/* {OBS_MARKER}: observe-only probability log. */\n"
+            f"{indent}if (mn_result != NULL)\n"
+            f"{indent}{{\n"
+            f"{indent}  int homeai_obs_count = mn_result->num < 5 ? mn_result->num : 5;\n"
+            f"{indent}  log_w(\"[WAKE-MN] candidates=%d\", mn_result->num);\n"
+            f"{indent}  for (int homeai_obs_i = 0; homeai_obs_i < homeai_obs_count; ++homeai_obs_i)\n"
+            f"{indent}  {{\n"
+            f"{indent}    int homeai_prob_x10000 = (int)(mn_result->prob[homeai_obs_i] * 10000.0f + 0.5f);\n"
+            f"{indent}    log_w(\"[WAKE-MN] rank=%d command=%d phrase=%d prob_x10000=%d\",\n"
+            f"{indent}          homeai_obs_i + 1,\n"
+            f"{indent}          mn_result->command_id[homeai_obs_i],\n"
+            f"{indent}          mn_result->phrase_id[homeai_obs_i],\n"
+            f"{indent}          homeai_prob_x10000);\n"
+            f"{indent}  }}\n"
+            f"{indent}}}\n"
+        )
+        verify = verify[:line_start] + obs_block + verify[line_start:]
+        TARGET.write_text(verify, encoding="utf-8")
+        print("[ESP-SR-CN] A1R25A.1 MultiNet probability observatory applied")
+    else:
+        print("[ESP-SR-CN] WARN A1R25A.1 probability anchor unavailable; app-level observatory remains active")
+else:
+    print("[ESP-SR-CN] A1R25A.1 MultiNet probability observatory already applied")
 
 verify = TARGET.read_text(encoding="utf-8")
 validate(verify)
 print(f"[ESP-SR-CN] source={TARGET}")
-print("[ESP-SR-CN] validation PASS: A4.4.10/upstream -> A4.4.12 guarded CN MultiNet")
+print("[ESP-SR-CN] validation PASS: guarded Chinese MultiNet + A1R25A.1 evidence observatory")

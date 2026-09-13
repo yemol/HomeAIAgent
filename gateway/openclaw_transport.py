@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Managed OpenClaw transport for HomeAIAgent.
 
-A1R11 keeps the HomeAIAgent service on the Mac mini while moving the
-Mini -> OpenClaw SSH local forward into the Python service process.
-The StickS3-facing server stays alive when the SSH path is unavailable.
+HomeAIAgent runs on the Mac mini and owns the OpenClaw SSH local forward
+inside the Python service process. The StickS3-facing server stays alive when
+the SSH path is unavailable.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ class OpenClawTransportManager:
                     raise RuntimeError(
                         f"local port {self.config.local_host}:{self.config.local_port} "
                         "is already in use. Stop the legacy openclaw_air_tunnel.sh "
-                        "or any old HomeAIAgent service before starting A1R11."
+                        "or any old HomeAIAgent service before starting HomeAIAgent."
                     )
 
                 print(

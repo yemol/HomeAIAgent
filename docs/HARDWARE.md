@@ -1,50 +1,63 @@
 # Hardware
 
-## Main devices
+## 主设备
 
 - M5Stack StickS3
 - M5Stack Unit Glass2
 
-## Glass2 connection
+## Glass2
 
-Use the normal HY2.0-4P / Grove connection.
+连接：HY2.0-4P / Grove。
 
-- supply: Grove 5 V rail
-- I2C address: `0x3C`
-- SDA: StickS3 GPIO9
-- SCL: StickS3 GPIO10
+```text
+5V   -> Grove 5V
+SDA  -> GPIO9
+SCL  -> GPIO10
+ADDR -> 0x3C
+```
 
-Firmware explicitly enables the StickS3 external output rail before Glass2 initialization.
+固件在初始化 Glass2 前显式开启 StickS3 外部供电。
 
-## StickS3 audio
+## StickS3 Audio
 
-The onboard ES8311 path is treated as half-duplex:
+板载 ES8311 按半双工使用：
 
-- microphone and speaker are not run concurrently;
-- Mic capture is stopped before speaker/TTS playback;
-- speaker is stopped before wake listening/capture resumes.
+- 唤醒/录音期间关闭 speaker path
+- 播放期间关闭 Mic capture
+- capture 完成后才发送 Wi-Fi PCM
 
-Current production audio settings remain frozen in the firmware configuration.
+当前参数：
+
+```text
+Wake listen PGA:      9 dB
+Command capture PGA:  6 dB
+Speaker volume:       255
+Normal TTS MAG:       5
+Wake ACK MAG:         6
+```
+
+Wake ACK 使用冻结的 `在的` PCM，16 kHz / mono / PCM16。
 
 ## Display roles
 
 ### StickS3 LCD
 
-Primary interaction/state display. Current candidate uses the A4.5 Cyber Expression A3R1 renderer, built on the verified A2 flicker-free path rather than the earlier digital-pet face.
+显示 Cyber Expression 状态动画。Speaking 使用播放中的 PCM 能量驱动波形，约 24 FPS。
 
 ### Glass2
 
-Transparent information display for the pre-rendered game/finance feed and bottom status information.
+显示 Gateway 预渲染的游戏/金融资讯和底部状态。
 
-## First hardware verification
+## First verification
 
-After flashing the current baseline:
+刷入当前基线后确认：
 
-1. StickS3 boots and prints the A4.5 A3R4 PCM-Synced Voice Wave banner.
-2. The cyber expression appears without full-screen flicker.
-3. Glass2 initializes and displays an information frame.
-4. Button A enters Listening and the voice path completes through Thinking/Speaking.
-5. Wake phrase `逐光逐光` starts the hands-free path.
-6. Glass2 navigation remains available outside active voice isolation.
+1. StickS3 正常启动，无 brownout/reset loop。
+2. Cyber Expression 无整屏闪烁。
+3. Glass2 正常初始化。
+4. Button A 可以完成一轮语音对话。
+5. `你好逐光` 可以进入 hands-free path。
+6. 本地 `在的` 正常播放。
+7. 语音结束后 wake listener 能重新 armed。
 
-If Glass2 initialization fails, the terminal emits a Glass2 initialization failure log over serial.
+Glass2 初始化失败会在串口输出明确错误。

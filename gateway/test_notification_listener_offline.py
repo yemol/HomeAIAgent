@@ -84,7 +84,7 @@ async def _run() -> None:
     assert len(g.REMINDER_PENDING) == 1
     assert g.NOTIFICATION_STATE_FILE.exists()
 
-    # A1R21: one synchronous voice turn can append multiple assistant progress
+    # One synchronous voice turn can append multiple assistant progress
     # rows before its final HTTP reply. None of those progress rows may be
     # replayed later as notifications. A truly earlier or later asynchronous
     # assistant row must still be delivered.

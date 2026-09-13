@@ -162,7 +162,7 @@ def write_header(samples: list[int], path: Path, metrics: dict[str, float], text
 #include <stddef.h>
 #include <stdint.h>
 
-// A1R19 local wake acknowledgement generated ONCE with HomeAIAgent's production TTS.
+// Local wake acknowledgement generated once with HomeAIAgent production TTS.
 // Text: {text}
 // Resource: {EXPECTED_RESOURCE}
 // Voice: {EXPECTED_VOICE}

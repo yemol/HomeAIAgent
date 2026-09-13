@@ -154,7 +154,7 @@ DISPLAY_STATUS_RECHECK_SEC = 300
 SPEAKER_VOLUME_STEP_PERCENT = 10
 SPEAKER_VOLUME_ACK_TIMEOUT_SEC = 2.5
 
-# A1R23 audio-output routing. HomeAgent may switch between its own speaker and
+# Audio-output routing. HomeAgent may switch between its own speaker and
 # a bound NetworkSpeaker. HomeAgentMini is intentionally NetworkSpeaker-only.
 AUDIO_OUTPUT_ROUTE_STATE_FILE = HOMEAI_DATA_DIR / "audio_output_route_state.json"
 HOMEAI_DEFAULT_AUDIO_OUTPUT = os.getenv(
@@ -332,8 +332,8 @@ VOLCENGINE_TTS_LOUDNESS_RATE = int(os.getenv("VOLCENGINE_TTS_LOUDNESS_RATE", "0"
 VOLCENGINE_TTS_CONNECT_TIMEOUT = float(os.getenv("VOLCENGINE_TTS_CONNECT_TIMEOUT", "8"))
 VOLCENGINE_TTS_SESSION_TIMEOUT = float(os.getenv("VOLCENGINE_TTS_SESSION_TIMEOUT", "20"))
 
-A1R7_STANDARD_TTS_RESOURCE_ID = "seed-tts-2.0"
-A1R7_STANDARD_TTS_VOICE = "zh_female_vv_uranus_bigtts"
+STANDARD_TTS_RESOURCE_ID = "seed-tts-2.0"
+STANDARD_TTS_VOICE = "zh_female_vv_uranus_bigtts"
 
 
 # Optional OpenAI speech fallback. Not required when domestic speech is selected.
@@ -449,7 +449,7 @@ NOTIFICATION_CURSOR_SESSION_KEY = ""
 NOTIFICATION_CURSOR_SESSION_ID = ""
 VOICE_OPENCLAW_INFLIGHT = 0
 VOICE_REPLY_SUPPRESSIONS: list[dict[str, Any]] = []
-# A1R21 Voice Turn Fence. OpenClaw may append multiple assistant progress rows
+# Voice Turn Fence. OpenClaw may append multiple assistant progress rows
 # to the same voice session while one synchronous /v1/chat/completions request
 # is running. The HTTP response is the authoritative spoken answer. Keep a
 # fence for each completed synchronous turn so transcript reconciliation marks
@@ -776,7 +776,7 @@ OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
 OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
 
-# A1R22 multi-device conversation router.
+# Multi-device conversation router.
 #
 # The existing StickS3 does not currently send a device_id, so a missing id is
 # intentionally treated as the primary HomeAIAgent. HomeAIAgent Mini already
@@ -894,7 +894,7 @@ def _audio_output_mode_for_device(device_id: str) -> str:
         return "network"
     if did == HOMEAI_PRIMARY_DEVICE_ID:
         return AUDIO_OUTPUT_ROUTES.get(did, HOMEAI_DEFAULT_AUDIO_OUTPUT)
-    # Preserve A1R22 behavior for any future/unknown companion: prefer a bound
+    # Future/unknown companions prefer a bound
     # speaker if present, otherwise use the companion itself.
     return "auto"
 
@@ -923,7 +923,7 @@ def _openclaw_user_for_device(device_id: str) -> str:
 
     return OPENCLAW_USER
 
-# A1R11: OpenClaw transport is owned by this Python service. On the Mac mini
+# OpenClaw transport is owned by this Python service. On the Mac mini
 # the default is an in-process AsyncSSH local forward. A future deployment on
 # the OpenClaw host can switch OPENCLAW_TRANSPORT=direct without changing the
 # StickS3 protocol.
@@ -3283,7 +3283,7 @@ async def startup_info_refresh_before_ws() -> None:
 
 
 async def info_skill_poll_loop() -> None:
-    # A1R12: Gateway restart is cache-only for Info. Do NOT spend tokens on a
+    # Gateway restart is cache-only for Info. Do NOT spend tokens on a
     # forced startup refresh. The already-loaded last-good cache is served to
     # the device immediately, and this loop owns all real refreshes at the
     # fixed wall-clock schedule below.
@@ -3637,7 +3637,7 @@ async def send_info_sync(session: "ClientSession") -> None:
 class ClientSession:
     ws: Any
 
-    # A1R22 device identity/routing.
+    # Device identity/routing.
     # - companion: owns an OpenClaw conversation
     # - speaker: owns no LLM session; it is an audio sink bound to parent_device_id
     device_id: str = HOMEAI_PRIMARY_DEVICE_ID
@@ -3670,6 +3670,11 @@ class ClientSession:
     display_last_ack: dict[str, Any] = field(default_factory=dict)
     display_last_confirmed_sleeping: bool | None = None
     display_policy_task: Any = None
+
+    # Explicit user voice control for Glass2 only. This is independent from
+    # the automatic night policy that can blank both local displays.
+    glass2_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    glass2_expected_command_id: str = ""
 
 
 def _is_speaker_session(session: ClientSession) -> bool:
@@ -3801,7 +3806,7 @@ def _select_audio_sink(source: ClientSession) -> ClientSession:
     fallback" rule is enforced by ``send_pcm_to_routed_sink`` so callers can
     still inspect the preferred sink without changing the session type.
 
-    Unknown future companions preserve the A1R22 automatic behavior.
+    Unknown future companions use the automatic routing behavior.
     """
     if not _is_companion_session(source):
         return source
@@ -3923,6 +3928,108 @@ async def _apply_audio_output_voice_command(
     if network_online:
         return "好的，已经切到 NetworkSpeaker。"
     return "已经切到 NetworkSpeaker 模式，不过它现在不在线，暂时由 HomeAgent 本机喇叭发声；连接恢复后会自动切回网络喇叭。"
+
+
+@dataclass(frozen=True)
+class Glass2DisplayIntent:
+    sleeping: bool
+
+
+def _parse_glass2_display_intent(transcript: str) -> Glass2DisplayIntent | None:
+    text = str(transcript or "").strip()
+    if not text:
+        return None
+
+    compact = re.sub(r"[\s，。,.！!？?、：:；;“”\"'（）()]+", "", text).lower()
+
+    # Avoid hijacking negated or informational questions. The local command is
+    # intentionally narrow and action-oriented.
+    if any(token in compact for token in ("不要", "别", "不用", "不许", "怎么", "如何", "为什么")):
+        return None
+
+    for prefix in ("逐光", "请", "帮我", "给我", "麻烦"):
+        if compact.startswith(prefix):
+            compact = compact[len(prefix):]
+    for suffix in ("一下", "吧", "谢谢"):
+        if compact.endswith(suffix):
+            compact = compact[:-len(suffix)]
+
+    close_phrases = {
+        "关闭屏幕", "关掉屏幕", "把屏幕关掉", "关屏", "息屏", "熄屏",
+        "关闭glass2", "关掉glass2", "glass2关掉",
+    }
+    open_phrases = {
+        "打开屏幕", "开启屏幕", "把屏幕打开", "亮屏", "点亮屏幕",
+        "打开glass2", "开启glass2", "glass2打开",
+    }
+
+    if compact in close_phrases:
+        return Glass2DisplayIntent(True)
+    if compact in open_phrases:
+        return Glass2DisplayIntent(False)
+    return None
+
+
+async def _apply_glass2_display_voice_command(
+    source: ClientSession,
+    transcript: str,
+) -> tuple[str, bool] | None:
+    intent = _parse_glass2_display_intent(transcript)
+    if intent is None:
+        return None
+
+    if source.device_id != HOMEAI_PRIMARY_DEVICE_ID:
+        return None
+
+    if intent.sleeping:
+        return "好的，Glass2 屏幕已关闭。", True
+    return "好的，Glass2 屏幕已打开。", False
+
+
+async def _apply_glass2_target(source: ClientSession, sleeping: bool) -> bool:
+    requested = "sleep" if sleeping else "wake"
+    command_id = f"glass2-{uuid.uuid4()}"
+    source.glass2_expected_command_id = command_id
+
+    while True:
+        try:
+            source.glass2_ack_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+    try:
+        await send_json(source.ws, {
+            "type": f"glass2.{requested}",
+            "command_id": command_id,
+            "reason": "local_voice_command",
+        })
+        print(
+            f"[GLASS2-VOICE] command sent requested={requested} "
+            f"command_id={command_id}"
+        )
+
+        ack = await asyncio.wait_for(source.glass2_ack_queue.get(), timeout=3.0)
+        status = str(ack.get("status") or "").strip().lower()
+        visible = bool(ack.get("visible"))
+        expected_visible = not sleeping
+        if status == "applied" and visible == expected_visible:
+            print(
+                f"[GLASS2-VOICE] ACK confirmed requested={requested} "
+                f"visible={visible} command_id={command_id}"
+            )
+            return True
+
+        print(
+            f"[GLASS2-VOICE-WARN] invalid ACK requested={requested} "
+            f"status={status!r} visible={visible} command_id={command_id}"
+        )
+        return False
+    except Exception as exc:
+        print(f"[GLASS2-VOICE-ERROR] {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if source.glass2_expected_command_id == command_id:
+            source.glass2_expected_command_id = ""
 
 
 @dataclass(frozen=True)
@@ -5485,6 +5592,7 @@ async def process_utterance(session: ClientSession) -> None:
     if session.processing:
         return
     session.processing = True
+    pending_glass2_target: bool | None = None
     try:
         pcm = bytes(session.audio)
         if len(pcm) < 640:  # < 20 ms
@@ -5550,6 +5658,11 @@ async def process_utterance(session: ClientSession) -> None:
             if answer is not None:
                 local_command = "volume"
         if answer is None:
+            glass2_result = await _apply_glass2_display_voice_command(session, transcript)
+            if glass2_result is not None:
+                answer, pending_glass2_target = glass2_result
+                local_command = "glass2-display"
+        if answer is None:
             print(
                 f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
                 f"model={OPENCLAW_MODEL} device={session.device_id} "
@@ -5563,6 +5676,8 @@ async def process_utterance(session: ClientSession) -> None:
             print("[STAGE] OpenClaw returned")
         elif local_command == "audio-route":
             print(f"[AUDIO-ROUTE-VOICE] handled locally transcript={transcript!r}")
+        elif local_command == "glass2-display":
+            print(f"[GLASS2-VOICE] handled locally transcript={transcript!r}")
         else:
             print(f"[VOLUME-VOICE] handled locally transcript={transcript!r}")
         agent_ms = int((time.perf_counter() - agent_started) * 1000)
@@ -5589,6 +5704,8 @@ async def process_utterance(session: ClientSession) -> None:
         print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
         session.processing = False
         await send_state(session.ws, "idle")
+        if pending_glass2_target is not None:
+            await _apply_glass2_target(session, pending_glass2_target)
 
     except Exception as exc:
         print(f"[ERROR] {type(exc).__name__}: {exc}")
@@ -5603,6 +5720,11 @@ async def process_utterance(session: ClientSession) -> None:
         except Exception:
             pass
         session.processing = False
+        if pending_glass2_target is not None:
+            try:
+                await _apply_glass2_target(session, pending_glass2_target)
+            except Exception:
+                pass
 
 
 async def handle_connection(ws) -> None:
@@ -5726,6 +5848,27 @@ async def handle_connection(ws) -> None:
                         f"got={command_id!r}"
                     )
 
+            elif kind == "glass2.ack":
+                command_id = str(msg.get("command_id") or "")
+                requested = str(msg.get("requested") or "")
+                status = str(msg.get("status") or "")
+                visible = bool(msg.get("visible"))
+                print(
+                    f"[GLASS2] device ACK requested={requested} "
+                    f"status={status} visible={visible} command_id={command_id}"
+                )
+                if (
+                    session.glass2_expected_command_id
+                    and command_id == session.glass2_expected_command_id
+                ):
+                    session.glass2_ack_queue.put_nowait(dict(msg))
+                else:
+                    print(
+                        f"[GLASS2-WARN] unexpected/stale ACK "
+                        f"expected={session.glass2_expected_command_id!r} "
+                        f"got={command_id!r}"
+                    )
+
             elif kind == "info.ack":
                 print(f"[INFO] device ack revision={FEED_REVISION}")
 
@@ -5814,11 +5957,11 @@ async def handle_connection(ws) -> None:
 async def preflight(*, require_openclaw: bool = True) -> int:
     print("=== HomeAIAgent Gateway persistent-config preflight ===")
     if (
-        VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
-        or VOLCENGINE_TTS_VOICE != A1R7_STANDARD_TTS_VOICE
+        VOLCENGINE_TTS_RESOURCE_ID != STANDARD_TTS_RESOURCE_ID
+        or VOLCENGINE_TTS_VOICE != STANDARD_TTS_VOICE
     ):
         print(
-            "[FAIL] A1R7 standard TTS guard rejected active pairing: "
+            "[FAIL] standard TTS guard rejected active pairing: "
             f"resource={VOLCENGINE_TTS_RESOURCE_ID} voice={VOLCENGINE_TTS_VOICE}"
         )
         print(
@@ -5971,11 +6114,11 @@ async def main() -> None:
     global OPENCLAW_TRANSPORT_MANAGER
 
     if (
-        VOLCENGINE_TTS_RESOURCE_ID != A1R7_STANDARD_TTS_RESOURCE_ID
-        or VOLCENGINE_TTS_VOICE != A1R7_STANDARD_TTS_VOICE
+        VOLCENGINE_TTS_RESOURCE_ID != STANDARD_TTS_RESOURCE_ID
+        or VOLCENGINE_TTS_VOICE != STANDARD_TTS_VOICE
     ):
         raise RuntimeError(
-            "A1R7 standard TTS guard rejected active pairing: "
+            "standard TTS guard rejected active pairing: "
             f"resource={VOLCENGINE_TTS_RESOURCE_ID} voice={VOLCENGINE_TTS_VOICE}"
         )
 
@@ -6008,7 +6151,7 @@ async def main() -> None:
         await OPENCLAW_TRANSPORT_MANAGER.close()
         raise RuntimeError(f"HomeAIAgent startup preflight failed status={preflight_status}")
 
-    # A1R12: restart is cache-only for Info. The cache was already loaded by
+    # Restart is cache-only for Info. The cache was already loaded by
     # load_info_skill_cache(); do not call OpenClaw/Info Skill here. This avoids
     # spending tokens every time the Gateway is restarted during development.
     # The next real refresh is owned exclusively by info_skill_poll_loop() at

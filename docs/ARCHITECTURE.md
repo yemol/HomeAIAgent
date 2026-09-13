@@ -1,83 +1,109 @@
 # Architecture
 
-## Components
-
-### StickS3 terminal
-
-Responsibilities:
-
-- local Chinese wake-word detection (`逐光逐光`)
-- Button-A PTT and hands-free capture
-- ES8311 half-duplex microphone/speaker control
-- PSRAM capture buffering
-- two-slot gapless TTS playback
-- cyber-expression state rendering
-- Glass2 frame cache/display
-- persistent NVS network/Gateway configuration
-- night display execution and acknowledgement
-
-### HomeAIAgent Server
-
-Responsibilities:
-
-- persistent WebSocket session with StickS3
-- in-process managed SSH/Tailscale transport to remote OpenClaw while developing on the Mac mini
-- ASR/TTS service integration
-- OpenClaw conversational request path
-- game/finance Info Skill refresh and cache
-- OpenClaw transient Info-session cleanup
-- Glass2 frame rendering
-- wall-clock display policy
-- diagnostics and runtime captures
-
-### OpenClaw
-
-OpenClaw remains the agent/tool authority. Normal voice conversations retain one conversational identity; background Info Skill requests use isolated transient sessions that are deleted through the OpenClaw Gateway control-plane RPC after use.
-
-## Voice data flow
+## 1. 总体结构
 
 ```text
-Wake/Button A
-  -> StickS3 Mic (PCM16/16 kHz)
-  -> HomeAIAgent Gateway
-  -> ASR
-  -> OpenClaw
-  -> TTS
-  -> segmented PCM
-  -> StickS3 two-slot speaker queue
+StickS3 / HomeAIAgent Mini / NetworkSpeaker
+                    |
+                    | WebSocket
+                    v
+           HomeAIAgent Gateway (Mac mini)
+              |      |       |
+             ASR    TTS    device router
+                    |
+                    +-- embedded SSH/Tailscale --> OpenClaw
 ```
 
-The StickS3 audio path is intentionally half-duplex. Microphone capture ends before RF-heavy upload/processing and speaker playback.
+Gateway 是本地服务层。OpenClaw 仍是对话与工具执行权威，StickS3 负责本地唤醒、采集、播放和显示。
 
-## Display data flow
+## 2. StickS3
+
+职责：
+
+- Chinese MultiNet 本地唤醒：`你好逐光`
+- Button A PTT
+- ES8311 半双工麦克风/扬声器切换
+- PSRAM 语音缓存与捕获后发送
+- 两槽 Gapless TTS 播放
+- Cyber Expression
+- Glass2 帧缓存与显示
+- NVS 网络/Gateway 配置
+- 夜间显示执行与 ACK
+
+语音链保持半双工。麦克风采集结束后才进行 Wi-Fi 音频上传；播放结束后再恢复唤醒监听。
+
+## 3. Gateway
+
+职责：
+
+- 维护设备 WebSocket
+- 火山 ASR/TTS
+- OpenClaw 对话调用
+- 内嵌 SSH/Tailscale transport
+- 多设备会话隔离
+- NetworkSpeaker 音频 sink 路由和音量状态
+- OpenClaw Notification listener
+- Info Skill 调度与缓存
+- Glass2 预渲染
+- Gold 状态
+- 夜间显示策略
+
+持久配置和运行状态都在项目目录之外，Direct Overwrite 不会删除用户凭据或运行队列。
+
+## 4. OpenClaw 会话
+
+主 HomeAIAgent 使用稳定 voice user：
+
+```text
+home-ai-agent:main
+```
+
+HomeAIAgent Mini 使用独立 voice user。未知 future companion 默认按 `device_id` 隔离。
+
+NetworkSpeaker 不拥有 OpenClaw 对话，通过 `parent_device_id` 绑定 companion，仅作为音频输出节点。
+
+## 5. Voice flow
+
+```text
+Wake / Button A
+  -> PCM16 16 kHz capture
+  -> Gateway ASR
+  -> OpenClaw
+  -> Gateway TTS
+  -> segmented PCM16
+  -> selected audio sink
+  -> playback ACK
+```
+
+当前本地 Wake ACK `在的` 不经过这条链路，直接由 StickS3 Flash 中的 PCM 播放。
+
+## 6. Display flow
 
 ### StickS3 LCD
 
-The local LCD renders the HomeAI cyber expression from the assistant state. A full 135×240 RGB565 frame is composed off-screen and pushed once to avoid flicker.
+135×240 RGB565 全帧离屏渲染，完成后一次 `pushSprite()`，避免清屏闪烁。
 
 ### Glass2
 
-The Gateway pre-renders each 128×64 monochrome information frame. StickS3 receives a complete revision using a two-phase sync and does not replace the active feed until the incoming set is complete.
+Gateway 预渲染 128×64 1-bit frame。设备使用两阶段同步，整批接收完成后才切换 active feed。
 
-## Reliability principles
+## 7. OpenClaw transport
 
-- do not modify audio-critical scheduling solely for UI effects;
-- keep application WebSocket traffic outside the active Mic/I2S capture window;
-- preserve per-category last-good information data;
-- require explicit display-state acknowledgement;
-- bound background OpenClaw session lifetime;
-- keep secrets and machine-local dependencies out of source control.
-
-
-## A1R11 managed OpenClaw transport
-
-During development HomeAIAgent remains on the Mac mini. The Python service owns the outbound SSH connection and local forward to the OpenClaw host using AsyncSSH. There is no separately launched `ssh -N -L` service.
+Mac mini Gateway 自己维护到 OpenClaw 主机的 SSH/Tailscale 本地转发：
 
 ```text
-StickS3 -> Mac mini HomeAIAgent Server :8765
-                         |
-                         +-> embedded AsyncSSH
-                               -> OpenClaw host 127.0.0.1:18789
+127.0.0.1:18790
+  -> SSH/Tailscale
+  -> OpenClaw 127.0.0.1:18789
 ```
 
-If the SSH path drops, only OpenClaw-dependent operations are temporarily unavailable. The HomeAIAgent process and StickS3-facing WebSocket stay online while the transport reconnects. A future same-host deployment can set `OPENCLAW_TRANSPORT=direct`.
+不需要单独运行 `ssh -N -L`。SSH 链路异常只降级 OpenClaw 相关能力，不应让 StickS3-facing Gateway 退出。
+
+## 8. Reliability rules
+
+- 音频采集/播放优先于 UI 动画。
+- Mic 活跃期间避免应用级 Wi-Fi 音频发送。
+- 保留 Info 各分类 last-good 数据。
+- 显示状态以设备 ACK 为准。
+- Background OpenClaw session 有界且用后清理。
+- `.pio-local`、凭据和 runtime state 不进入源码包。
