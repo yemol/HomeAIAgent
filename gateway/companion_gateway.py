@@ -154,6 +154,15 @@ DISPLAY_STATUS_RECHECK_SEC = 300
 SPEAKER_VOLUME_STEP_PERCENT = 10
 SPEAKER_VOLUME_ACK_TIMEOUT_SEC = 2.5
 
+# A1R23 audio-output routing. HomeAgent may switch between its own speaker and
+# a bound NetworkSpeaker. HomeAgentMini is intentionally NetworkSpeaker-only.
+AUDIO_OUTPUT_ROUTE_STATE_FILE = HOMEAI_DATA_DIR / "audio_output_route_state.json"
+HOMEAI_DEFAULT_AUDIO_OUTPUT = os.getenv(
+    "HOMEAI_DEFAULT_AUDIO_OUTPUT", "network"
+).strip().lower()
+if HOMEAI_DEFAULT_AUDIO_OUTPUT not in {"local", "network"}:
+    HOMEAI_DEFAULT_AUDIO_OUTPUT = "network"
+
 INFO_FRAME_WIDTH = 128
 INFO_FRAME_HEIGHT = 64
 
@@ -833,6 +842,72 @@ def _load_device_openclaw_users() -> dict[str, str]:
 
 
 DEVICE_OPENCLAW_USERS = _load_device_openclaw_users()
+
+
+def _load_audio_output_routes() -> dict[str, str]:
+    routes: dict[str, str] = {}
+    try:
+        if AUDIO_OUTPUT_ROUTE_STATE_FILE.exists():
+            raw = json.loads(AUDIO_OUTPUT_ROUTE_STATE_FILE.read_text(encoding="utf-8"))
+            raw_routes = raw.get("routes", {}) if isinstance(raw, dict) else {}
+            if isinstance(raw_routes, dict):
+                for device_id, mode in raw_routes.items():
+                    did = str(device_id or "").strip()
+                    value = str(mode or "").strip().lower()
+                    if did and value in {"local", "network"}:
+                        routes[did] = value
+    except Exception as exc:
+        print(
+            "[AUDIO-ROUTE-WARN] route state load failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    return routes
+
+
+def _persist_audio_output_routes() -> None:
+    try:
+        AUDIO_OUTPUT_ROUTE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        body = {
+            "version": 1,
+            "routes": AUDIO_OUTPUT_ROUTES,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+        tmp = AUDIO_OUTPUT_ROUTE_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(AUDIO_OUTPUT_ROUTE_STATE_FILE)
+    except Exception as exc:
+        print(
+            "[AUDIO-ROUTE-WARN] route state save failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+AUDIO_OUTPUT_ROUTES: dict[str, str] = _load_audio_output_routes()
+
+
+def _audio_output_mode_for_device(device_id: str) -> str:
+    did = str(device_id or "").strip()
+    if did == HOMEAI_MINI_DEVICE_ID:
+        return "network"
+    if did == HOMEAI_PRIMARY_DEVICE_ID:
+        return AUDIO_OUTPUT_ROUTES.get(did, HOMEAI_DEFAULT_AUDIO_OUTPUT)
+    # Preserve A1R22 behavior for any future/unknown companion: prefer a bound
+    # speaker if present, otherwise use the companion itself.
+    return "auto"
+
+
+def _set_audio_output_mode_for_device(device_id: str, mode: str) -> bool:
+    did = str(device_id or "").strip()
+    target = str(mode or "").strip().lower()
+    if did != HOMEAI_PRIMARY_DEVICE_ID or target not in {"local", "network"}:
+        return False
+    AUDIO_OUTPUT_ROUTES[did] = target
+    _persist_audio_output_routes()
+    print(f"[AUDIO-ROUTE] preference device={did} mode={target}")
+    return True
 
 
 def _openclaw_user_for_device(device_id: str) -> str:
@@ -3716,23 +3791,138 @@ def _speaker_candidates_for(parent_device_id: str) -> list[ClientSession]:
 
 
 def _select_audio_sink(source: ClientSession) -> ClientSession:
-    """Resolve one live audio sink for one companion.
+    """Resolve the preferred live sink for one companion.
 
-    NetworkSpeaker devices bind themselves with parent_device_id. This supports
-    multiple speakers in the same Gateway without cross-routing:
-      speaker-A -> companion-A
-      speaker-B -> companion-B
-      Mini Dock -> homeai-mini-bedroom-01
+    HomeAgent (primary) has a persistent user-selectable route:
+      local   -> always use the built-in HomeAgent speaker
+      network -> use its bound NetworkSpeaker when online
 
-    If no bound speaker is live, audio falls back to the companion itself.
+    HomeAgentMini is hard-locked to network mode. The strict "no local
+    fallback" rule is enforced by ``send_pcm_to_routed_sink`` so callers can
+    still inspect the preferred sink without changing the session type.
+
+    Unknown future companions preserve the A1R22 automatic behavior.
     """
     if not _is_companion_session(source):
         return source
 
-    candidates = _speaker_candidates_for(source.device_id)
-    if not candidates:
+    mode = _audio_output_mode_for_device(source.device_id)
+    if mode == "local":
         return source
-    return candidates[0]
+
+    candidates = _speaker_candidates_for(source.device_id)
+    if candidates:
+        return candidates[0]
+    return source
+
+
+@dataclass(frozen=True)
+class AudioOutputIntent:
+    operation: str
+    target: str = ""
+
+
+def _parse_audio_output_intent(transcript: str) -> AudioOutputIntent | None:
+    text = str(transcript or "").strip()
+    if not text:
+        return None
+
+    compact = re.sub(r"[\s，。,.！!？?、：:；;“”\"'（）()]+", "", text).lower()
+
+    query_phrases = (
+        "现在用哪个喇叭", "当前用哪个喇叭", "现在是哪个喇叭",
+        "当前发声设备", "现在发声设备", "当前输出设备",
+        "声音从哪里出来", "现在从哪里发声", "你现在从哪里出声", "现在谁在发声",
+        "现在用的是本机还是网络喇叭", "现在用的是哪个音箱",
+    )
+    if any(phrase in compact for phrase in query_phrases):
+        return AudioOutputIntent("get")
+
+    local_tokens = (
+        "本机喇叭", "本地喇叭", "机身喇叭", "本机扬声器",
+        "本地扬声器", "自带喇叭", "自己的喇叭", "你自己的喇叭",
+        "homeagent喇叭", "homeagent扬声器",
+    )
+    network_tokens = (
+        "networkspeaker", "网络喇叭", "网络音箱", "网络扬声器",
+        "duck喇叭", "duck音箱",
+    )
+    action_tokens = (
+        "切到", "切换到", "切回", "换到", "改到", "改用",
+        "使用", "用本", "用网", "用你自己", "用自己", "从本", "从网", "走本", "走网",
+        "输出到",
+    )
+
+    has_action = any(token in compact for token in action_tokens)
+    if has_action and any(token in compact for token in local_tokens):
+        return AudioOutputIntent("set", "local")
+    if has_action and any(token in compact for token in network_tokens):
+        return AudioOutputIntent("set", "network")
+
+    # Natural short forms after the wake word. Keep these explicit enough to
+    # avoid hijacking ordinary questions mentioning a speaker.
+    if compact in {
+        "逐光切回本机", "逐光切到本机", "逐光切换到本机", "逐光用本机喇叭",
+        "切回本机", "切到本机", "切换到本机", "用本机喇叭",
+    }:
+        return AudioOutputIntent("set", "local")
+    if compact in {
+        "逐光切到networkspeaker", "逐光用网络喇叭", "切到networkspeaker",
+        "用网络喇叭", "切回网络喇叭",
+    }:
+        return AudioOutputIntent("set", "network")
+    return None
+
+
+async def _apply_audio_output_voice_command(
+    source: ClientSession,
+    transcript: str,
+) -> str | None:
+    intent = _parse_audio_output_intent(transcript)
+    if intent is None:
+        return None
+
+    if source.device_id == HOMEAI_MINI_DEVICE_ID:
+        speakers = _speaker_candidates_for(source.device_id)
+        online = bool(speakers)
+        if intent.operation == "get":
+            return (
+                "HomeAgentMini 固定使用 NetworkSpeaker 发声，当前网络喇叭在线。"
+                if online
+                else "HomeAgentMini 固定使用 NetworkSpeaker 发声，不过当前网络喇叭不在线。"
+            )
+        if intent.target == "local":
+            return "HomeAgentMini 不支持切换到本机喇叭，只能使用 NetworkSpeaker 发声。"
+        return (
+            "HomeAgentMini 已经固定使用 NetworkSpeaker，无需切换。"
+            if online
+            else "HomeAgentMini 固定使用 NetworkSpeaker，不过当前网络喇叭不在线。"
+        )
+
+    # Only the primary HomeAgent exposes this user-facing switch. Unknown
+    # companions keep their existing routing behavior and let OpenClaw answer.
+    if source.device_id != HOMEAI_PRIMARY_DEVICE_ID:
+        return None
+
+    mode = _audio_output_mode_for_device(source.device_id)
+    speakers = _speaker_candidates_for(source.device_id)
+    network_online = bool(speakers)
+
+    if intent.operation == "get":
+        if mode == "local":
+            return "现在使用的是 HomeAgent 本机喇叭。"
+        if network_online:
+            return "现在使用的是 NetworkSpeaker。"
+        return "当前设置为 NetworkSpeaker，不过它现在不在线，暂时由 HomeAgent 本机喇叭发声。"
+
+    if intent.target == "local":
+        _set_audio_output_mode_for_device(source.device_id, "local")
+        return "好的，已经切到 HomeAgent 本机喇叭。"
+
+    _set_audio_output_mode_for_device(source.device_id, "network")
+    if network_online:
+        return "好的，已经切到 NetworkSpeaker。"
+    return "已经切到 NetworkSpeaker 模式，不过它现在不在线，暂时由 HomeAgent 本机喇叭发声；连接恢复后会自动切回网络喇叭。"
 
 
 @dataclass(frozen=True)
@@ -5058,18 +5248,24 @@ async def send_pcm_to_routed_sink(
     pcm: bytes,
     sample_rate: int,
 ) -> ClientSession:
-    """Play one reply on the speaker bound to `source`, if one is online.
+    """Play one reply according to the companion's audio-output policy.
 
-    The companion remains the owner of UI/conversation state. The speaker only
-    receives the existing TTS PCM protocol and playback acknowledgements.
+    HomeAgent may use either its local speaker or a bound NetworkSpeaker.
+    HomeAgentMini is NetworkSpeaker-only and never falls back to local audio.
     """
     sink = _select_audio_sink(source)
+    mode = _audio_output_mode_for_device(source.device_id)
+
     if sink is source:
+        if source.device_id == HOMEAI_MINI_DEVICE_ID:
+            raise RuntimeError(
+                "HomeAgentMini requires a bound NetworkSpeaker; local playback is disabled"
+            )
         await send_pcm_for_playback(source, pcm, sample_rate)
         return source
 
     print(
-        f"[AUDIO-ROUTE] source={source.device_id} "
+        f"[AUDIO-ROUTE] source={source.device_id} mode={mode} "
         f"-> speaker={sink.device_id} priority={sink.audio_priority}"
     )
     try:
@@ -5082,8 +5278,16 @@ async def send_pcm_to_routed_sink(
         )
         return sink
     except Exception as exc:
-        # A dock/speaker disappearing must not lose the answer. Fall back to the
-        # companion's existing speaker path for this turn.
+        if source.device_id == HOMEAI_MINI_DEVICE_ID:
+            print(
+                f"[AUDIO-ROUTE-ERROR] mini speaker={sink.device_id} failed; "
+                f"local fallback forbidden: {type(exc).__name__}: {exc}"
+            )
+            raise
+
+        # HomeAgent keeps answer availability: if a selected NetworkSpeaker
+        # disappears during a turn, play this turn locally. The saved route
+        # remains "network", so a later reconnect automatically restores it.
         print(
             f"[AUDIO-ROUTE-WARN] speaker={sink.device_id} failed; "
             f"fallback={source.device_id}: {type(exc).__name__}: {exc}"
@@ -5317,8 +5521,8 @@ async def process_utterance(session: ClientSession) -> None:
         await send_state(session.ws, "thinking")
 
         if MODE == "loopback":
-            # Loopback acceptance mode: the user should hear their own voice.
-            await send_pcm_for_playback(session, pcm, MIC_RATE)
+            # Loopback acceptance mode still respects the product audio route.
+            await send_pcm_to_routed_sink(session, pcm, MIC_RATE)
             session.processing = False
             await send_state(session.ws, "idle")
             return
@@ -5339,7 +5543,12 @@ async def process_utterance(session: ClientSession) -> None:
         await send_json(session.ws, {"type": "asr.result", "text": transcript})
 
         agent_started = time.perf_counter()
-        answer = await _apply_speaker_volume_voice_command(session, transcript)
+        answer = await _apply_audio_output_voice_command(session, transcript)
+        local_command = "audio-route" if answer is not None else ""
+        if answer is None:
+            answer = await _apply_speaker_volume_voice_command(session, transcript)
+            if answer is not None:
+                local_command = "volume"
         if answer is None:
             print(
                 f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
@@ -5352,6 +5561,8 @@ async def process_utterance(session: ClientSession) -> None:
                 openclaw_user=session.openclaw_user,
             )
             print("[STAGE] OpenClaw returned")
+        elif local_command == "audio-route":
+            print(f"[AUDIO-ROUTE-VOICE] handled locally transcript={transcript!r}")
         else:
             print(f"[VOLUME-VOICE] handled locally transcript={transcript!r}")
         agent_ms = int((time.perf_counter() - agent_started) * 1000)
