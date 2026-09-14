@@ -2,9 +2,10 @@ Import("env")
 
 from pathlib import Path
 import shutil
+import re
 
 PROJECT = Path(env["PROJECT_DIR"])
-print("[ESP-SR-CN] patcher=guarded-cn-multinet+a1r25a1-evidence")
+print("[ESP-SR-CN] patcher=guarded-cn-multinet+a1r25b1.3-sr-rollback-stable")
 TARGET = PROJECT / ".pio-local" / "ESP-SR-For-M5Unified" / "src" / "esp32-hal-sr-m5.c"
 BACKUP = TARGET.with_name(TARGET.name + ".homeai-a4.4.12.prepatch")
 CN_MARKER = "HOMEAI_A4_4_10_MULTINET_CN"
@@ -12,6 +13,8 @@ GUARD_MARKER = "HOMEAI_A4_4_12_MULTINET_ONLY_GUARDED"
 LEGACY_GUARD_MARKER = "HOMEAI_A4_4_11_MULTINET_ONLY_GUARDED"
 OBS_MARKER = "HOMEAI_A1R25A_MULTINET_OBSERVATORY"
 OBS_RESULT_ANCHOR = "int sr_command_id = mn_result->command_id[0];"
+B2_PROB_EXPORT_MARKER = "HOMEAI_A1R25B2_PROB_EXPORT"
+B2_PROB_ASSIGN_MARKER = "HOMEAI_A1R25B2_PROB_ASSIGN"
 
 
 START_ANCHOR = "esp_err_t sr_start_m5(\n"
@@ -179,6 +182,49 @@ if not TARGET.is_file():
     )
 
 text = TARGET.read_text(encoding="utf-8")
+
+# A1R25B1.3 rollback cleanup.
+# A1R25B2/B2.1 experimentally exported the top MultiNet probability from the
+# low-level ESP-SR wrapper. Wake recall regressed in real-device testing, so
+# remove ONLY those two marked additions and restore the previous A1R25A.1
+# observe-only wrapper behavior. Keep .pio-local itself intact.
+rollback_changed = False
+
+export_pattern = re.compile(
+    rf"/\* {re.escape(B2_PROB_EXPORT_MARKER)}: diagnostics-only top probability export\. \*/\n"
+    r"static volatile int homeai_sr_last_prob_x10000_m5 = -1;\n"
+    r"int homeai_sr_get_last_prob_x10000_m5\(void\)\n"
+    r"\{\n"
+    r"  return homeai_sr_last_prob_x10000_m5;\n"
+    r"\}\n\n"
+)
+text, export_count = export_pattern.subn("", text)
+if export_count > 1:
+    raise RuntimeError("[ESP-SR-CN] multiple A1R25B2 probability export helpers found; refusing unsafe rollback")
+if export_count == 1:
+    rollback_changed = True
+    print("[ESP-SR-CN] rollback removed A1R25B2 probability export helper")
+
+assign_pattern = re.compile(
+    r"^[ \t]*if \(homeai_obs_i == 0\) \{ homeai_sr_last_prob_x10000_m5 = homeai_prob_x10000; \}"
+    r"[ \t]*/\* " + re.escape(B2_PROB_ASSIGN_MARKER) + r" \*/\n",
+    re.MULTILINE,
+)
+text, assign_count = assign_pattern.subn("", text)
+if assign_count > 1:
+    raise RuntimeError("[ESP-SR-CN] multiple A1R25B2 probability assignments found; refusing unsafe rollback")
+if assign_count == 1:
+    rollback_changed = True
+    print("[ESP-SR-CN] rollback removed A1R25B2 probability assignment")
+
+if B2_PROB_EXPORT_MARKER in text or B2_PROB_ASSIGN_MARKER in text:
+    raise RuntimeError("[ESP-SR-CN] A1R25B2 probability markers remain after rollback")
+
+if rollback_changed:
+    TARGET.write_text(text, encoding="utf-8")
+    print("[ESP-SR-CN] rollback PASS: restored pre-A1R25B2 low-level SR instrumentation")
+else:
+    print("[ESP-SR-CN] rollback not needed: A1R25B2 low-level probability taps absent")
 
 # Remove the withdrawn candidate-threshold experiment if it is still present.
 # Never replace or delete .pio-local; only remove the known marked block.

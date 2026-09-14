@@ -1,3 +1,23 @@
+# KitchenTerminal A3.0c UI1 (2026-09-14)
+
+- User-visible KitchenTerminal name changed to `小K`.
+- Added a single top safe-area at the outer `#app` container:
+  `calc(env(safe-area-inset-top, 0px) + 18px)`.
+- Internal KitchenTerminal protocol/device IDs and voice command namespace remain unchanged.
+- Removed macOS archive metadata and added a root `.gitignore`.
+- No StickS3 firmware, OpenClaw, NetworkSpeaker, timer, recipe-progress, microphone, TTS, HTTPS/Tailscale, or kitchen-control behavior changed.
+
+# A1R25B1.3 SR Rollback Stable (2026-09-14)
+
+- Restore the device runtime to the user's latest known-working project baseline.
+- Remove only the persisted A1R25B2/B2.1 low-level ESP-SR probability-export experiment from `.pio-local` during the next build.
+- Keep the existing A1R25A.1 `[WAKE-MN]` observe-only probability logging.
+- No Wake Guard is enabled in this rollback build.
+- Wake phrase remains `你好逐光`.
+- Wake PGA remains 6 dB.
+- Glass2 active brightness remains 96.
+- Latest Gateway/OpenClaw/NetworkSpeaker code from the user's uploaded project is preserved unchanged.
+
 # A1R25B1.1 Glass2 Half Brightness
 
 - Glass2 active brightness changed from 255 to 128 (about 50%).
