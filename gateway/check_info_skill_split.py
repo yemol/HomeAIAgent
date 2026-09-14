@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import json
 import companion_gateway as gateway
 
 async def one(category: str):
@@ -16,7 +15,7 @@ async def one(category: str):
     return body, items
 
 async def main() -> int:
-    print("=== HomeAIAgent A4.4 split Info Skill check ===")
+    print("=== HomeAIAgent split Info Skill check ===")
     total = 0
     for category in ("game", "finance"):
         try:

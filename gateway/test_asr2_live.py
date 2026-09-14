@@ -13,10 +13,10 @@ sys.modules[name] = m
 assert spec.loader
 spec.loader.exec_module(m)
 
-wav_path = base / "latest_input.wav"
+wav_path = m.HOMEAI_DEBUG_DIR / "latest_input.wav"
 if not wav_path.exists():
     raise SystemExit(
-        "latest_input.wav 不存在。先让设备录一次音，或把测试 WAV 放到 gateway/latest_input.wav"
+        f"latest_input.wav 不存在。先让设备录一次音；默认路径：{m.HOMEAI_DEBUG_DIR / 'latest_input.wav'}"
     )
 
 async def main():

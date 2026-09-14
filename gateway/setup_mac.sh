@@ -13,105 +13,60 @@ echo " Config : $HOMEAI_CONFIG_FILE"
 echo " Runtime: $HOMEAI_VENV"
 echo
 
-# 1) Persistent runtime.
 homeai_bootstrap_runtime "./requirements.txt"
-
-# 2) One-time persistent config migration / creation.
 homeai_migrate_legacy_env "./.env"
 
 if [ -f "$HOMEAI_CONFIG_FILE" ]; then
   chmod 600 "$HOMEAI_CONFIG_FILE"
   echo "[OK] Existing persistent config retained."
   echo "[OK] API keys/tokens were NOT overwritten."
-else
-  mkdir -p "$HOMEAI_CONFIG_DIR"
 
-  echo
-  echo "[1/2] 豆包语音 API Key"
+  MISSING="$(homeai_missing_required_config || true)"
+  if [ -n "$MISSING" ]; then
+    echo "[MIGRATE] Existing config predates the current embedded-SSH schema."
+    echo "$MISSING" | while IFS= read -r key; do
+      [ -n "$key" ] && echo "          missing: $key"
+    done
+    echo "[MIGRATE] Launching one-time persistent config repair..."
+    ./configure_mac.sh
+  fi
+else
+  echo "[1/4] Volcengine speech API key"
   read -s "VOLC_KEY?VOLCENGINE_API_KEY: "
   echo
-  if [ -z "$VOLC_KEY" ]; then
-    echo "[FAIL] VOLCENGINE_API_KEY 不能为空。"
-    exit 3
-  fi
+  [ -n "$VOLC_KEY" ] || { echo "[FAIL] VOLCENGINE_API_KEY cannot be empty."; exit 3; }
 
+  echo "[2/4] OpenClaw Gateway token"
+  read -s "OPENCLAW_KEY?OPENCLAW_TOKEN: "
   echo
-  echo "[2/2] Air OpenClaw Gateway token"
-  read -s "OPENCLAW_KEY?OpenClaw token: "
-  echo
-  if [ -z "$OPENCLAW_KEY" ]; then
-    echo "[FAIL] OPENCLAW_TOKEN 不能为空。"
-    exit 4
-  fi
+  [ -n "$OPENCLAW_KEY" ] || { echo "[FAIL] OPENCLAW_TOKEN cannot be empty."; exit 4; }
 
-  TMP="$HOMEAI_CONFIG_FILE.tmp"
-  cat > "$TMP" <<EOF
-P0_MODE=full
-GATEWAY_HOST=0.0.0.0
-GATEWAY_PORT=8765
-GATEWAY_PATH=/companion
+  echo "[3/4] OpenClaw SSH user"
+  read "SSH_USER?SSH user: "
+  [ -n "$SSH_USER" ] || { echo "[FAIL] OPENCLAW_SSH_USER cannot be empty."; exit 5; }
 
-ASR_PROVIDER=volcengine
-TTS_PROVIDER=volcengine
-ASR_FALLBACK=none
-TTS_FALLBACK=none
+  echo "[4/4] OpenClaw SSH host"
+  read "SSH_HOST?Tailscale IP / hostname: "
+  [ -n "$SSH_HOST" ] || { echo "[FAIL] OPENCLAW_SSH_HOST cannot be empty."; exit 6; }
 
-VOLCENGINE_API_KEY=${VOLC_KEY}
-
-VOLCENGINE_ASR_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
-VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
-VOLCENGINE_ASR_CHUNK_MS=200
-VOLCENGINE_ASR_SEND_INTERVAL_MS=100
-VOLCENGINE_ASR_ENABLE_NONSTREAM=true
-VOLCENGINE_ASR_END_WINDOW_MS=800
-VOLCENGINE_ASR_FORCE_TO_SPEECH_MS=1000
-VOLCENGINE_ASR_CONNECT_TIMEOUT=8
-VOLCENGINE_ASR_FINAL_TIMEOUT=12
-
-VOLCENGINE_TTS_ENDPOINT=wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream
-VOLCENGINE_TTS_RESOURCE_ID=seed-tts-2.0
-VOLCENGINE_TTS_VOICE=zh_female_vv_uranus_bigtts
-VOLCENGINE_TTS_SAMPLE_RATE=16000
-VOLCENGINE_TTS_SPEECH_RATE=0
-VOLCENGINE_TTS_LOUDNESS_RATE=0
-
-DEVICE_TTS_SEGMENT_MAX_BYTES=786432
-DEVICE_TTS_PLAYBACK_MARGIN_SEC=15
-
-OPENAI_API_KEY=
-
-OPENCLAW_BASE_URL=http://127.0.0.1:18790
-OPENCLAW_TOKEN=${OPENCLAW_KEY}
-OPENCLAW_MODEL=openclaw/default
-OPENCLAW_USER=home-ai-agent:main
-MAX_AGENT_CHARS=600
-
-OPENCLAW_TRANSPORT=embedded_ssh
-OPENCLAW_SSH_USER=yuanxiang
-OPENCLAW_SSH_HOST=100.105.66.46
-OPENCLAW_LOCAL_PORT=18790
-OPENCLAW_REMOTE_PORT=18789
-OPENCLAW_SSH_CONNECT_TIMEOUT_SEC=10
-OPENCLAW_SSH_RECONNECT_MIN_SEC=2
-OPENCLAW_SSH_RECONNECT_MAX_SEC=30
-OPENCLAW_SSH_STARTUP_WAIT_SEC=15
-EOF
-  chmod 600 "$TMP"
-  mv "$TMP" "$HOMEAI_CONFIG_FILE"
-  unset VOLC_KEY OPENCLAW_KEY
-  echo "[OK] Persistent config created."
+  mkdir -p "$HOMEAI_CONFIG_DIR"
+  cp ./gateway.env.example "$HOMEAI_CONFIG_FILE"
+  chmod 600 "$HOMEAI_CONFIG_FILE"
+  homeai_upsert_config_value VOLCENGINE_API_KEY "$VOLC_KEY"
+  homeai_upsert_config_value OPENCLAW_TOKEN "$OPENCLAW_KEY"
+  homeai_upsert_config_value OPENCLAW_SSH_USER "$SSH_USER"
+  homeai_upsert_config_value OPENCLAW_SSH_HOST "$SSH_HOST"
+  unset VOLC_KEY OPENCLAW_KEY SSH_USER SSH_HOST
+  echo "[OK] Persistent config created from gateway.env.example."
 fi
 
-homeai_apply_a46_voice_migration
-
+homeai_enforce_standard_voice
+homeai_activate_runtime "./requirements.txt"
+homeai_source_config
 python protocol_selftest.py
 
 echo
 echo "[READY]"
-echo " Config persists at:"
-echo "   $HOMEAI_CONFIG_FILE"
-echo " Python runtime persists at:"
-echo "   $HOMEAI_VENV"
-echo
-echo "Normal daily start:"
-echo "  ./run_full.sh"
+echo " Config persists at: $HOMEAI_CONFIG_FILE"
+echo " Python runtime persists at: $HOMEAI_VENV"
+echo " Daily start: ./run_full.sh"

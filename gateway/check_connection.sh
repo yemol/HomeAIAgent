@@ -7,7 +7,7 @@ source ./homeai_runtime.sh
 
 homeai_migrate_legacy_env "./.env"
 homeai_require_config
-homeai_apply_a46_voice_migration
+homeai_enforce_standard_voice
 homeai_activate_runtime "./requirements.txt"
 homeai_source_config
 

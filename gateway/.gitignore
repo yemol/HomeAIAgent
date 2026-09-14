@@ -1,0 +1,37 @@
+# Secrets / local configuration
+.env
+*.env.local
+gateway.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime/debug artifacts
+*.wav
+*.pcm
+*.raw
+*.log
+latest_*
+info_skill_startup_snapshots/
+kitchen_timers.json
+kitchen_progress.json
+notification_queue.json
+openclaw_voice_listener_state.json
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Archives/build outputs
+*.zip
+dist/
+build/

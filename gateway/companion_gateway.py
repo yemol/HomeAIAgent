@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """HomeAIAgent local Gateway for voice, OpenClaw, Info feed and display policy.
 
 Default speech path:
@@ -20,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import gzip
 import hashlib
 import io
@@ -40,16 +40,19 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from PIL import Image, ImageDraw, ImageFont
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 from dotenv import load_dotenv
 
 from openclaw_transport import OpenClawTransportConfig, OpenClawTransportManager
+from kitchen_menu import KitchenMenuError, load_kitchen_menu, match_recipe, recipe_for
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -115,6 +118,22 @@ HOMEAI_DATA_DIR = Path(
     )
 ).expanduser()
 
+# Runtime diagnostics stay outside the deployable source tree.
+HOMEAI_DEBUG_DIR = HOMEAI_DATA_DIR / "debug"
+
+# Keep routine logs compact. Verbose transport/UI chatter and Python tracebacks
+# can be re-enabled temporarily from the persistent environment when diagnosing.
+HOMEAI_LOG_VERBOSE = os.getenv("HOMEAI_LOG_VERBOSE", "false").strip().lower() in {"1", "true", "yes", "on"}
+HOMEAI_LOG_TRACEBACK = os.getenv("HOMEAI_LOG_TRACEBACK", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+def _vlog(message: str) -> None:
+    if HOMEAI_LOG_VERBOSE:
+        print(message)
+
+def _log_traceback() -> None:
+    if HOMEAI_LOG_TRACEBACK:
+        traceback.print_exc()
+
 INFO_SKILL_PROTOCOL = "homeai-info/1.1"
 INFO_MAX_ITEMS = 20
 INFO_GAME_LIMIT = 10
@@ -162,6 +181,17 @@ HOMEAI_DEFAULT_AUDIO_OUTPUT = os.getenv(
 ).strip().lower()
 if HOMEAI_DEFAULT_AUDIO_OUTPUT not in {"local", "network"}:
     HOMEAI_DEFAULT_AUDIO_OUTPUT = "network"
+
+# Once a turn starts on a NetworkSpeaker, keep that sink sticky for the whole
+# reply. A transient speaker WebSocket reconnect must never make the remaining
+# answer jump to the companion's built-in speaker.
+AUDIO_ROUTE_RECONNECT_GRACE_SEC = max(
+    0.5, float(os.getenv("HOMEAI_AUDIO_ROUTE_RECONNECT_GRACE_SEC", "8"))
+)
+AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS = max(1, int(
+    os.getenv("HOMEAI_AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS", "3")
+))
+AUDIO_ROUTE_RECONNECT_POLL_SEC = 0.10
 
 INFO_FRAME_WIDTH = 128
 INFO_FRAME_HEIGHT = 64
@@ -245,6 +275,38 @@ HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.getenv("GATEWAY_PORT", "8765"))
 WS_PATH = os.getenv("GATEWAY_PATH", "/companion")
 MODE = os.getenv("P0_MODE", "full").strip().lower()
+
+# KitchenTerminal A3.0b FIX1. The iPad loads its UI from this same Gateway process.
+# KitchenTerminal includes the validated “问逐光” PTT Q&A pipeline.
+KITCHEN_PROTOCOL = "homeai-kitchen/1.9"
+KITCHEN_UI_VERSION = "A3.0b FIX1 R12"
+KITCHEN_HTTP_PATH = os.getenv("HOMEAI_KITCHEN_HTTP_PATH", "/kitchen").strip() or "/kitchen"
+KITCHEN_WS_PATH = os.getenv("HOMEAI_KITCHEN_WS_PATH", "/kitchen/ws").strip() or "/kitchen/ws"
+KITCHEN_CONTROL_PATH = os.getenv("HOMEAI_KITCHEN_CONTROL_PATH", "/kitchen/control").strip() or "/kitchen/control"
+KITCHEN_DEVICE_ID = os.getenv("HOMEAI_KITCHEN_DEVICE_ID", "KitchenTerminal-iPadMini").strip() or "KitchenTerminal-iPadMini"
+KITCHEN_MENU_DIR = Path(
+    os.getenv(
+        "HOMEAI_KITCHEN_MENU_DIR",
+        str(Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/自媒体工作流/晚餐推荐"),
+    )
+).expanduser()
+KITCHEN_TIMER_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_timers.json"
+KITCHEN_PROGRESS_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_progress.json"
+KITCHEN_IDLE_RETURN_DELAY_SEC = max(30, int(os.getenv("HOMEAI_KITCHEN_IDLE_RETURN_DELAY_SEC", "240")))
+KITCHEN_TIMER_MIN_SEC = max(1, int(os.getenv("HOMEAI_KITCHEN_TIMER_MIN_SEC", "5")))
+KITCHEN_TIMER_MAX_SEC = max(60, int(os.getenv("HOMEAI_KITCHEN_TIMER_MAX_SEC", str(99 * 60 + 59))))
+KITCHEN_AUDIO_TTL_SEC = max(30, int(os.getenv("HOMEAI_KITCHEN_AUDIO_TTL_SEC", "600")))
+KITCHEN_QA_MAX_SEC = max(5, min(45, int(os.getenv("HOMEAI_KITCHEN_QA_MAX_SEC", "25"))))
+KITCHEN_QA_MAX_BYTES = max(128 * 1024, min(2 * 1024 * 1024 - 4096, int(os.getenv("HOMEAI_KITCHEN_QA_MAX_BYTES", "1500000"))))
+KITCHEN_AUDIO_CACHE_MAX = max(2, int(os.getenv("HOMEAI_KITCHEN_AUDIO_CACHE_MAX", "8")))
+KITCHEN_FINISHED_TIMER_TTL_SEC = max(60, int(os.getenv("HOMEAI_KITCHEN_FINISHED_TIMER_TTL_SEC", "1800")))
+KITCHEN_PRIVATE_RECIPE_DIR = Path(
+    os.getenv(
+        "HOMEAI_KITCHEN_PRIVATE_RECIPE_DIR",
+        str(KITCHEN_MENU_DIR.parent / "私房菜"),
+    )
+).expanduser()
+
 
 # HomeAIAgent Notification A1. OpenClaw background reminders already land in
 # the same stable voice session used by /v1/chat/completions. Instead of opening
@@ -351,6 +413,7 @@ MAX_AGENT_CHARS = int(os.getenv("MAX_AGENT_CHARS", "600"))
 
 def _best_effort_write_bytes(path: Path, data: bytes) -> None:
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
     except OSError as exc:
         print(f"[FILE-WARN] write_bytes failed path={path} error={type(exc).__name__}: {exc}")
@@ -358,6 +421,7 @@ def _best_effort_write_bytes(path: Path, data: bytes) -> None:
 
 def _best_effort_write_text(path: Path, text: str) -> None:
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
         print(f"[FILE-WARN] write_text failed path={path} error={type(exc).__name__}: {exc}")
@@ -775,6 +839,23 @@ OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "")
 OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
 OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
+OPENCLAW_CHAT_TIMEOUT_SEC = max(30.0, float(os.getenv("OPENCLAW_CHAT_TIMEOUT_SEC", "180")))
+OPENCLAW_KITCHEN_TIMEOUT_SEC = max(30.0, float(os.getenv("OPENCLAW_KITCHEN_TIMEOUT_SEC", "180")))
+OPENCLAW_INFO_TIMEOUT_SEC = max(60.0, float(os.getenv("OPENCLAW_INFO_TIMEOUT_SEC", "300")))
+
+
+def _openclaw_http_trust_env() -> bool:
+    """Bypass HTTP(S)_PROXY for loopback OpenClaw endpoints."""
+    try:
+        host = (urlsplit(OPENCLAW_BASE_URL).hostname or "").strip().lower()
+    except Exception:
+        host = ""
+    return host not in {"127.0.0.1", "localhost", "::1"}
+
+
+def _openclaw_http_client(timeout: float) -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=timeout, trust_env=_openclaw_http_trust_env())
+
 
 # Multi-device conversation router.
 #
@@ -928,8 +1009,8 @@ def _openclaw_user_for_device(device_id: str) -> str:
 # the OpenClaw host can switch OPENCLAW_TRANSPORT=direct without changing the
 # StickS3 protocol.
 OPENCLAW_TRANSPORT = os.getenv("OPENCLAW_TRANSPORT", "embedded_ssh").strip().lower()
-OPENCLAW_SSH_USER = os.getenv("OPENCLAW_SSH_USER", "yuanxiang").strip() or "yuanxiang"
-OPENCLAW_SSH_HOST = os.getenv("OPENCLAW_SSH_HOST", "100.105.66.46").strip()
+OPENCLAW_SSH_USER = os.getenv("OPENCLAW_SSH_USER", "").strip()
+OPENCLAW_SSH_HOST = os.getenv("OPENCLAW_SSH_HOST", "").strip()
 OPENCLAW_LOCAL_PORT = int(os.getenv("OPENCLAW_LOCAL_PORT", "18790"))
 OPENCLAW_REMOTE_PORT = int(os.getenv("OPENCLAW_REMOTE_PORT", "18789"))
 OPENCLAW_SSH_CONNECT_TIMEOUT_SEC = max(2.0, float(os.getenv("OPENCLAW_SSH_CONNECT_TIMEOUT_SEC", "10")))
@@ -990,7 +1071,6 @@ OPENCLAW_GATEWAY_WS_URL = os.getenv("OPENCLAW_GATEWAY_WS_URL", "").strip()
 OPENCLAW_GATEWAY_PROTOCOL = int(os.getenv("OPENCLAW_GATEWAY_PROTOCOL", "4"))
 
 MIC_RATE = 16000
-MIC_CHANNELS = 1
 MIC_SAMPLE_WIDTH = 2
 TTS_CHUNK_BYTES = 8192
 MAX_INPUT_BYTES = MIC_RATE * MIC_SAMPLE_WIDTH * 20  # 20 s hard server guard
@@ -1004,6 +1084,25 @@ DEVICE_TTS_SEGMENT_MAX_BYTES = int(
 DEVICE_TTS_PLAYBACK_MARGIN_SEC = float(
     os.getenv("DEVICE_TTS_PLAYBACK_MARGIN_SEC", "15")
 )
+
+# NetworkSpeaker (ESP32-C3) uses a deliberately gentler transport profile than
+# the PSRAM-equipped StickS3. The shared 768 KiB / two-slot prebuffer was
+# originally tuned for StickS3; on NetworkSpeaker, long replies can otherwise
+# create a large burst while it is simultaneously doing Wi-Fi RX + I2S output.
+# 256 KiB @ PCM16 mono 16 kHz = 8.192 s per segment. Two queued slots therefore
+# keep ~16 s of audio ahead while cutting each refill burst by 3x.
+NETWORK_SPEAKER_TTS_SEGMENT_MAX_BYTES = int(
+    os.getenv("NETWORK_SPEAKER_TTS_SEGMENT_MAX_BYTES", str(256 * 1024))
+)
+NETWORK_SPEAKER_TTS_CHUNK_BYTES = int(
+    os.getenv("NETWORK_SPEAKER_TTS_CHUNK_BYTES", "4096")
+)
+NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS = max(0, int(
+    os.getenv("NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS", "8")
+))
+NETWORK_SPEAKER_TTS_PACE_SEC = max(0.0, float(
+    os.getenv("NETWORK_SPEAKER_TTS_PACE_SEC", "0.001")
+))
 
 
 
@@ -1547,7 +1646,7 @@ async def _openclaw_gateway_rpc(
             "client": {
                 "id": "gateway-client",
                 "displayName": "HomeAIAgent Info Cleanup",
-                "version": "A4.4.18-RC1R13",
+                "version": KITCHEN_UI_VERSION,
                 "platform": sys.platform,
                 "mode": "backend",
             },
@@ -1631,7 +1730,7 @@ async def _openclaw_listener_connect(*, timeout: float = 15.0) -> Any:
             "client": {
                 "id": "gateway-client",
                 "displayName": "HomeAIAgent Session Listener",
-                "version": "A4.6-Notification-A1",
+                "version": KITCHEN_UI_VERSION,
                 "platform": sys.platform,
                 "mode": "backend",
             },
@@ -2018,7 +2117,7 @@ async def _openclaw_background_json(
     *,
     category: str,
     attempt: int | None = None,
-    timeout: float = 120,
+    timeout: float = OPENCLAW_INFO_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     session_key = _new_info_session_key(category)
     headers = {
@@ -2061,7 +2160,7 @@ async def _openclaw_background_json(
 
     body: dict[str, Any]
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with _openclaw_http_client(timeout) as client:
             try:
                 # Category-level retry already exists. Keep exactly one HTTP
                 # request per transient session key so a transport retry cannot
@@ -3204,82 +3303,6 @@ async def _sleep_until_not_early(target: datetime) -> None:
         await asyncio.sleep(min(remaining, 1.0))
 
 
-async def startup_info_refresh_before_ws() -> None:
-    # Startup freshness barrier:
-    # refresh game + finance BEFORE the WebSocket server starts accepting
-    # device connections. This guarantees the first device sync observes the
-    # freshly fetched feed when refresh succeeds, rather than racing against
-    # the startup polling task and receiving stale last-good first.
-    if not _openclaw_transport_ready():
-        print(
-            "[INFO-SKILL-WARN] OpenClaw transport unavailable at startup; "
-            "opening server with last-good cache and leaving SSH reconnect active"
-        )
-        return
-    startup_now = datetime.now(_info_schedule_tz())
-    startup_label = startup_now.strftime("startup-%Y-%m-%dT%H:%M:%S")
-    _begin_startup_info_snapshot(
-        startup_now,
-        trigger="startup",
-        slot_label=startup_label,
-    )
-    print(
-        f"[INFO-SKILL] startup barrier refresh start="
-        f"{startup_now.isoformat()} slot={startup_label}"
-    )
-    try:
-        changed = await refresh_info_from_skill(
-            force=True,
-            slot_label=startup_label,
-        )
-        failed = list(LAST_INFO_REFRESH_DIAGNOSTIC.get("failed") or [])
-        succeeded = list(LAST_INFO_REFRESH_DIAGNOSTIC.get("succeeded") or [])
-        if failed and succeeded:
-            snapshot_status = "partial"
-        elif failed and not succeeded:
-            snapshot_status = "last-good"
-        else:
-            snapshot_status = "success" if changed else "last-good"
-        if changed:
-            print(
-                f"[INFO-SKILL] startup barrier refresh READY "
-                f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
-            )
-        else:
-            print(
-                f"[INFO-SKILL-WARN] startup barrier refresh used last-good "
-                f"count={len(FEED_ITEMS)} revision={FEED_REVISION}"
-            )
-        _finish_startup_info_snapshot(
-            started_at=startup_now,
-            status=snapshot_status,
-            trigger="startup",
-            slot_label=startup_label,
-        )
-    except asyncio.CancelledError:
-        _finish_startup_info_snapshot(
-            started_at=startup_now,
-            status="cancelled",
-            error="asyncio.CancelledError",
-            trigger="startup",
-            slot_label=startup_label,
-        )
-        raise
-    except Exception as exc:
-        # Startup must remain available even if OpenClaw / Info Skill is
-        # temporarily unhealthy. The already-loaded last-good cache remains
-        # authoritative and will be sent once the server opens.
-        _finish_startup_info_snapshot(
-            started_at=startup_now,
-            status="error",
-            error=f"{type(exc).__name__}: {exc}",
-            trigger="startup",
-            slot_label=startup_label,
-        )
-        print(
-            f"[INFO-SKILL-ERROR] startup barrier refresh failure, "
-            f"opening server with last-good cache: {type(exc).__name__}: {exc}"
-        )
 
 
 async def info_skill_poll_loop() -> None:
@@ -3630,7 +3653,7 @@ async def send_info_sync(session: "ClientSession") -> None:
             "count": total,
         },
     )
-    print(f"[INFO] sync sent revision={FEED_REVISION} count={total}")
+    _vlog(f"[INFO] sync sent revision={FEED_REVISION} count={total}")
 
 
 @dataclass
@@ -3659,6 +3682,11 @@ class ClientSession:
     playback_done_event: asyncio.Event = field(default_factory=asyncio.Event)
     playback_error_event: asyncio.Event = field(default_factory=asyncio.Event)
     playback_slot_ready_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # Number of fully played segments confirmed by playback.slot_ready/done.
+    # This survives a transient disconnect long enough for the route layer to
+    # resume from the first unconfirmed segment on the reconnected speaker.
+    playback_completed_segments: int = 0
+    playback_total_segments: int = 0
 
     # NetworkSpeaker control ACKs. Commands are serialized by one companion
     # turn, but the request_id check still protects against stale frames.
@@ -3675,6 +3703,90 @@ class ClientSession:
     # the automatic night policy that can blank both local displays.
     glass2_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
     glass2_expected_command_id: str = ""
+
+
+@dataclass
+class KitchenSession:
+    ws: Any
+    device_id: str = KITCHEN_DEVICE_ID
+    hello_received: bool = False
+    connected_at: float = field(default_factory=time.time)
+    current_view: str = "idle"
+    current_item: str = ""
+    current_step: int = 0
+    # A3.0b one-shot Kitchen Q&A upload. The browser sends a 16 kHz mono WAV
+    # over a dedicated WSS connection; normal UI state remains HTTP-poll owned.
+    qa_receiving: bool = False
+    qa_processing: bool = False
+    qa_request_id: str = ""
+    qa_audio: bytearray = field(default_factory=bytearray)
+
+
+@dataclass
+class KitchenTimer:
+    timer_id: str
+    dish: str
+    step: int
+    duration_sec: int
+    status: str = "running"  # running | paused | finished
+    started_at: float = 0.0
+    ends_at: float = 0.0
+    paused_remaining_sec: int = 0
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    finished_at: float = 0.0
+    notified: bool = False
+
+
+KITCHEN_SESSIONS: list[KitchenSession] = []
+KITCHEN_CURRENT_VIEW: dict[str, Any] = {
+    "type": "kitchen.show_idle",
+    "title": "厨房终端",
+    "message": "等待逐光发送菜单",
+    "revision": "boot",
+}
+KITCHEN_CURRENT_MENU: dict[str, Any] | None = None
+KITCHEN_CURRENT_STATE: dict[str, Any] = {
+    "screen": "idle",
+    "date": "",
+    "dish": "",
+    "step": 0,
+}
+# Per-day, per-dish last viewed step. Gateway-owned so returning to a dish
+# continues where the cook left off, even after an iPad page reload or Gateway restart.
+KITCHEN_RECIPE_PROGRESS: dict[str, dict[str, int]] = {}
+KITCHEN_RETURN_IDLE_AT: float = 0.0
+
+# A3.0b Q&A state lives in Gateway so the iPad can recover by HTTP polling even
+# when its dedicated audio-upload WebSocket closes during ASR/OpenClaw/TTS.
+KITCHEN_QA_STATE: dict[str, Any] = {
+    "status": "idle",
+    "request_id": "",
+    "transcript": "",
+    "answer": "",
+    "error": "",
+    "audio_event_id": "",
+    "started_at": 0.0,
+    "updated_at": 0.0,
+}
+
+
+KITCHEN_TIMERS: dict[str, KitchenTimer] = {}
+
+# KitchenTerminal A3.0b FIX1 local-audio state. Audio is synthesized by the Gateway
+# and played by the iPad via Web Audio. The latest event is intentionally
+# ephemeral; menu voice should not unexpectedly replay hours later.
+KITCHEN_AUDIO_CACHE: dict[str, bytes] = {}
+KITCHEN_AUDIO_ORDER: list[str] = []
+KITCHEN_LATEST_AUDIO: dict[str, Any] = {
+    "event_id": "",
+    "text": "",
+    "kind": "",
+    "created_at": 0.0,
+    "expires_at": 0.0,
+    "provider": "",
+    "source_id": "",
+}
 
 
 def _is_speaker_session(session: ClientSession) -> bool:
@@ -3793,6 +3905,32 @@ def _speaker_candidates_for(parent_device_id: str) -> list[ClientSession]:
         reverse=True,
     )
     return candidates
+
+
+async def _wait_for_bound_speaker_reconnect(
+    *,
+    device_id: str,
+    parent_device_id: str,
+    previous: ClientSession,
+    timeout: float,
+) -> ClientSession | None:
+    """Wait briefly for the same NetworkSpeaker to establish a fresh session."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        for item in list(ACTIVE_SESSIONS):
+            if item is previous:
+                continue
+            if (
+                _is_speaker_session(item)
+                and item.hello_received
+                and item.device_id == device_id
+                and item.parent_device_id == parent_device_id
+                and not item.playback_sequence_active
+            ):
+                return item
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(AUDIO_ROUTE_RECONNECT_POLL_SEC)
 
 
 def _select_audio_sink(source: ClientSession) -> ClientSession:
@@ -4393,16 +4531,6 @@ def _volcengine_tts_headers(resource_id: str) -> dict[str, str]:
     }
 
 
-def _http_error_detail(response: httpx.Response) -> str:
-    text = response.text.strip()
-    if len(text) > 600:
-        text = text[:600] + "..."
-    return (
-        f"HTTP {response.status_code}; "
-        f"request_id={response.headers.get('X-Api-Request-Id','')}; "
-        f"logid={response.headers.get('X-Tt-Logid','')}; "
-        f"body={text}"
-    )
 
 
 # Volcengine Streaming ASR V1 binary framing.
@@ -4702,8 +4830,6 @@ _VOLC_TTS_EVENT_FINISH_CONNECTION = 2
 _VOLC_TTS_EVENT_CONNECTION_FINISHED = 52
 _VOLC_TTS_EVENT_SESSION_FINISHED = 152
 _VOLC_TTS_EVENT_SESSION_FAILED = 153
-_VOLC_TTS_EVENT_SENTENCE_START = 350
-_VOLC_TTS_EVENT_SENTENCE_END = 351
 _VOLC_TTS_EVENT_AUDIO = 352
 
 
@@ -4981,6 +5107,7 @@ def build_agent_prompt(transcript: str, context: dict[str, Any]) -> str:
     current = context.get("current") or {}
     previous = context.get("previous") or {}
     nxt = context.get("next") or {}
+    kitchen_context = _kitchen_agent_context_text()
     return f"""你正在作为一个屏幕挂件形态的家庭AI助手与用户语音交流。
 回答以自然中文口语为主，适合直接TTS播报。
 默认只回答 1～3 句，优先控制在 120 个中文字符左右；用户明确要求详细说明时才展开。
@@ -5002,6 +5129,13 @@ Glass2 当前资讯上下文：
 - 对 get_item 的固定调用语义是：tool=homeai_info.get_item，protocol=homeai-info/1.1，item_id=当前被指代资讯的 item_id。
 - 不要只凭屏幕标题或短摘要推测细节。
 - 如果用户不是在询问资讯，就按普通家庭助手请求处理，并可使用 OpenClaw 已配置的其他工具。
+
+{kitchen_context}
+
+KitchenTerminal 指代规则：
+- 当 KitchenTerminal 正在显示某道菜时，“这个 / 这道菜 / 现在这个”优先指当前菜品。
+- 当 KitchenTerminal 正在显示某一步时，“这个要多久 / 现在要怎么做 / 为什么这样做”等追问优先结合当前步骤和该菜完整做法回答。
+- 不要声称已经操作 KitchenTerminal，除非 Gateway 本地命令已经实际完成；普通知识问答只负责回答。
 
 用户说：{transcript}
 """
@@ -5033,7 +5167,7 @@ async def openclaw_chat(
                 {"role": "user", "content": build_agent_prompt(transcript, enrich_info_context(context))}
             ],
         }
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with _openclaw_http_client(OPENCLAW_CHAT_TIMEOUT_SEC) as client:
             r = await _post_with_retry(
                 client,
                 f"{OPENCLAW_BASE_URL}/v1/chat/completions",
@@ -5196,6 +5330,27 @@ def split_pcm_for_device(
     return [seg for seg in segments if seg]
 
 
+def _tts_segment_max_bytes_for_session(session: ClientSession) -> int:
+    if _is_speaker_session(session):
+        return max(32 * 1024, NETWORK_SPEAKER_TTS_SEGMENT_MAX_BYTES)
+    return DEVICE_TTS_SEGMENT_MAX_BYTES
+
+
+def _tts_chunk_bytes_for_session(session: ClientSession) -> int:
+    if _is_speaker_session(session):
+        return max(1024, NETWORK_SPEAKER_TTS_CHUNK_BYTES)
+    return TTS_CHUNK_BYTES
+
+
+def _tts_pacing_for_session(session: ClientSession) -> tuple[int, float]:
+    if _is_speaker_session(session):
+        return (
+            NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS,
+            NETWORK_SPEAKER_TTS_PACE_SEC,
+        )
+    return 0, 0.0
+
+
 async def _send_pcm_segment(
     session: ClientSession,
     pcm: bytes,
@@ -5203,6 +5358,9 @@ async def _send_pcm_segment(
     *,
     index: int,
     total: int,
+    chunk_bytes: int | None = None,
+    pace_every_chunks: int = 0,
+    pace_sec: float = 0.0,
 ) -> None:
     duration_sec = len(pcm) / max(1, sample_rate * 2)
 
@@ -5216,8 +5374,21 @@ async def _send_pcm_segment(
         "segment_total": total,
     })
 
-    for offset in range(0, len(pcm), TTS_CHUNK_BYTES):
-        await session.ws.send(pcm[offset:offset + TTS_CHUNK_BYTES])
+    if chunk_bytes is None:
+        chunk_bytes = TTS_CHUNK_BYTES
+    chunk_bytes = max(1024, int(chunk_bytes))
+    chunk_no = 0
+    for offset in range(0, len(pcm), chunk_bytes):
+        await session.ws.send(pcm[offset:offset + chunk_bytes])
+        chunk_no += 1
+        if (
+            pace_every_chunks > 0
+            and pace_sec > 0
+            and chunk_no % pace_every_chunks == 0
+        ):
+            # Tiny cooperative pacing keeps constrained ESP32-C3 receive/I2S
+            # tasks responsive without materially changing transfer latency.
+            await asyncio.sleep(pace_sec)
 
     await send_json(session.ws, {
         "type": "tts.end",
@@ -5225,7 +5396,7 @@ async def _send_pcm_segment(
         "segment_total": total,
     })
 
-    print(
+    _vlog(
         f"[TTS-PIPE] queued-to-device {index}/{total} "
         f"bytes={len(pcm)} duration={duration_sec:.2f}s"
     )
@@ -5276,7 +5447,14 @@ async def send_pcm_for_playback(
     *,
     emit_state: bool = True,
 ) -> None:
-    segments = split_pcm_for_device(pcm, sample_rate)
+    segment_max_bytes = _tts_segment_max_bytes_for_session(session)
+    chunk_bytes = _tts_chunk_bytes_for_session(session)
+    pace_every_chunks, pace_sec = _tts_pacing_for_session(session)
+    segments = split_pcm_for_device(
+        pcm,
+        sample_rate,
+        max_bytes=segment_max_bytes,
+    )
     if not segments:
         raise RuntimeError("empty TTS PCM")
 
@@ -5289,10 +5467,13 @@ async def send_pcm_for_playback(
 
     print(
         f"[TTS-PIPE] total_bytes={len(pcm)} duration={total_duration:.2f}s "
-        f"segments={total} max_segment={DEVICE_TTS_SEGMENT_MAX_BYTES}"
+        f"segments={total} max_segment={segment_max_bytes} "
+        f"chunk={chunk_bytes} role={session.device_role}"
     )
 
     session.playback_sequence_active = True
+    session.playback_total_segments = total
+    session.playback_completed_segments = 0
     session.playback_done_event.clear()
     session.playback_error_event.clear()
     session.playback_slot_ready_event.clear()
@@ -5312,6 +5493,9 @@ async def send_pcm_for_playback(
                 sample_rate,
                 index=idx + 1,
                 total=total,
+                chunk_bytes=chunk_bytes,
+                pace_every_chunks=pace_every_chunks,
+                pace_sec=pace_sec,
             )
 
         next_index = initial
@@ -5332,6 +5516,9 @@ async def send_pcm_for_playback(
                 sample_rate,
                 index=next_index + 1,
                 total=total,
+                chunk_bytes=chunk_bytes,
+                pace_every_chunks=pace_every_chunks,
+                pace_sec=pace_sec,
             )
             next_index += 1
 
@@ -5348,6 +5535,100 @@ async def send_pcm_for_playback(
 
     finally:
         session.playback_sequence_active = False
+
+
+async def _send_network_pcm_with_recovery(
+    sink: ClientSession,
+    pcm: bytes,
+    sample_rate: int,
+) -> ClientSession:
+    """Keep one reply pinned to the same NetworkSpeaker across reconnects.
+
+    R5 added single-reconnect recovery. A real ESP32-C3 failure can reconnect
+    and drop again during the resumed transfer, so a one-shot recovery still
+    truncates the reply. This loop permits a small bounded number of reconnects
+    while preserving the no-local-fallback rule.
+    """
+    current = sink
+    remaining_pcm = pcm
+    confirmed_global = 0
+    reconnects_used = 0
+
+    while True:
+        try:
+            await send_pcm_for_playback(
+                current,
+                remaining_pcm,
+                sample_rate,
+                emit_state=False,
+            )
+            return current
+        except Exception as exc:
+            attempt_segments = split_pcm_for_device(
+                remaining_pcm,
+                sample_rate,
+                max_bytes=_tts_segment_max_bytes_for_session(current),
+            )
+            completed_attempt = max(
+                0,
+                min(
+                    int(current.playback_completed_segments or 0),
+                    len(attempt_segments),
+                ),
+            )
+            confirmed_global += completed_attempt
+            remaining_pcm = b"".join(attempt_segments[completed_attempt:])
+            reconnects_used += 1
+
+            print(
+                f"[AUDIO-ROUTE-HOLD] speaker={current.device_id} disconnected; "
+                f"keep_sink=network confirmed_total={confirmed_global} "
+                f"reconnect={reconnects_used}/{AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS} "
+                f"grace={AUDIO_ROUTE_RECONNECT_GRACE_SEC:.1f}s "
+                f"error={type(exc).__name__}: {exc}"
+            )
+
+            if reconnects_used > AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS:
+                print(
+                    f"[AUDIO-ROUTE-ERROR] speaker={current.device_id} exceeded "
+                    f"reconnect limit={AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS}; "
+                    "local fallback suppressed to prevent mid-reply speaker switching"
+                )
+                raise RuntimeError(
+                    f"NetworkSpeaker {current.device_id} repeatedly disconnected "
+                    "during playback; local fallback suppressed"
+                ) from exc
+
+            replacement = await _wait_for_bound_speaker_reconnect(
+                device_id=current.device_id,
+                parent_device_id=current.parent_device_id,
+                previous=current,
+                timeout=AUDIO_ROUTE_RECONNECT_GRACE_SEC,
+            )
+            if replacement is None:
+                print(
+                    f"[AUDIO-ROUTE-ERROR] speaker={current.device_id} unavailable "
+                    f"after {AUDIO_ROUTE_RECONNECT_GRACE_SEC:.1f}s; "
+                    "local fallback suppressed to prevent mid-reply speaker switching"
+                )
+                raise RuntimeError(
+                    f"NetworkSpeaker {current.device_id} disconnected during playback; "
+                    "local fallback suppressed"
+                ) from exc
+
+            current = replacement
+            if not remaining_pcm:
+                print(
+                    f"[AUDIO-ROUTE-RECOVER] speaker={current.device_id} reconnected "
+                    "after all segments were already confirmed"
+                )
+                return current
+
+            print(
+                f"[AUDIO-ROUTE-RECOVER] speaker={current.device_id} reconnected; "
+                f"resume_after_confirmed={confirmed_global} "
+                f"reconnect={reconnects_used}/{AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS}"
+            )
 
 
 async def send_pcm_to_routed_sink(
@@ -5375,8 +5656,20 @@ async def send_pcm_to_routed_sink(
         f"[AUDIO-ROUTE] source={source.device_id} mode={mode} "
         f"-> speaker={sink.device_id} priority={sink.audio_priority}"
     )
+    await send_state(source.ws, "speaking")
+
+    strict_network = (
+        source.device_id == HOMEAI_MINI_DEVICE_ID
+        or mode == "network"
+    )
+    if strict_network:
+        return await _send_network_pcm_with_recovery(
+            sink,
+            pcm,
+            sample_rate,
+        )
+
     try:
-        await send_state(source.ws, "speaking")
         await send_pcm_for_playback(
             sink,
             pcm,
@@ -5385,18 +5678,10 @@ async def send_pcm_to_routed_sink(
         )
         return sink
     except Exception as exc:
-        if source.device_id == HOMEAI_MINI_DEVICE_ID:
-            print(
-                f"[AUDIO-ROUTE-ERROR] mini speaker={sink.device_id} failed; "
-                f"local fallback forbidden: {type(exc).__name__}: {exc}"
-            )
-            raise
-
-        # HomeAgent keeps answer availability: if a selected NetworkSpeaker
-        # disappears during a turn, play this turn locally. The saved route
-        # remains "network", so a later reconnect automatically restores it.
+        # Automatic routing for future/unknown companions keeps the legacy
+        # availability fallback. Explicit `network` mode is sticky above.
         print(
-            f"[AUDIO-ROUTE-WARN] speaker={sink.device_id} failed; "
+            f"[AUDIO-ROUTE-WARN] speaker={sink.device_id} failed in auto mode; "
             f"fallback={source.device_id}: {type(exc).__name__}: {exc}"
         )
         await send_pcm_for_playback(source, pcm, sample_rate)
@@ -5588,6 +5873,38 @@ async def reminder_dispatch_loop() -> None:
             await asyncio.sleep(1.0)
 
 
+def _is_kitchen_related_utterance(transcript: str, *, local_command: str = "") -> bool:
+    if str(local_command or "").startswith("kitchen"):
+        return True
+    text = str(transcript or "").strip()
+    if not text:
+        return False
+    if any(token in text for token in (
+        "厨房终端", "厨房屏", "今天的菜单", "今日菜单", "晚餐菜单", "菜谱", "购物清单",
+        "烧菜顺序", "烹饪顺序", "计时", "定时", "下一步", "上一步", "返回菜单",
+        "结束今日烹饪", "结束今天的烹饪", "今天做完了", "私房菜", "保存菜谱",
+    )):
+        return True
+    if KITCHEN_CURRENT_MENU is not None:
+        compact = re.sub(r"[\s，。！？、,.!?]", "", text)
+        for recipe in KITCHEN_CURRENT_MENU.get("recipes") or []:
+            name = re.sub(r"[\s，。！？、,.!?]", "", str(recipe.get("name") or ""))
+            if name and name in compact:
+                return True
+            for width in (4, 3, 2):
+                if len(name) >= width and name[-width:] in compact:
+                    return True
+    active_recipe = KITCHEN_CURRENT_STATE.get("screen") == "recipe" and bool(KITCHEN_CURRENT_STATE.get("dish"))
+    if not active_recipe:
+        return False
+    deictic = any(token in text for token in ("这个", "这道菜", "这一步", "现在这个", "当前这个"))
+    cooking = any(token in text for token in (
+        "多久", "怎么做", "怎么烧", "怎么煮", "怎么炒", "怎么烤", "怎么炖", "火候", "大火", "小火",
+        "中火", "几分钟", "几秒", "熟", "咸", "淡", "调味", "加盐", "放多少", "食材", "步骤",
+    ))
+    return deictic or cooking
+
+
 async def process_utterance(session: ClientSession) -> None:
     if session.processing:
         return
@@ -5599,7 +5916,7 @@ async def process_utterance(session: ClientSession) -> None:
             raise RuntimeError("recording too short")
 
         wav_bytes = pcm_to_wav_bytes(pcm)
-        _best_effort_write_bytes(BASE_DIR / "latest_input.wav", wav_bytes)
+        _best_effort_write_bytes(HOMEAI_DEBUG_DIR / "latest_input.wav", wav_bytes)
 
         safe_mode = (
             session.diag_glass_mode.lower()
@@ -5607,7 +5924,7 @@ async def process_utterance(session: ClientSession) -> None:
             .replace(" ", "_")
             .replace("/", "_")
         )
-        mode_path = BASE_DIR / f"latest_input_{safe_mode}.wav"
+        mode_path = HOMEAI_DEBUG_DIR / f"latest_input_{safe_mode}.wav"
         _best_effort_write_bytes(mode_path, wav_bytes)
 
         print(
@@ -5646,7 +5963,7 @@ async def process_utterance(session: ClientSession) -> None:
         print(f"[ASR:{asr_used}] {transcript}")
         if not transcript:
             raise RuntimeError("ASR returned empty text")
-        _best_effort_write_text(BASE_DIR / "latest_transcript.txt", transcript + "\n")
+        _best_effort_write_text(HOMEAI_DEBUG_DIR / "latest_transcript.txt", transcript + "\n")
 
         await send_json(session.ws, {"type": "asr.result", "text": transcript})
 
@@ -5663,36 +5980,56 @@ async def process_utterance(session: ClientSession) -> None:
                 answer, pending_glass2_target = glass2_result
                 local_command = "glass2-display"
         if answer is None:
+            answer = await _apply_kitchen_voice_command(session, transcript)
+            if answer is not None:
+                local_command = "kitchen"
+        if answer is None:
             print(
                 f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
                 f"model={OPENCLAW_MODEL} device={session.device_id} "
                 f"user={session.openclaw_user}"
             )
-            answer = await openclaw_chat(
-                transcript,
-                session.context,
-                openclaw_user=session.openclaw_user,
-            )
-            print("[STAGE] OpenClaw returned")
+            try:
+                answer = await openclaw_chat(
+                    transcript,
+                    session.context,
+                    openclaw_user=session.openclaw_user,
+                )
+                print("[STAGE] OpenClaw returned")
+            except Exception as exc:
+                fallback = _kitchen_offline_fallback(transcript) if _is_kitchen_related_utterance(transcript) else None
+                if fallback is None:
+                    raise
+                answer = fallback
+                local_command = "kitchen-offline"
+                print(
+                    f"[KITCHEN-OFFLINE] OpenClaw unavailable; local fallback used "
+                    f"error={type(exc).__name__}: {exc}"
+                )
         elif local_command == "audio-route":
             print(f"[AUDIO-ROUTE-VOICE] handled locally transcript={transcript!r}")
         elif local_command == "glass2-display":
             print(f"[GLASS2-VOICE] handled locally transcript={transcript!r}")
+        elif local_command == "kitchen":
+            print(f"[KITCHEN-VOICE] handled locally transcript={transcript!r}")
+        elif local_command == "kitchen-offline":
+            print(f"[KITCHEN-VOICE] OpenClaw offline fallback transcript={transcript!r}")
         else:
             print(f"[VOLUME-VOICE] handled locally transcript={transcript!r}")
         agent_ms = int((time.perf_counter() - agent_started) * 1000)
-        print(f"[AGENT] {answer}")
-        _best_effort_write_text(BASE_DIR / "latest_answer.txt", answer + "\n")
+        print(f"[AGENT] answer_chars={len(answer)}")
+        _vlog(f"[AGENT-TEXT] {answer}")
+        _best_effort_write_text(HOMEAI_DEBUG_DIR / "latest_answer.txt", answer + "\n")
         await send_json(session.ws, {"type": "assistant.text", "text": answer})
 
-        print(f"[STAGE] TTS begin provider={TTS_PROVIDER}")
+        kitchen_audio = _is_kitchen_related_utterance(transcript, local_command=local_command)
+        print(f"[STAGE] TTS begin provider={TTS_PROVIDER} target={'kitchen-ipad' if kitchen_audio else 'routed-sink'}")
         tts_started = time.perf_counter()
         pcm_out, sample_rate, tts_used = await synthesize_speech(answer)
         print("[STAGE] TTS returned")
         tts_ms = int((time.perf_counter() - tts_started) * 1000)
-        _best_effort_write_bytes(
-            BASE_DIR / "latest_tts.wav", pcm_to_wav_bytes(pcm_out, sample_rate)
-        )
+        wav_out = pcm_to_wav_bytes(pcm_out, sample_rate)
+        _best_effort_write_bytes(HOMEAI_DEBUG_DIR / "latest_tts.wav", wav_out)
 
         total_ms = int((time.perf_counter() - turn_started) * 1000)
         print(f"[TTS:{tts_used}] {len(pcm_out)} bytes @ {sample_rate} Hz")
@@ -5700,8 +6037,22 @@ async def process_utterance(session: ClientSession) -> None:
             f"[LATENCY] asr={asr_ms}ms agent={agent_ms}ms "
             f"tts={tts_ms}ms total_before_playback={total_ms}ms"
         )
-        sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
-        print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
+        if kitchen_audio:
+            event_id = "ka-" + uuid.uuid4().hex[:16]
+            now = time.time()
+            KITCHEN_AUDIO_CACHE[event_id] = wav_out
+            KITCHEN_AUDIO_ORDER.append(event_id)
+            while len(KITCHEN_AUDIO_ORDER) > KITCHEN_AUDIO_CACHE_MAX:
+                old_id = KITCHEN_AUDIO_ORDER.pop(0)
+                KITCHEN_AUDIO_CACHE.pop(old_id, None)
+            KITCHEN_LATEST_AUDIO.update({
+                "event_id": event_id, "text": answer, "kind": "assistant",
+                "created_at": now, "expires_at": now + KITCHEN_AUDIO_TTL_SEC, "provider": tts_used, "source_id": "",
+            })
+            print(f"[KITCHEN-AUDIO] routed reply to iPad id={event_id} source={session.device_id}")
+        else:
+            sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
+            print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
         session.processing = False
         await send_state(session.ws, "idle")
         if pending_glass2_target is not None:
@@ -5709,9 +6060,10 @@ async def process_utterance(session: ClientSession) -> None:
 
     except Exception as exc:
         print(f"[ERROR] {type(exc).__name__}: {exc}")
-        print("[TRACEBACK-BEGIN]")
-        traceback.print_exc()
-        print("[TRACEBACK-END]")
+        if HOMEAI_LOG_TRACEBACK:
+            print("[TRACEBACK-BEGIN]")
+            _log_traceback()
+            print("[TRACEBACK-END]")
         try:
             await send_json(session.ws, {"type": "assistant.error", "message": str(exc)[:180]})
             await send_state(session.ws, "error")
@@ -5727,10 +6079,1972 @@ async def process_utterance(session: ClientSession) -> None:
                 pass
 
 
+
+def _kitchen_clamp_timer_seconds(value: int | float) -> int:
+    return max(KITCHEN_TIMER_MIN_SEC, min(int(round(value)), KITCHEN_TIMER_MAX_SEC))
+
+
+def _kitchen_format_duration(seconds: int | float) -> str:
+    sec = max(0, int(round(seconds)))
+    minutes, rem = divmod(sec, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}小时{minutes}分{rem}秒" if rem else f"{hours}小时{minutes}分"
+    if minutes:
+        return f"{minutes}分{rem}秒" if rem else f"{minutes}分钟"
+    return f"{rem}秒"
+
+
+def _kitchen_timer_remaining(timer: KitchenTimer, *, now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    if timer.status == "running":
+        return max(0, int(math.ceil(timer.ends_at - current)))
+    if timer.status == "paused":
+        return max(0, int(timer.paused_remaining_sec))
+    return 0
+
+
+def _kitchen_timer_public(timer: KitchenTimer) -> dict[str, Any]:
+    return {
+        "timer_id": timer.timer_id,
+        "dish": timer.dish,
+        "step": int(timer.step),
+        "duration_sec": int(timer.duration_sec),
+        "status": timer.status,
+        "remaining_sec": _kitchen_timer_remaining(timer),
+        "ends_at": float(timer.ends_at or 0.0),
+        "created_at": float(timer.created_at),
+        "updated_at": float(timer.updated_at),
+        "finished_at": float(timer.finished_at or 0.0),
+    }
+
+
+def _kitchen_timer_snapshot() -> list[dict[str, Any]]:
+    # Finished timers remain visible until acknowledged, but stale reminders
+    # are eventually pruned so yesterday's "时间到" can never live forever.
+    now = time.time()
+    stale_ids = [
+        t.timer_id for t in KITCHEN_TIMERS.values()
+        if t.status == "finished" and t.finished_at and now - t.finished_at > KITCHEN_FINISHED_TIMER_TTL_SEC
+    ]
+    for timer_id in stale_ids:
+        KITCHEN_TIMERS.pop(timer_id, None)
+    if stale_ids:
+        save_kitchen_timers()
+    timers = list(KITCHEN_TIMERS.values())
+    timers.sort(key=lambda t: (t.status == "finished", t.ends_at or 9e18, t.created_at))
+    return [_kitchen_timer_public(t) for t in timers]
+
+
+def save_kitchen_progress() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"schema": 1, "progress": KITCHEN_RECIPE_PROGRESS}
+        tmp = KITCHEN_PROGRESS_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(KITCHEN_PROGRESS_STATE_FILE)
+        return True
+    except Exception as exc:
+        print(f"[KITCHEN-PROGRESS-WARN] save failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def load_kitchen_progress() -> None:
+    KITCHEN_RECIPE_PROGRESS.clear()
+    if not KITCHEN_PROGRESS_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(KITCHEN_PROGRESS_STATE_FILE.read_text(encoding="utf-8"))
+        raw = data.get("progress") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for date_text, dishes in raw.items():
+                if not isinstance(dishes, dict):
+                    continue
+                clean: dict[str, int] = {}
+                for dish, step in dishes.items():
+                    try:
+                        clean[str(dish)] = max(0, int(step))
+                    except (TypeError, ValueError):
+                        continue
+                if clean:
+                    KITCHEN_RECIPE_PROGRESS[str(date_text)] = clean
+        print(f"[KITCHEN-PROGRESS] loaded dates={len(KITCHEN_RECIPE_PROGRESS)} file={KITCHEN_PROGRESS_STATE_FILE}")
+    except Exception as exc:
+        print(f"[KITCHEN-PROGRESS-WARN] load failed: {type(exc).__name__}: {exc}")
+
+
+def _kitchen_progress_get(date_text: str, dish: str, total_steps: int) -> tuple[int, bool]:
+    dishes = KITCHEN_RECIPE_PROGRESS.get(str(date_text), {})
+    if str(dish) not in dishes:
+        return 0, False
+    step = max(0, min(int(dishes.get(str(dish), 0)), max(0, int(total_steps) - 1)))
+    return step, True
+
+
+def _kitchen_progress_set(date_text: str, dish: str, step: int, total_steps: int) -> int:
+    date_key, dish_key = str(date_text), str(dish)
+    value = max(0, min(int(step), max(0, int(total_steps) - 1)))
+    KITCHEN_RECIPE_PROGRESS.setdefault(date_key, {})[dish_key] = value
+    # Keep the file bounded; old dinner progress has little operational value.
+    if len(KITCHEN_RECIPE_PROGRESS) > 45:
+        for old_date in sorted(KITCHEN_RECIPE_PROGRESS)[:-45]:
+            KITCHEN_RECIPE_PROGRESS.pop(old_date, None)
+    save_kitchen_progress()
+    return value
+
+
+def _kitchen_idle_payload(message: str = "等待逐光发送菜单") -> dict[str, Any]:
+    return {
+        "type": "kitchen.show_idle",
+        "eyebrow": "HOME AI · 厨房",
+        "title": "厨房终端",
+        "message": message,
+        "can_pull_today": True,
+        "footer": "可以在 iPad 直接加载今日菜单，也可以对逐光说“显示今天的菜单”",
+    }
+
+
+def _kitchen_maybe_return_idle() -> bool:
+    global KITCHEN_RETURN_IDLE_AT, KITCHEN_CURRENT_STATE
+    if not KITCHEN_RETURN_IDLE_AT or time.time() < KITCHEN_RETURN_IDLE_AT:
+        return False
+    KITCHEN_RETURN_IDLE_AT = 0.0
+    KITCHEN_CURRENT_STATE = {"screen": "idle", "date": "", "dish": "", "step": 0}
+    _kitchen_set_current_view(_kitchen_idle_payload())
+    print("[KITCHEN] end-of-day grace complete -> idle")
+    return True
+
+
+def save_kitchen_timers() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "saved_at": datetime.now().astimezone().isoformat(),
+            "timers": [asdict(t) for t in KITCHEN_TIMERS.values()],
+        }
+        tmp = KITCHEN_TIMER_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(KITCHEN_TIMER_STATE_FILE)
+        return True
+    except OSError as exc:
+        print(f"[KITCHEN-TIMER-WARN] save failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def load_kitchen_timers() -> None:
+    KITCHEN_TIMERS.clear()
+    if not KITCHEN_TIMER_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(KITCHEN_TIMER_STATE_FILE.read_text(encoding="utf-8"))
+        rows = data.get("timers") if isinstance(data, dict) else []
+        now = time.time()
+        for raw in rows if isinstance(rows, list) else []:
+            if not isinstance(raw, dict):
+                continue
+            timer = KitchenTimer(
+                timer_id=str(raw.get("timer_id") or ""),
+                dish=str(raw.get("dish") or ""),
+                step=max(0, int(raw.get("step") or 0)),
+                duration_sec=_kitchen_clamp_timer_seconds(int(raw.get("duration_sec") or KITCHEN_TIMER_MIN_SEC)),
+                status=str(raw.get("status") or "running"),
+                started_at=float(raw.get("started_at") or 0.0),
+                ends_at=float(raw.get("ends_at") or 0.0),
+                paused_remaining_sec=max(0, int(raw.get("paused_remaining_sec") or 0)),
+                created_at=float(raw.get("created_at") or now),
+                updated_at=float(raw.get("updated_at") or now),
+                finished_at=float(raw.get("finished_at") or 0.0),
+                notified=bool(raw.get("notified", False)),
+            )
+            if not timer.timer_id or not timer.dish:
+                continue
+            if timer.status not in {"running", "paused", "finished"}:
+                timer.status = "running"
+            # Old finished timers aren't useful after a day; prune them.
+            if timer.status == "finished" and timer.finished_at and now - timer.finished_at > 86400:
+                continue
+            KITCHEN_TIMERS[timer.timer_id] = timer
+        print(f"[KITCHEN-TIMER] loaded count={len(KITCHEN_TIMERS)} file={KITCHEN_TIMER_STATE_FILE}")
+    except Exception as exc:
+        print(f"[KITCHEN-TIMER-WARN] load failed: {type(exc).__name__}: {exc}")
+
+
+def _kitchen_current_recipe() -> tuple[dict[str, Any] | None, int]:
+    menu = KITCHEN_CURRENT_MENU
+    dish = str(KITCHEN_CURRENT_STATE.get("dish") or "")
+    step = max(0, int(KITCHEN_CURRENT_STATE.get("step") or 0))
+    if menu is None or not dish:
+        return None, step
+    return recipe_for(menu, dish), step
+
+
+def _kitchen_step_timer_hint(recipe: dict[str, Any] | None, step: int) -> dict[str, Any] | None:
+    if recipe is None:
+        return None
+    hints = recipe.get("step_timers") or []
+    if 0 <= step < len(hints) and isinstance(hints[step], dict):
+        hint = dict(hints[step])
+        try:
+            hint["default_sec"] = _kitchen_clamp_timer_seconds(int(hint.get("default_sec") or 0))
+            hint["max_sec"] = _kitchen_clamp_timer_seconds(int(hint.get("max_sec") or hint["default_sec"]))
+        except (TypeError, ValueError):
+            return None
+        return hint
+    return None
+
+
+def _kitchen_timer_for_step(dish: str, step: int) -> KitchenTimer | None:
+    candidates = [
+        t for t in KITCHEN_TIMERS.values()
+        if t.dish == dish and int(t.step) == int(step)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t.created_at, reverse=True)
+    return candidates[0]
+
+
+def _kitchen_pick_timer(text: str = "") -> KitchenTimer | None:
+    query = re.sub(r"[\s，。！？、,.!?]", "", text or "")
+    recipe, step = _kitchen_current_recipe()
+    if recipe is not None:
+        current = _kitchen_timer_for_step(str(recipe.get("name") or ""), step)
+        if current is not None:
+            return current
+    if query:
+        matches = []
+        for timer in KITCHEN_TIMERS.values():
+            dish_compact = re.sub(r"[\s，。！？、,.!?]", "", timer.dish)
+            if dish_compact and (dish_compact in query or any(part and part in query for part in re.split(r"[·（）()]+", dish_compact))):
+                matches.append(timer)
+        if matches:
+            matches.sort(key=lambda t: t.created_at, reverse=True)
+            return matches[0]
+    active = [t for t in KITCHEN_TIMERS.values() if t.status in {"running", "paused"}]
+    active.sort(key=lambda t: t.created_at, reverse=True)
+    return active[0] if active else None
+
+
+def _kitchen_timer_start(seconds: int | None = None) -> KitchenTimer:
+    recipe, step = _kitchen_current_recipe()
+    if recipe is None:
+        raise KitchenMenuError("current screen is not a recipe step")
+    hint = _kitchen_step_timer_hint(recipe, step)
+    if seconds is None:
+        if hint is None:
+            raise KitchenMenuError("current step has no default timer")
+        seconds = int(hint.get("default_sec") or 0)
+    seconds = _kitchen_clamp_timer_seconds(seconds)
+    dish = str(recipe.get("name") or "")
+    old = _kitchen_timer_for_step(dish, step)
+    if old is not None:
+        KITCHEN_TIMERS.pop(old.timer_id, None)
+    now = time.time()
+    timer = KitchenTimer(
+        timer_id="kt-" + uuid.uuid4().hex[:12],
+        dish=dish,
+        step=step,
+        duration_sec=seconds,
+        status="running",
+        started_at=now,
+        ends_at=now + seconds,
+        created_at=now,
+        updated_at=now,
+    )
+    KITCHEN_TIMERS[timer.timer_id] = timer
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] start id={timer.timer_id} dish={dish!r} step={step+1} sec={seconds}")
+    return timer
+
+
+def _kitchen_timer_set(timer: KitchenTimer, seconds: int) -> KitchenTimer:
+    seconds = _kitchen_clamp_timer_seconds(seconds)
+    now = time.time()
+    timer.duration_sec = seconds
+    timer.status = "running"
+    timer.started_at = now
+    timer.ends_at = now + seconds
+    timer.paused_remaining_sec = 0
+    timer.updated_at = now
+    timer.finished_at = 0.0
+    timer.notified = False
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] set id={timer.timer_id} sec={seconds}")
+    return timer
+
+
+def _kitchen_timer_adjust(timer: KitchenTimer, delta_sec: int) -> KitchenTimer:
+    now = time.time()
+    if timer.status == "finished":
+        if delta_sec <= 0:
+            return timer
+        timer.status = "running"
+        timer.duration_sec = _kitchen_clamp_timer_seconds(delta_sec)
+        timer.started_at = now
+        timer.ends_at = now + timer.duration_sec
+        timer.finished_at = 0.0
+        timer.notified = False
+    elif timer.status == "paused":
+        timer.paused_remaining_sec = _kitchen_clamp_timer_seconds(timer.paused_remaining_sec + delta_sec)
+        timer.duration_sec = timer.paused_remaining_sec
+    else:
+        remaining = _kitchen_timer_remaining(timer, now=now)
+        new_remaining = _kitchen_clamp_timer_seconds(remaining + delta_sec)
+        timer.ends_at = now + new_remaining
+        timer.duration_sec = new_remaining
+    timer.updated_at = now
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] adjust id={timer.timer_id} delta={delta_sec} remaining={_kitchen_timer_remaining(timer)}")
+    return timer
+
+
+def _kitchen_timer_pause(timer: KitchenTimer) -> KitchenTimer:
+    if timer.status != "running":
+        return timer
+    now = time.time()
+    timer.paused_remaining_sec = _kitchen_timer_remaining(timer, now=now)
+    timer.status = "paused"
+    timer.updated_at = now
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] pause id={timer.timer_id} remaining={timer.paused_remaining_sec}")
+    return timer
+
+
+def _kitchen_timer_resume(timer: KitchenTimer) -> KitchenTimer:
+    if timer.status != "paused":
+        return timer
+    now = time.time()
+    remaining = _kitchen_clamp_timer_seconds(timer.paused_remaining_sec or timer.duration_sec)
+    timer.status = "running"
+    timer.started_at = now
+    timer.ends_at = now + remaining
+    timer.duration_sec = remaining
+    timer.paused_remaining_sec = 0
+    timer.updated_at = now
+    timer.finished_at = 0.0
+    timer.notified = False
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] resume id={timer.timer_id} remaining={remaining}")
+    return timer
+
+
+def _kitchen_clear_audio(*, event_id: str = "", source_id: str = "") -> None:
+    current_event = str(KITCHEN_LATEST_AUDIO.get("event_id") or "")
+    current_source = str(KITCHEN_LATEST_AUDIO.get("source_id") or "")
+    if event_id and current_event != event_id:
+        return
+    if source_id and current_source != source_id:
+        return
+    KITCHEN_LATEST_AUDIO.update({
+        "event_id": "", "text": "", "kind": "", "created_at": 0.0,
+        "expires_at": 0.0, "provider": "", "source_id": "",
+    })
+
+
+def _kitchen_timer_remove(timer: KitchenTimer) -> None:
+    KITCHEN_TIMERS.pop(timer.timer_id, None)
+    _kitchen_clear_audio(source_id=timer.timer_id)
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] remove id={timer.timer_id}")
+
+
+def _kitchen_clear_all_timers() -> int:
+    count = len(KITCHEN_TIMERS)
+    KITCHEN_TIMERS.clear()
+    if str(KITCHEN_LATEST_AUDIO.get("kind") or "") == "timer":
+        _kitchen_clear_audio()
+    save_kitchen_timers()
+    if count:
+        print(f"[KITCHEN-TIMER] cleared all count={count}")
+    return count
+
+
+async def _kitchen_speak(text: str, *, kind: str = "assistant", source_id: str = "") -> dict[str, Any] | None:
+    """Synthesize one KitchenTerminal voice event for playback on the iPad."""
+    spoken = str(text or "").strip()
+    if not spoken:
+        return None
+    try:
+        pcm, sample_rate, provider = await synthesize_speech(spoken)
+        wav = pcm_to_wav_bytes(pcm, sample_rate)
+    except Exception as exc:
+        print(f"[KITCHEN-AUDIO-ERROR] synthesize failed: {type(exc).__name__}: {exc}")
+        return None
+
+    event_id = "ka-" + uuid.uuid4().hex[:16]
+    now = time.time()
+    KITCHEN_AUDIO_CACHE[event_id] = wav
+    KITCHEN_AUDIO_ORDER.append(event_id)
+    while len(KITCHEN_AUDIO_ORDER) > KITCHEN_AUDIO_CACHE_MAX:
+        old = KITCHEN_AUDIO_ORDER.pop(0)
+        KITCHEN_AUDIO_CACHE.pop(old, None)
+
+    KITCHEN_LATEST_AUDIO.update({
+        "event_id": event_id,
+        "text": spoken,
+        "kind": kind,
+        "created_at": now,
+        "expires_at": now + KITCHEN_AUDIO_TTL_SEC,
+        "provider": provider,
+        "source_id": source_id,
+    })
+    print(f"[KITCHEN-AUDIO] queued id={event_id} kind={kind} provider={provider} text={spoken!r}")
+    return _kitchen_audio_public()
+
+
+def _kitchen_audio_public() -> dict[str, Any] | None:
+    event_id = str(KITCHEN_LATEST_AUDIO.get("event_id") or "")
+    expires_at = float(KITCHEN_LATEST_AUDIO.get("expires_at") or 0.0)
+    if not event_id or event_id not in KITCHEN_AUDIO_CACHE or expires_at <= time.time():
+        return None
+    return {
+        "event_id": event_id,
+        "text": str(KITCHEN_LATEST_AUDIO.get("text") or ""),
+        "kind": str(KITCHEN_LATEST_AUDIO.get("kind") or "assistant"),
+        "created_at": float(KITCHEN_LATEST_AUDIO.get("created_at") or 0.0),
+        "expires_at": expires_at,
+        "provider": str(KITCHEN_LATEST_AUDIO.get("provider") or ""),
+        "source_id": str(KITCHEN_LATEST_AUDIO.get("source_id") or ""),
+        "url": f"{KITCHEN_HTTP_PATH}/audio?id={event_id}",
+    }
+
+
+async def _kitchen_timer_alert(timer: KitchenTimer) -> bool:
+    text = f"{timer.dish}第{timer.step + 1}步计时结束，可以检查一下状态了。"
+    event = await _kitchen_speak(text, kind="timer", source_id=timer.timer_id)
+    if event is None:
+        return False
+    print(f"[KITCHEN-TIMER] iPad alert queued id={timer.timer_id} audio={event.get('event_id')}")
+    return True
+
+
+async def kitchen_timer_loop() -> None:
+    while True:
+        try:
+            now = time.time()
+            dirty = False
+            for timer in list(KITCHEN_TIMERS.values()):
+                if timer.status == "running" and timer.ends_at <= now:
+                    timer.status = "finished"
+                    timer.finished_at = now
+                    timer.updated_at = now
+                    dirty = True
+                    print(f"[KITCHEN-TIMER] finished id={timer.timer_id} dish={timer.dish!r} step={timer.step+1}")
+                if timer.status == "finished" and not timer.notified:
+                    if await _kitchen_timer_alert(timer):
+                        timer.notified = True
+                        timer.updated_at = now
+                        dirty = True
+            if dirty:
+                save_kitchen_timers()
+            await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[KITCHEN-TIMER-ERROR] loop: {type(exc).__name__}: {exc}")
+            await asyncio.sleep(1.0)
+
+
+def _kitchen_voice_number(text: str) -> int | None:
+    text = text.strip()
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if text in digits:
+        return digits[text]
+    if "十" in text:
+        left, right = text.split("十", 1)
+        tens = digits.get(left, 1) if left else 1
+        ones = digits.get(right, 0) if right else 0
+        return tens * 10 + ones
+    return None
+
+
+def _kitchen_duration_from_voice(text: str) -> int | None:
+    total = 0
+    found = False
+    for pattern, mult in [
+        (r"([0-9零〇一二两三四五六七八九十]+)\s*(?:小时|时)", 3600),
+        (r"([0-9零〇一二两三四五六七八九十]+)\s*(?:分钟|分)", 60),
+        (r"([0-9零〇一二两三四五六七八九十]+)\s*秒", 1),
+    ]:
+        for m in re.finditer(pattern, text):
+            value = _kitchen_voice_number(m.group(1))
+            if value is not None:
+                total += value * mult
+                found = True
+    return _kitchen_clamp_timer_seconds(total) if found and total > 0 else None
+
+
+def _kitchen_safe_filename(name: str) -> str:
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', '_', str(name or '').strip())
+    value = value.strip(' .')
+    return value[:80] or '私房菜'
+
+
+def _kitchen_human_timer_text(hint: dict[str, Any] | None) -> str:
+    if not isinstance(hint, dict):
+        return ''
+    default = int(hint.get('default_sec') or 0)
+    maximum = int(hint.get('max_sec') or default)
+    if default <= 0:
+        return ''
+    def short(sec: int) -> str:
+        if sec % 3600 == 0 and sec >= 3600:
+            return f'{sec // 3600}小时'
+        if sec % 60 == 0 and sec >= 60:
+            return f'{sec // 60}分钟'
+        return f'{sec}秒'
+    base = short(default)
+    return f'{base}，可延长至{short(maximum)}' if maximum > default else base
+
+
+def _kitchen_private_recipe_markdown(menu: dict[str, Any], recipe: dict[str, Any]) -> str:
+    name = str(recipe.get('name') or '未命名菜谱')
+    source_date = str(menu.get('date') or _kitchen_today())
+    saved_at = datetime.now().astimezone().isoformat(timespec='seconds')
+    q = lambda v: json.dumps(str(v), ensure_ascii=False)
+    lines = [
+        '---', 'type: private-recipe', 'schema: kitchen-private-recipe-v1',
+        f'name: {q(name)}', f'source_date: {q(source_date)}', f'saved_at: {q(saved_at)}',
+        'tags:', '  - 私房菜', '  - KitchenTerminal', '---', '',
+        f'# 🍳 私房菜 · {name}', '', f'> 来源：{source_date} 晚餐 · 由 KitchenTerminal 保存',
+    ]
+    meta = ' · '.join(x for x in [str(recipe.get('type_label') or ''), str(recipe.get('estimated_text') or '')] if x)
+    if meta:
+        lines += ['', f'> {meta}']
+    ingredients = recipe.get('ingredients') or []
+    if ingredients:
+        lines += ['', '## 🧺 食材', ''] + [f'- {x}' for x in ingredients]
+    seasoning = recipe.get('seasoning') or []
+    if seasoning:
+        lines += ['', '## 🧂 调味', ''] + [f'- {x}' for x in seasoning]
+    steps = recipe.get('steps') or []
+    hints = recipe.get('step_timers') or []
+    if steps:
+        lines += ['', '## 👨‍🍳 做法', '']
+        for idx, step in enumerate(steps):
+            lines.append(f'{idx + 1}. {step}')
+            hint = hints[idx] if idx < len(hints) else None
+            timer_text = _kitchen_human_timer_text(hint)
+            if timer_text:
+                lines.append(f'   - ⏱️ 计时：{timer_text}')
+    key_points = recipe.get('key_points') or []
+    if key_points:
+        lines += ['', '## 💡 关键点', ''] + [f'- {x}' for x in key_points]
+    lines += ['', '---', '', f'保存自：{source_date} · KitchenTerminal', '']
+    return '\n'.join(lines)
+
+
+def _kitchen_write_private_recipe(menu: dict[str, Any], recipe: dict[str, Any]) -> Path:
+    KITCHEN_PRIVATE_RECIPE_DIR.mkdir(parents=True, exist_ok=True)
+    name = str(recipe.get('name') or '未命名菜谱')
+    source_date = str(menu.get('date') or _kitchen_today())
+    stem = _kitchen_safe_filename(name)
+    target = KITCHEN_PRIVATE_RECIPE_DIR / f'{stem}.md'
+    if target.exists():
+        target = KITCHEN_PRIVATE_RECIPE_DIR / f'{stem}_{source_date}.md'
+        seq = 2
+        while target.exists():
+            target = KITCHEN_PRIVATE_RECIPE_DIR / f'{stem}_{source_date}_{seq}.md'
+            seq += 1
+    tmp = target.with_suffix(target.suffix + '.tmp')
+    tmp.write_text(_kitchen_private_recipe_markdown(menu, recipe), encoding='utf-8')
+    tmp.replace(target)
+    print(f'[KITCHEN] private recipe saved dish={name!r} path={target}')
+    return target
+
+
+def _kitchen_finish_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    active = [t for t in KITCHEN_TIMERS.values() if t.status in {'running', 'paused'}]
+    return {
+        'type': 'kitchen.show_finish',
+        'eyebrow': f"{menu.get('date','')} · 收尾", 'title': '结束今日烹饪',
+        'message': (f'还有 {len(active)} 个计时器正在运行，确认结束后会全部取消。' if active else '确认今天的烹饪已经完成？'),
+        'active_timers': len(active),
+        'footer': '确认后可以选择要保存到 Obsidian 私房菜的菜谱',
+    }
+
+
+def _kitchen_save_private_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    return {
+        'type': 'kitchen.show_save_private',
+        'eyebrow': f"{menu.get('date','')} · 今日收尾", 'title': '保存到私房菜？',
+        'message': '如果今天有特别满意的菜，可以选中保存到 Obsidian「私房菜」。',
+        'items': [str(x.get('name') or '') for x in menu.get('items') or [] if str(x.get('name') or '')],
+        'private_dir': str(KITCHEN_PRIVATE_RECIPE_DIR),
+        'footer': '可以多选，也可以直接结束不保存',
+    }
+
+
+async def _kitchen_begin_finish(*, speak: bool = False) -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    KITCHEN_CURRENT_STATE = {'screen': 'finish', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
+    delivered = await kitchen_broadcast(_kitchen_finish_payload(menu))
+    if speak:
+        await _kitchen_speak('确认结束今天的烹饪吗？确认后我会关闭今天的计时器，然后让你选择是否保存菜谱到私房菜。', kind='assistant')
+    return delivered
+
+
+async def _kitchen_confirm_finish(*, speak: bool = False) -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    _kitchen_clear_all_timers()
+    KITCHEN_CURRENT_STATE = {'screen': 'save_private', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
+    delivered = await kitchen_broadcast(_kitchen_save_private_payload(menu))
+    if speak:
+        await _kitchen_speak('今天有没有想保存到私房菜的菜谱？可以勾选菜名，也可以直接选择不保存。', kind='assistant')
+    return delivered
+
+
+async def _kitchen_finalize_day(selected_names: list[str] | None = None, *, speak: bool = False) -> tuple[int, list[str]]:
+    global KITCHEN_CURRENT_MENU, KITCHEN_CURRENT_STATE, KITCHEN_RETURN_IDLE_AT
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    saved: list[str] = []
+    for name in [str(x).strip() for x in (selected_names or []) if str(x).strip()]:
+        recipe = recipe_for(menu, name) or match_recipe(menu, name)
+        if recipe is None:
+            continue
+        _kitchen_write_private_recipe(menu, recipe)
+        saved.append(str(recipe.get('name') or name))
+    _kitchen_clear_all_timers()
+    _kitchen_clear_audio()
+    date_text = str(menu.get('date') or _kitchen_today())
+    KITCHEN_CURRENT_MENU = None
+    KITCHEN_CURRENT_STATE = {'screen': 'done', 'date': date_text, 'dish': '', 'step': 0}
+    KITCHEN_RETURN_IDLE_AT = time.time() + KITCHEN_IDLE_RETURN_DELAY_SEC
+    msg = ('已保存到私房菜：' + '、'.join(saved)) if saved else '今天没有保存新的私房菜。'
+    delivered = await kitchen_broadcast({
+        'type': 'kitchen.show_done', 'eyebrow': f'{date_text} · 已收尾', 'title': '今天辛苦了',
+        'message': msg + ' 今日烹饪已经结束。',
+        'return_idle_at': KITCHEN_RETURN_IDLE_AT,
+        'footer': f'约 {max(1, round(KITCHEN_IDLE_RETURN_DELAY_SEC / 60))} 分钟后自动返回等待页面',
+    })
+    if speak:
+        spoken = (('已经保存' + '、'.join(saved) + '到私房菜。') if saved else '') + '今天的烹饪已经结束，辛苦了。'
+        await _kitchen_speak(spoken, kind='assistant')
+    return delivered, saved
+
+
+def _kitchen_html() -> bytes:
+    # KitchenTerminal: HTTP polling is authoritative; WebSocket is an optional
+    # fast path. Timers and Q&A recovery state are Gateway-owned.
+    html = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>KitchenTerminal __KITCHEN_UI_VERSION__</title>
+<style>
+:root{color-scheme:light;--bg:#f4f1e8;--card:#fffdf7;--ink:#171717;--muted:#777267;--line:#d9d3c7;--accent:#1d6b47;--danger:#9c2f2f;--soft:#eee9dd}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;width:100%;height:100%;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;color:var(--ink);overflow:hidden}button,input{font:inherit;color:inherit}button{touch-action:manipulation}
+#app{height:100%;display:flex;flex-direction:column;padding:12px 14px 10px}header{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}.brand{font-weight:760;font-size:21px}.version{font-size:12px;color:var(--muted);margin-left:7px}.status{font-size:13px;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--danger)}.dot.online{background:var(--accent)}.status-pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:700;white-space:nowrap}.status-pill.ready{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}.status-pill.wait{color:var(--muted)}.status-pill.bad{border-color:#d3aaaa;color:var(--danger);background:#fff8f8}.help-btn{appearance:none;border:1px solid var(--line);background:#fff;border-radius:999px;min-height:32px;padding:6px 12px;font-size:13px;font-weight:750;color:var(--ink)}
+#timerStrip{display:none;gap:10px;overflow-x:auto;padding:7px 0 11px;white-space:nowrap}.timer-chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:10px 16px;font-size:28px;line-height:1.05;display:inline-flex;gap:10px;align-items:center;font-weight:720}.timer-chip.running{border-color:#9bbbaa}.timer-chip.paused{border-color:#d3b776}.timer-chip.finished{border-color:#c88f8f;color:var(--danger);font-weight:700}.timer-chip{cursor:pointer}.timer-chip .chip-x{border:0;background:transparent;color:var(--danger);font-size:28px;line-height:1;padding:0 0 1px 4px}.finish-btn{border-color:#c9a1a1!important;color:var(--danger)!important}.choice-list{display:grid;gap:10px;margin-top:12px}.choice-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);background:#fff;border-radius:14px;padding:14px 16px;font-size:20px;font-weight:650}.choice-row input{width:24px;height:24px}.finish-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.finish-actions button{min-height:54px;border-radius:13px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.finish-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}.finish-actions .danger{color:var(--danger);border-color:#c9a1a1}
+main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;max-width:1000px;height:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px 24px;display:flex;flex-direction:column;min-height:0}.eyebrow{font-size:14px;color:var(--muted);margin-bottom:5px}.title{font-size:38px;font-weight:780;line-height:1.12;margin:0 0 10px}.message{font-size:21px;line-height:1.4;color:#3f3b34}.content{flex:1;min-height:0;overflow:auto;padding-bottom:4px}.menu{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}.menu button,.action{appearance:none;border:1px solid var(--line);background:#fff;border-radius:15px;padding:16px 18px;text-align:left;font-size:23px;font-weight:680;min-height:66px}.menu button{display:flex;flex-direction:column;gap:5px}.menu-progress{font-size:13px;color:var(--accent);font-weight:700}.idle-actions{display:flex;justify-content:center;margin-top:34px}.idle-actions button{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:22px;min-height:108px;min-width:min(100%,420px);width:min(100%,420px);padding:18px 28px;font-size:32px;line-height:1.15;font-weight:820;letter-spacing:.5px;box-shadow:0 10px 24px rgba(29,107,71,.18)}.done-note{margin-top:18px;color:var(--muted);font-size:16px}.toolbar{display:flex;gap:10px;margin-top:14px}.toolbar .action{flex:1;text-align:center;font-size:17px;min-height:52px;padding:10px}.recipe-meta{font-size:16px;color:var(--muted);margin-bottom:10px}.step-card{border:1px solid var(--line);background:#fff;border-radius:18px;padding:20px;margin-top:5px}.step-label{font-size:15px;color:var(--accent);font-weight:700;margin-bottom:8px}.step-text{font-size:30px;line-height:1.4;font-weight:650}.tips{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.tips h3{font-size:15px;margin:0 0 7px;color:var(--muted)}.tips ul{margin:0;padding-left:21px}.tips li{font-size:16px;line-height:1.4;margin:4px 0}
+.step-timer{margin-top:16px;border:1px solid #bfd2c7;background:#f7fbf8;border-radius:17px;padding:14px}.step-timer.finished{border-color:#d7aaaa;background:#fff7f7}.timer-title{font-size:15px;color:var(--muted);font-weight:700}.timer-time{font-size:42px;line-height:1;font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:1px;margin-top:3px}.timer-state{font-size:14px;color:var(--muted);margin-top:5px}.timer-controls{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.timer-controls button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:46px;padding:8px;font-size:15px;font-weight:650}.timer-controls button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.timer-controls button.danger{color:var(--danger)}
+.nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding-top:13px}.nav button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:13px;padding:12px;font-size:17px;font-weight:650;min-height:50px}.nav button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.list-group{margin:0 0 16px}.list-group h3{font-size:19px;margin:0 0 7px}.list-group ul,.timeline{margin:0;padding-left:23px}.list-group li,.timeline li{font-size:19px;line-height:1.45;margin:6px 0}.timeline li{margin:9px 0}footer{padding-top:8px;text-align:center;font-size:12px;color:var(--muted)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.32);display:none;align-items:center;justify-content:center;padding:18px;z-index:20}.modal.show{display:flex}.modal-card{width:min(430px,94vw);background:#fffdf7;border-radius:20px;border:1px solid var(--line);padding:20px}.modal-card h2{font-size:23px;margin:0 0 14px}.time-inputs{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}.time-inputs input{width:100%;font-size:34px;text-align:center;border:1px solid var(--line);border-radius:13px;padding:10px;background:#fff}.time-inputs span{font-size:28px;font-weight:700}.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.modal-actions button{min-height:48px;border-radius:12px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.modal-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.qa-dock{width:100%;max-width:1000px;margin:9px auto 0;border:1px solid var(--line);background:#fffdf7;border-radius:19px;padding:10px 12px;display:flex;align-items:center;gap:14px;min-height:92px}.qa-btn{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:17px;min-width:230px;min-height:72px;padding:12px 22px;font-size:24px;font-weight:820;box-shadow:0 4px 14px rgba(29,107,71,.18)}.qa-btn.recording{background:var(--danger);border-color:var(--danger);box-shadow:0 4px 14px rgba(156,47,47,.18)}.qa-btn.busy{background:#706c63;border-color:#706c63;box-shadow:none}.qa-copy{flex:1;min-width:0}.qa-status{font-size:15px;font-weight:760;color:var(--accent)}.qa-transcript{font-size:14px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}.qa-answer{font-size:16px;line-height:1.35;margin-top:4px;max-height:50px;overflow:auto}.qa-clear{appearance:none;border:0;background:transparent;color:var(--muted);font-size:25px;line-height:1;padding:6px}.help-list{margin:4px 0 0;padding-left:22px}.help-list li{font-size:16px;line-height:1.5;margin:8px 0}.help-note{font-size:14px;line-height:1.45;color:var(--muted);background:var(--soft);border-radius:12px;padding:10px 12px;margin-top:12px}
+@media(max-width:700px){#app{padding:9px 10px 8px}header{align-items:flex-start}.brand{font-size:18px}.version{display:none}.status{gap:5px;max-width:68%;}.status-pill{padding:6px 8px;font-size:11px}.help-btn{padding:5px 10px;font-size:12px}.menu{grid-template-columns:1fr}.panel{padding:17px}.title{font-size:31px}.step-text{font-size:26px}.timer-time{font-size:37px}.toolbar{flex-direction:column}.nav{gap:7px}.nav button{font-size:15px;padding:9px}.timer-controls{grid-template-columns:1fr 1fr}.message{font-size:19px}.qa-dock{gap:9px;padding:8px;min-height:82px}.qa-btn{min-width:176px;min-height:64px;font-size:21px;padding:10px 14px}.qa-answer{font-size:15px}}
+</style>
+</head>
+<body>
+<div id="app">
+<header><div><span class="brand">KitchenTerminal</span><span class="version">__KITCHEN_UI_VERSION__</span></div><div class="status"><span id="micState" class="status-pill wait">🎙 麦克风 检测中</span><span id="audioState" class="status-pill wait">🔊 语音 待激活</span><button id="helpBtn" class="help-btn">？ 帮助</button><span id="dot" class="dot"></span><span id="statusText">连接中</span></div></header>
+<div id="timerStrip"></div>
+<main><section class="panel"><div id="eyebrow" class="eyebrow">HOME AI · 厨房</div><h1 id="title" class="title">厨房终端</h1><div id="message" class="message">正在读取 Gateway…</div><div id="content" class="content"></div><div id="nav" class="nav" style="display:none"></div></section></main>
+<div id="qaDock" class="qa-dock"><button id="qaBtn" type="button" class="qa-btn">🎙 问逐光</button><div class="qa-copy"><div id="qaStatus" class="qa-status">可以问做法、替代食材、火候和补救办法</div><div id="qaTranscript" class="qa-transcript"></div><div id="qaAnswer" class="qa-answer"></div></div><button id="qaClear" class="qa-clear" aria-label="清除回答">×</button></div>
+<footer id="footer">KitchenTerminal __KITCHEN_UI_VERSION__ · 等待 Gateway</footer>
+</div>
+<div id="timerModal" class="modal"><div class="modal-card"><h2>设置计时</h2><div class="time-inputs"><input id="minInput" inputmode="numeric" pattern="[0-9]*" value="0"><span>:</span><input id="secInput" inputmode="numeric" pattern="[0-9]*" value="30"></div><div class="modal-actions"><button id="modalCancel">取消</button><button id="modalOK" class="primary">确定</button></div></div></div>
+<div id="helpModal" class="modal"><div class="modal-card"><h2>厨房终端操作指南</h2><ol class="help-list"><li><strong>开始做饭：</strong>在等待页点“加载今日菜单”，选择菜品进入步骤。</li><li><strong>按步骤操作：</strong>用“上一步 / 下一步”切换；需要返回总菜单时点“返回菜单”。</li><li><strong>计时：</strong>步骤里出现建议计时后可直接开始，也可以增减时间；顶部会持续显示正在运行的计时器。</li><li><strong>问逐光：</strong>点底部的大按钮开始说话，再点一次结束。可以问火候、替代食材、做法原因和翻车补救。</li><li><strong>语音播报：</strong>首次触碰页面后会自动激活；回答和厨房提示都在这台 iPad 本地播放。</li><li><strong>结束烹饪：</strong>回到今日菜单后点“结束今日烹饪”，可选择把喜欢的菜保存到私房菜。</li></ol><div class="help-note">顶部状态只用于快速确认：麦克风、厨房语音和 Gateway 连接是否正常，不再放测试按钮。</div><div class="modal-actions" style="grid-template-columns:1fr"><button id="helpClose" class="primary">知道了</button></div></div></div>
+<script>
+(function(){
+  var ws=null,retry=1000,httpOK=false,wsOK=false,lastRevision='',currentView=null,latestTimers=[],drafts={},modalTarget=null;
+  var audioCtx=null,audioUnlocked=false,audioMuted=false,lastAudioId='',pendingAudio=null,audioPlaying=false;
+  var qaRecording=false,qaBusy=false,qaStream=null,qaCtx=null,qaSource=null,qaProcessor=null,qaChunks=[],qaSampleRate=0,qaStartedAt=0,qaAutoStop=null,qaSocket=null;
+  var kitchenProtocol='__KITCHEN_PROTOCOL__',qaMaxMs=__KITCHEN_QA_MAX_MS__;
+  var deviceId='KitchenTerminal-iPadMini';
+  try{var saved=localStorage.getItem('kitchen.device_id');if(saved){deviceId=saved;}else{deviceId='KitchenTerminal-iPadMini-'+String(Date.now()).slice(-6);localStorage.setItem('kitchen.device_id',deviceId);}}catch(e){}
+  var $=function(id){return document.getElementById(id);};
+  function setStatus(){var ok=httpOK||wsOK;$('dot').className='dot'+(ok?' online':'');$('statusText').textContent=wsOK?'实时连接':(httpOK?'已连接':'正在重连');}
+  function clearView(){$('content').innerHTML='';$('nav').innerHTML='';$('nav').style.display='none';$('nav').style.gridTemplateColumns='1fr 1fr 1fr';}
+  function el(tag,cls,text){var x=document.createElement(tag);if(cls)x.className=cls;if(text!==undefined&&text!==null)x.textContent=String(text);return x;}
+  function xhrGet(url,cb){var x=new XMLHttpRequest();x.open('GET',url+(url.indexOf('?')>=0?'&':'?')+'_='+Date.now(),true);x.onreadystatechange=function(){if(x.readyState!==4)return;if(x.status>=200&&x.status<300){httpOK=true;setStatus();cb(null,x.responseText);}else{httpOK=false;setStatus();cb(new Error('HTTP '+x.status),'');}};x.onerror=function(){httpOK=false;setStatus();cb(new Error('network'),'');};x.send(null);}
+  function showError(text){$('message').textContent=text;$('footer').textContent='KitchenTerminal __KITCHEN_UI_VERSION__ · 页面错误';}
+  function micStatusState(){var b=$('micState');if(!b)return;var secure=!!window.isSecureContext,gum=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);if(secure&&gum){b.textContent='🎙 麦克风 已就绪';b.className='status-pill ready';}else{b.textContent='🎙 麦克风 不可用';b.className='status-pill bad';}}
+  function audioButtonState(){var b=$('audioState');if(!b)return;if(audioMuted){b.textContent='🔇 语音 已静音';b.className='status-pill bad';}else if(audioUnlocked){b.textContent='🔊 语音 已就绪';b.className='status-pill ready';}else{b.textContent='🔊 语音 待激活';b.className='status-pill wait';}}
+  function unlockAudio(){try{var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unsupported');if(!audioCtx)audioCtx=new C();var p=audioCtx.resume();audioUnlocked=true;audioMuted=false;try{localStorage.setItem('kitchen.audio_enabled','1');localStorage.setItem('kitchen.audio_muted','0');}catch(e){}audioButtonState();if(p&&p.then){p.then(function(){if(pendingAudio)playKitchenAudio(pendingAudio);}).catch(function(){});}else if(pendingAudio){playKitchenAudio(pendingAudio);}}catch(e){var b=$('audioState');if(b){b.textContent='🔇 语音 不可用';b.className='status-pill bad';}showError('无法开启厨房语音：'+String(e));}}
+  try{audioMuted=false;localStorage.setItem('kitchen.audio_muted','0');}catch(e){}micStatusState();audioButtonState();
+  function opportunisticUnlock(){if(!audioUnlocked)unlockAudio();}
+  document.addEventListener('click',opportunisticUnlock,false);
+  function openHelp(){$('helpModal').className='modal show';}
+  function closeHelp(){$('helpModal').className='modal';}
+  $('helpBtn').onclick=openHelp;$('helpClose').onclick=closeHelp;
+  function qaStateLabel(st){var m={idle:'可以提问',listening:'正在听…',uploading:'正在发送…',recognizing:'正在识别…',thinking:'正在回答…',speaking:'正在生成语音…',done:'回答完成',error:'出现问题'};return m[st]||'问逐光';}
+  function qaRender(q){if(!q)return;var st=String(q.status||'idle'),updated=Number(q.updated_at||0),age=updated?((Date.now()/1000)-updated):0;var serverBusy=(st==='uploading'||st==='recognizing'||st==='thinking'||st==='speaking');if(serverBusy&&age>180){serverBusy=false;st='error';q.error='上一条问答状态已超时，已经自动解锁，可以重新提问。';qaBusy=false;}else{qaBusy=serverBusy;}if(!qaRecording){$('qaBtn').disabled=false;$('qaBtn').className='qa-btn'+(qaBusy?' busy':'');$('qaBtn').textContent=qaBusy?'处理中…':'🎙 问逐光';}$('qaStatus').textContent=qaRecording?'正在听…再次点击结束':qaStateLabel(st);$('qaTranscript').textContent=q.transcript?('你：'+q.transcript):'';$('qaAnswer').textContent=q.answer?('逐光：'+q.answer):(st==='error'?(q.error||'语音问答失败'):'');}
+  function qaFloatConcat(parts){var total=0,i;for(i=0;i<parts.length;i++)total+=parts[i].length;var out=new Float32Array(total),p=0;for(i=0;i<parts.length;i++){out.set(parts[i],p);p+=parts[i].length;}return out;}
+  function qaDownsample(input,inRate,outRate){if(!input||!input.length)return new Float32Array(0);if(inRate===outRate)return input;if(outRate>inRate)outRate=inRate;var ratio=inRate/outRate,newLen=Math.max(1,Math.round(input.length/ratio)),out=new Float32Array(newLen),offset=0;for(var i=0;i<newLen;i++){var next=Math.min(input.length,Math.round((i+1)*ratio)),sum=0,count=0;for(var j=offset;j<next;j++){sum+=input[j];count++;}out[i]=count?sum/count:0;offset=next;}return out;}
+  function qaWav(samples,rate){var b=new ArrayBuffer(44+samples.length*2),v=new DataView(b);function ws(o,t){for(var i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));}ws(0,'RIFF');v.setUint32(4,36+samples.length*2,true);ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,'data');v.setUint32(40,samples.length*2,true);var o=44;for(var i=0;i<samples.length;i++,o+=2){var x=Math.max(-1,Math.min(1,samples[i]));v.setInt16(o,x<0?x*32768:x*32767,true);}return b;}
+  function qaStopTracks(stream){if(!stream)return;try{var tracks=stream.getTracks?stream.getTracks():[];for(var i=0;i<tracks.length;i++){try{tracks[i].stop();}catch(e){}}}catch(e){}}
+  function qaCleanupCapture(){if(qaAutoStop){clearTimeout(qaAutoStop);qaAutoStop=null;}try{if(qaProcessor){qaProcessor.disconnect();qaProcessor.onaudioprocess=null;}}catch(e){}try{if(qaSource)qaSource.disconnect();}catch(e){}qaStopTracks(qaStream);qaStream=null;qaProcessor=null;qaSource=null;if(qaCtx){try{qaCtx.close();}catch(e){}}qaCtx=null;}
+  function qaStart(){if(qaBusy){$('qaStatus').textContent='上一条问题还在处理中，请稍候…';return;}if(qaRecording){qaStop();return;}unlockAudio();var gum=navigator.mediaDevices&&navigator.mediaDevices.getUserMedia;if(!gum){qaRender({status:'error',error:'当前页面无法使用麦克风，请确认使用 HTTPS 地址。',updated_at:Date.now()/1000});return;}$('qaBtn').disabled=false;$('qaBtn').className='qa-btn busy';$('qaBtn').textContent='请求麦克风…';$('qaStatus').textContent='正在请求麦克风权限…';navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(stream){qaStream=stream;var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unavailable');qaCtx=new C();try{qaCtx.resume();}catch(e){}qaSampleRate=qaCtx.sampleRate||48000;qaSource=qaCtx.createMediaStreamSource(stream);qaProcessor=qaCtx.createScriptProcessor(4096,1,1);qaChunks=[];qaProcessor.onaudioprocess=function(ev){if(!qaRecording)return;var input=ev.inputBuffer.getChannelData(0);qaChunks.push(new Float32Array(input));};qaSource.connect(qaProcessor);qaProcessor.connect(qaCtx.destination);qaRecording=true;qaStartedAt=Date.now();$('qaBtn').disabled=false;$('qaBtn').className='qa-btn recording';$('qaBtn').textContent='⏹ 结束提问';$('qaStatus').textContent='正在听…再次点击结束';$('qaTranscript').textContent='';$('qaAnswer').textContent='';qaAutoStop=setTimeout(function(){if(qaRecording)qaStop();},qaMaxMs);}).catch(function(err){qaCleanupCapture();qaRecording=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'无法取得麦克风：'+String(err&&err.message?err.message:err),updated_at:Date.now()/1000});});}
+  function qaStop(){if(!qaRecording)return;qaRecording=false;var duration=(Date.now()-qaStartedAt)/1000,parts=qaChunks.slice(),rate=qaSampleRate||48000;qaCleanupCapture();$('qaBtn').className='qa-btn busy';$('qaBtn').disabled=true;$('qaBtn').textContent='处理中…';if(duration<0.35||!parts.length){qaBusy=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'录音太短，请再说一次。',updated_at:Date.now()/1000});return;}var joined=qaFloatConcat(parts),down=qaDownsample(joined,rate,16000),wav=qaWav(down,16000);qaSend(wav);}
+  function qaSend(wav){qaBusy=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='kq-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);qaRender({status:'uploading',request_id:rid,updated_at:Date.now()/1000});try{qaSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');qaSocket.binaryType='arraybuffer';}catch(e){qaBusy=false;qaRender({status:'error',error:'无法建立语音上传连接',updated_at:Date.now()/1000});return;}var finished=false;qaSocket.onopen=function(){try{qaSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,mic_probe:true,qa_ptt:true}}));qaSocket.send(JSON.stringify({type:'kitchen.qa.start',request_id:rid,format:'audio/wav',sample_rate:16000}));qaSocket.send(wav);qaSocket.send(JSON.stringify({type:'kitchen.qa.stop',request_id:rid}));}catch(e){qaRender({status:'error',error:'发送录音失败',updated_at:Date.now()/1000});}};qaSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.qa)qaRender(m.qa);if(m.type==='kitchen.qa.transcript'&&m.text)$('qaTranscript').textContent='你：'+m.text;if(m.type==='kitchen.qa.answer'&&m.text)$('qaAnswer').textContent='逐光：'+m.text;if(m.type==='kitchen.qa.result'){finished=true;qaBusy=false;if(m.qa)qaRender(m.qa);if(m.audio)syncAudio(m.audio);try{qaSocket.close();}catch(e){}}if(m.type==='kitchen.qa.error'){finished=true;qaBusy=false;qaRender(m.qa||{status:'error',error:m.message||'语音问答失败',updated_at:Date.now()/1000});try{qaSocket.close();}catch(e){}}}catch(e){}};qaSocket.onerror=function(){};qaSocket.onclose=function(){qaSocket=null;if(!finished){/* HTTP polling is authoritative and can recover the final result. */}};}
+  function qaTap(ev){if(ev){try{ev.preventDefault();}catch(e){}}qaStart();}if(window.PointerEvent){$('qaBtn').addEventListener('pointerup',qaTap,false);}else{$('qaBtn').addEventListener('click',qaTap,false);}$('qaClear').onclick=function(){$('qaTranscript').textContent='';$('qaAnswer').textContent='';action('qa_dismiss',{},function(){qaRender({status:'idle',updated_at:Date.now()/1000});});};
+  function playKitchenAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;if(!audioUnlocked||audioPlaying)return;if(Number(a.expires_at||0)>0&&Number(a.expires_at)<Date.now()/1000){lastAudioId=a.event_id;pendingAudio=null;return;}audioPlaying=true;fetch(a.url+'&_='+Date.now()).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();}).then(function(buf){return audioCtx.decodeAudioData(buf);}).then(function(decoded){var src=audioCtx.createBufferSource();src.buffer=decoded;src.connect(audioCtx.destination);src.onended=function(){audioPlaying=false;lastAudioId=a.event_id;pendingAudio=null;ackAudio(a.event_id);};src.start(0);}).catch(function(e){audioPlaying=false;console.log('kitchen audio failed',e);});}
+  function syncAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;playKitchenAudio(a);}
+  function ackAudio(id){if(!id)return;xhrGet('/kitchen/action?action=audio_ack&value='+encodeURIComponent(id),function(){});}
+  function action(name,params,cb){var url='/kitchen/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!==''){url+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}}xhrGet(url,function(err,text){if(err){if(cb)cb(err);return;}try{var r=JSON.parse(text);if(r&&r.timers)syncTimers(r.timers);if(r&&r.audio)syncAudio(r.audio);if(r&&r.qa)qaRender(r.qa);if(r&&r.view)render(r.view,true);if(cb)cb(null,r);}catch(e){showError('操作响应解析失败');if(cb)cb(e);}});}
+  function navButton(text,name,primary){var b=el('button',primary?'primary':'',text);b.onclick=function(){action(name);};return b;}
+  function fmt(sec){sec=Math.max(0,Math.ceil(Number(sec)||0));var m=Math.floor(sec/60),s=sec%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;}
+  function remaining(t){if(!t)return 0;if(t.status==='running'&&t.ends_at){return Math.max(0,Math.ceil(Number(t.ends_at)-Date.now()/1000));}return Math.max(0,Number(t.remaining_sec)||0);}
+  function timerForView(v){if(!v||v.type!=='kitchen.show_recipe')return null;for(var i=0;i<latestTimers.length;i++){var t=latestTimers[i];if(t.dish===v.title&&Number(t.step)===Number(v.step))return t;}return null;}
+  function stepSize(sec){sec=Number(sec)||0;if(sec<=90)return 10;if(sec<=600)return 30;return 60;}
+  function draftKey(v){return (v&&v.title?v.title:'')+'#'+String(v&&v.step!==undefined?v.step:0);}
+  function suggested(v){var key=draftKey(v);if(drafts[key])return drafts[key];var hint=v&&v.timer_hint?v.timer_hint:null;var sec=hint&&hint.default_sec?Number(hint.default_sec):30;sec=Math.max(5,Math.min(5999,sec));drafts[key]=sec;return sec;}
+  function setDraft(v,sec){sec=Math.max(5,Math.min(5999,Math.round(sec)));drafts[draftKey(v)]=sec;renderStepTimer(v);}
+  function renderTimerStrip(){var strip=$('timerStrip');strip.innerHTML='';var shown=0;for(var i=0;i<latestTimers.length;i++){(function(t){if(t.status==='finished'&&currentView&&currentView.type==='kitchen.show_recipe'&&t.dish===currentView.title&&Number(t.step)===Number(currentView.step)){return;}var chip=el('div','timer-chip '+t.status);var label=t.dish+' · '+(Number(t.step)+1)+'步';var right=t.status==='finished'?'时间到':fmt(remaining(t));chip.appendChild(el('span','',label));chip.appendChild(el('strong','',right));chip.onclick=function(){action('timer_open',{timer_id:t.timer_id});};if(t.status==='finished'){var x=el('button','chip-x','×');x.setAttribute('aria-label','关闭提醒');x.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();action('timer_dismiss',{timer_id:t.timer_id});};chip.appendChild(x);}strip.appendChild(chip);shown++;})(latestTimers[i]);}strip.style.display=shown?'flex':'none';}
+  function syncTimers(timers){latestTimers=(timers&&timers.length!==undefined)?timers:[];renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe')renderStepTimer(currentView);}
+  function timerButton(text,fn,cls){var b=el('button',cls||'',text);b.onclick=fn;return b;}
+  function openModal(seconds,target){seconds=Math.max(5,Math.min(5999,Math.round(seconds||30)));$('minInput').value=Math.floor(seconds/60);$('secInput').value=seconds%60;modalTarget=target;$('timerModal').className='modal show';setTimeout(function(){try{$('minInput').focus();}catch(e){}},50);}
+  function closeModal(){$('timerModal').className='modal';modalTarget=null;}
+  $('modalCancel').onclick=closeModal;$('modalOK').onclick=function(){var m=parseInt($('minInput').value||'0',10)||0,s=parseInt($('secInput').value||'0',10)||0,total=m*60+s;total=Math.max(5,Math.min(5999,total));var target=modalTarget;closeModal();if(!target)return;if(target.timer){action('timer_set',{timer_id:target.timer.timer_id,seconds:total});}else if(target.view){setDraft(target.view,total);}};
+  function renderStepTimer(v){var host=$('stepTimerHost');if(!host)return;host.innerHTML='';var hint=v.timer_hint||null,t=timerForView(v);if(!hint&&!t)return;var box=el('div','step-timer'+(t&&t.status==='finished'?' finished':''));var left=el('div');left.appendChild(el('div','timer-title',t?'本步骤计时':'建议计时'));var sec=t?remaining(t):suggested(v);var timeEl=el('div','timer-time',fmt(sec));timeEl.id='currentTimerTime';timeEl.onclick=function(){openModal(sec,t?{timer:t}:{view:v});};left.appendChild(timeEl);var state='';if(t){state=t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'时间到');}else if(hint){state='默认 '+fmt(hint.default_sec)+(Number(hint.max_sec)>Number(hint.default_sec)?' · 可延长到 '+fmt(hint.max_sec):'');}left.appendChild(el('div','timer-state',state));box.appendChild(left);var controls=el('div','timer-controls');var step=stepSize(sec);
+    if(!t){controls.appendChild(timerButton('－'+fmt(step),function(){setDraft(v,suggested(v)-step);}));controls.appendChild(timerButton('▶ 开始',function(){action('timer_start',{seconds:suggested(v)});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){setDraft(v,suggested(v)+step);}));controls.appendChild(timerButton('设置',function(){openModal(suggested(v),{view:v});}));}
+    else if(t.status==='running'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}
+    else if(t.status==='paused'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('▶ 继续',function(){action('timer_resume',{timer_id:t.timer_id});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('设置',function(){openModal(sec,{timer:t});}));}
+    else{controls.appendChild(timerButton('＋'+fmt(step)+'继续',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});},'primary'));controls.appendChild(timerButton('重新计时',function(){action('timer_start',{seconds:suggested(v)});}));controls.appendChild(timerButton('完成',function(){action('timer_dismiss',{timer_id:t.timer_id});}));}
+    box.appendChild(controls);host.appendChild(box);
+  }
+  function tickTimers(){renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe'){var t=timerForView(currentView),n=$('currentTimerTime');if(t&&n)n.textContent=fmt(remaining(t));}}
+  function render(v,force){
+    if(!v||!v.type)return;var rev=String(v.revision||'');if(!force&&rev&&rev===lastRevision){currentView=v;return;}if(rev)lastRevision=rev;currentView=v;clearView();
+    $('eyebrow').textContent=v.eyebrow||'HOME AI · 厨房';$('title').textContent=v.title||'厨房终端';$('message').textContent=v.message||'';$('footer').textContent=(v.footer||'')+' · __KITCHEN_UI_VERSION__';
+    if(v.type==='kitchen.show_idle'){var ia=el('div','idle-actions');var pull=el('button','','加载今日菜单');pull.onclick=function(){action('today');};ia.appendChild(pull);$('content').appendChild(ia);return;}
+    if(v.type==='kitchen.show_done'){var note=el('div','done-note','稍后会自动回到等待页面。');$('content').appendChild(note);return;}
+    if(v.type==='kitchen.show_message')return;
+    if(v.type==='kitchen.show_menu'){var grid=el('div','menu');var items=(v.items&&v.items.length!==undefined)?v.items:[];for(var i=0;i<items.length;i++){(function(index){var item=items[index];var label=(typeof item==='string')?item:((item&&item.name)?item.name:('菜品 '+(index+1)));var b=el('button','');b.appendChild(el('span','',label));if(item&&item.has_progress&&Number(item.total_steps)>0){b.appendChild(el('span','menu-progress','继续 · 第 '+(Number(item.progress_step)+1)+' / '+Number(item.total_steps)+' 步'));}b.onclick=function(){action('recipe',{value:label});};grid.appendChild(b);})(i);}$('content').appendChild(grid);var tools=el('div','toolbar');var shop=el('button','action','购物清单');shop.onclick=function(){action('shopping');};tools.appendChild(shop);var time=el('button','action','烧菜顺序');time.onclick=function(){action('timeline');};tools.appendChild(time);var finish=el('button','action finish-btn','结束今日烹饪');finish.onclick=function(){action('finish_start');};tools.appendChild(finish);$('content').appendChild(tools);return;}
+    if(v.type==='kitchen.show_recipe'){$('message').textContent='';var metaText=(v.type_label||'菜谱')+(v.estimated_text?' · '+v.estimated_text:'');$('content').appendChild(el('div','recipe-meta',metaText));var card=el('div','step-card');var stepNum=(parseInt(v.step,10)||0)+1,total=parseInt(v.total_steps,10)||1;card.appendChild(el('div','step-label','步骤 '+stepNum+' / '+total));card.appendChild(el('div','step-text',v.step_text||'（本步骤内容为空）'));var timerHost=el('div','');timerHost.id='stepTimerHost';card.appendChild(timerHost);var tips=v.key_points||[];if(tips.length){var box=el('div','tips');box.appendChild(el('h3','','关键提醒'));var ul=el('ul');for(var j=0;j<tips.length;j++){ul.appendChild(el('li','',tips[j]));}box.appendChild(ul);card.appendChild(box);}$('content').appendChild(card);renderStepTimer(v);$('nav').style.display='grid';$('nav').appendChild(navButton('← 上一步','prev',false));$('nav').appendChild(navButton('返回菜单','menu',false));$('nav').appendChild(navButton('下一步 →','next',true));return;}
+    if(v.type==='kitchen.show_finish'){var wrap=el('div','step-card');wrap.appendChild(el('div','step-label','今日收尾'));wrap.appendChild(el('div','step-text',v.message||'确认结束今天的烹饪？'));var fa=el('div','finish-actions');var back=el('button','','继续烹饪');back.onclick=function(){action('menu');};fa.appendChild(back);var yes=el('button','danger','确认结束');yes.onclick=function(){action('finish_confirm');};fa.appendChild(yes);wrap.appendChild(fa);$('content').appendChild(wrap);return;}
+    if(v.type==='kitchen.show_save_private'){var items2=v.items||[],list=el('div','choice-list');for(var z=0;z<items2.length;z++){var row=el('label','choice-row');var ck=document.createElement('input');ck.type='checkbox';ck.value=items2[z];ck.className='private-choice';row.appendChild(ck);row.appendChild(el('span','',items2[z]));list.appendChild(row);}$('content').appendChild(list);var sa=el('div','finish-actions');var none=el('button','','不保存，直接结束');none.onclick=function(){action('finish_no_save');};sa.appendChild(none);var save=el('button','primary','保存所选并结束');save.onclick=function(){var picked=[],nodes=document.querySelectorAll('.private-choice:checked');for(var n=0;n<nodes.length;n++)picked.push(nodes[n].value);action('finish_save',{value:JSON.stringify(picked)});};sa.appendChild(save);$('content').appendChild(sa);return;}
+    if(v.type==='kitchen.show_shopping'){var groups=v.groups||[];for(var g=0;g<groups.length;g++){var box2=el('section','list-group');box2.appendChild(el('h3','',groups[g].name||''));var ul2=el('ul'),gi=groups[g].items||[];for(var q=0;q<gi.length;q++){ul2.appendChild(el('li','',gi[q]));}box2.appendChild(ul2);$('content').appendChild(box2);}$('nav').style.display='grid';$('nav').style.gridTemplateColumns='1fr';$('nav').appendChild(navButton('返回今日菜单','menu',true));return;}
+    if(v.type==='kitchen.show_timeline'){var ol=el('ol','timeline'),ti=v.items||[];for(var k=0;k<ti.length;k++){ol.appendChild(el('li','',ti[k]));}$('content').appendChild(ol);$('nav').style.display='grid';$('nav').style.gridTemplateColumns='1fr';$('nav').appendChild(navButton('返回今日菜单','menu',true));return;}
+    showError('未知页面类型：'+v.type);
+  }
+  function poll(){xhrGet('/kitchen/view',function(err,text){if(err)return;try{var m=JSON.parse(text);if(m&&m.timers)syncTimers(m.timers);if(m&&m.audio)syncAudio(m.audio);if(m&&m.qa)qaRender(m.qa);if(m&&m.view)render(m.view,false);}catch(e){showError('Gateway 状态解析失败');}});}
+  function connectWS(){var scheme=(location.protocol==='https:')?'wss:':'ws:';try{ws=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');}catch(e){wsOK=false;setStatus();return;}ws.onopen=function(){retry=1000;wsOK=true;setStatus();try{ws.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,mic_probe:true,qa_ptt:true}}));}catch(e){}};ws.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.type==='kitchen.ready'){wsOK=true;setStatus();return;}if(m.type==='kitchen.sync'&&m.view){render(m.view,false);return;}if(m.type&&m.type.indexOf('kitchen.show_')===0){render(m,false);return;}}catch(e){}};ws.onclose=function(){wsOK=false;setStatus();setTimeout(connectWS,retry);retry=Math.min(Math.floor(retry*1.6),10000);};ws.onerror=function(){try{ws.close();}catch(e){}};}
+  window.onerror=function(msg){showError('页面脚本错误：'+String(msg));return false;};
+  poll();setInterval(poll,1000);setInterval(tickTimers,250);connectWS();
+})();
+</script>
+</body>
+</html>'''
+    html = (
+        html.replace("__KITCHEN_UI_VERSION__", KITCHEN_UI_VERSION)
+        .replace("__KITCHEN_PROTOCOL__", KITCHEN_PROTOCOL)
+        .replace("__KITCHEN_QA_MAX_MS__", str(KITCHEN_QA_MAX_SEC * 1000))
+    )
+    return html.encode("utf-8")
+
+
+def _http_response(status: int, reason: str, body: bytes, content_type: str) -> Response:
+    headers = Headers()
+    headers["Content-Type"] = content_type
+    headers["Content-Length"] = str(len(body))
+    headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    headers["Pragma"] = "no-cache"
+    headers["Expires"] = "0"
+    headers["X-Content-Type-Options"] = "nosniff"
+    return Response(status, reason, headers, body)
+
+
+async def gateway_http_request(connection: Any, request: Any) -> Response | None:
+    # Serve KitchenTerminal HTTP without creating a second web server.
+    raw_path = str(getattr(request, "path", "") or "")
+    parsed = urlsplit(raw_path)
+    path = parsed.path
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if path in {WS_PATH, KITCHEN_WS_PATH, KITCHEN_CONTROL_PATH}:
+        return None
+    if path in {KITCHEN_HTTP_PATH, KITCHEN_HTTP_PATH + "/"}:
+        return _http_response(200, "OK", _kitchen_html(), "text/html; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/view":
+        _kitchen_maybe_return_idle()
+        body = json.dumps({
+            "ok": True,
+            "protocol": KITCHEN_PROTOCOL,
+            "view": KITCHEN_CURRENT_VIEW,
+            "state": KITCHEN_CURRENT_STATE,
+            "timers": _kitchen_timer_snapshot(),
+            "audio": _kitchen_audio_public(),
+            "qa": _kitchen_qa_public(),
+            "server_time": datetime.now().astimezone().isoformat(),
+        }, ensure_ascii=False).encode("utf-8")
+        return _http_response(200, "OK", body, "application/json; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/audio":
+        event_id = str((query.get("id") or [""])[0])
+        wav = KITCHEN_AUDIO_CACHE.get(event_id)
+        if wav is None:
+            return _http_response(404, "Not Found", b"audio event not found", "text/plain; charset=utf-8")
+        return _http_response(200, "OK", wav, "audio/wav")
+
+    if path == KITCHEN_HTTP_PATH + "/action":
+        action = str((query.get("action") or [""])[0]).strip().lower()
+        action = {
+            "show_today": "today", "menu.today": "today", "menu.load": "today", "pull_today": "today",
+            "recipe.open": "recipe", "menu.recipe": "recipe",
+            "step.next": "next", "recipe.next": "next", "step.prev": "prev", "recipe.prev": "prev",
+            "menu.back": "menu", "show_menu": "menu",
+            "menu.shopping": "shopping", "show_shopping": "shopping",
+            "menu.timeline": "timeline", "show_timeline": "timeline",
+            "day.finish": "finish_start", "day.finish.confirm": "finish_confirm",
+            "day.finish.none": "finish_no_save", "day.finish.save": "finish_save",
+            "qa.dismiss": "qa_dismiss", "qa.clear": "qa_dismiss",
+        }.get(action, action)
+        value = str((query.get("value") or [""])[0]).strip()
+        timer_id = str((query.get("timer_id") or [""])[0]).strip()
+        seconds_text = str((query.get("seconds") or [""])[0]).strip()
+        try:
+            if action == "today":
+                await _kitchen_show_today_menu()
+            elif action == "recipe":
+                delivered, recipe = await _kitchen_open_recipe_by_name(value, None)
+                if recipe is None:
+                    raise KitchenMenuError(f"recipe not found: {value}")
+            elif action == "next":
+                await _kitchen_move_step(1)
+            elif action == "prev":
+                await _kitchen_move_step(-1)
+            elif action == "menu":
+                menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+                await _kitchen_show_menu(menu)
+            elif action == "shopping":
+                await _kitchen_show_shopping()
+            elif action == "timeline":
+                await _kitchen_show_timeline()
+            elif action == "finish_start":
+                await _kitchen_begin_finish(speak=True)
+            elif action == "finish_confirm":
+                await _kitchen_confirm_finish(speak=True)
+            elif action == "finish_no_save":
+                await _kitchen_finalize_day([], speak=True)
+            elif action == "finish_save":
+                try:
+                    selected = json.loads(value) if value else []
+                except json.JSONDecodeError as exc:
+                    raise KitchenMenuError("invalid recipe selection") from exc
+                if not isinstance(selected, list):
+                    raise KitchenMenuError("invalid recipe selection")
+                await _kitchen_finalize_day([str(x) for x in selected], speak=True)
+            elif action == "timer_open":
+                timer = KITCHEN_TIMERS.get(timer_id)
+                if timer is None:
+                    raise KitchenMenuError("timer not found")
+                delivered, recipe = await _kitchen_open_recipe_by_name(timer.dish, timer.step)
+                if recipe is None:
+                    raise KitchenMenuError(f"recipe not found: {timer.dish}")
+            elif action == "audio_ack":
+                _kitchen_clear_audio(event_id=value)
+            elif action == "timer_start":
+                seconds = int(seconds_text) if seconds_text else None
+                _kitchen_timer_start(seconds)
+            elif action in {"timer_adjust", "timer_set", "timer_pause", "timer_resume", "timer_cancel", "timer_dismiss"}:
+                timer = KITCHEN_TIMERS.get(timer_id) if timer_id else _kitchen_pick_timer()
+                if timer is None:
+                    raise KitchenMenuError("timer not found")
+                if action == "timer_adjust":
+                    _kitchen_timer_adjust(timer, int(seconds_text or "0"))
+                elif action == "timer_set":
+                    _kitchen_timer_set(timer, int(seconds_text or "0"))
+                elif action == "timer_pause":
+                    _kitchen_timer_pause(timer)
+                elif action == "timer_resume":
+                    _kitchen_timer_resume(timer)
+                else:
+                    _kitchen_timer_remove(timer)
+            elif action == "qa_dismiss":
+                _kitchen_qa_set("idle", reset=True)
+            else:
+                raise KitchenMenuError(f"unsupported action: {action}")
+            payload = {"ok": True, "action": action, "view": KITCHEN_CURRENT_VIEW, "state": KITCHEN_CURRENT_STATE, "timers": _kitchen_timer_snapshot(), "audio": _kitchen_audio_public(), "qa": _kitchen_qa_public()}
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            return _http_response(200, "OK", body, "application/json; charset=utf-8")
+        except (KitchenMenuError, ValueError, TypeError) as exc:
+            body = json.dumps({"ok": False, "action": action, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            return _http_response(400, "Bad Request", body, "application/json; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/health":
+        body = json.dumps({
+            "ok": True,
+            "protocol": KITCHEN_PROTOCOL,
+            "clients": len(KITCHEN_SESSIONS),
+            "current_view": str(KITCHEN_CURRENT_VIEW.get("type") or ""),
+            "menu_dir": str(KITCHEN_MENU_DIR),
+            "private_recipe_dir": str(KITCHEN_PRIVATE_RECIPE_DIR),
+            "state": KITCHEN_CURRENT_STATE,
+            "timers": _kitchen_timer_snapshot(),
+            "audio": _kitchen_audio_public(),
+            "qa": _kitchen_qa_public(),
+        }, ensure_ascii=False).encode("utf-8")
+        return _http_response(200, "OK", body, "application/json; charset=utf-8")
+    if path == "/":
+        body = ("HomeAIAgent Gateway\nKitchenTerminal: " + KITCHEN_HTTP_PATH + "\n").encode("utf-8")
+        return _http_response(200, "OK", body, "text/plain; charset=utf-8")
+    return _http_response(404, "Not Found", b"Not Found\n", "text/plain; charset=utf-8")
+
+def _kitchen_set_current_view(payload: dict[str, Any]) -> dict[str, Any]:
+    global KITCHEN_CURRENT_VIEW
+    view = dict(payload)
+    view["protocol"] = KITCHEN_PROTOCOL
+    view["revision"] = str(view.get("revision") or f"k-{int(time.time() * 1000)}")
+    KITCHEN_CURRENT_VIEW = view
+    return view
+
+
+async def kitchen_broadcast(payload: dict[str, Any]) -> int:
+    view = _kitchen_set_current_view(payload)
+    delivered = 0
+    for session in list(KITCHEN_SESSIONS):
+        try:
+            await send_json(session.ws, view)
+            delivered += 1
+        except Exception:
+            pass
+    _vlog(f"[KITCHEN] broadcast type={view.get('type')} clients={delivered}")
+    return delivered
+
+
+def _kitchen_today() -> str:
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _kitchen_load(date_text: str | None = None) -> dict[str, Any]:
+    global KITCHEN_CURRENT_MENU
+    target = date_text or _kitchen_today()
+    menu = load_kitchen_menu(KITCHEN_MENU_DIR, target)
+    KITCHEN_CURRENT_MENU = menu
+    print(
+        f"[KITCHEN] menu loaded date={menu.get('date')} "
+        f"dishes={len(menu.get('items') or [])} source={menu.get('source')}"
+    )
+    return menu
+
+
+def _kitchen_menu_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    servings = menu.get("servings")
+    minutes = menu.get("estimated_minutes")
+    bits = []
+    if servings:
+        bits.append(f"{servings}人份")
+    if minutes:
+        bits.append(f"约{minutes}分钟")
+    date_text = str(menu.get("date") or "")
+    items: list[dict[str, Any]] = []
+    for raw in menu.get("items") or []:
+        item = dict(raw) if isinstance(raw, dict) else {"name": str(raw)}
+        name = str(item.get("name") or "")
+        recipe = recipe_for(menu, name)
+        total = len((recipe or {}).get("steps") or [])
+        step, has_progress = _kitchen_progress_get(date_text, name, total) if total else (0, False)
+        item["progress_step"] = step
+        item["has_progress"] = has_progress
+        item["total_steps"] = total
+        items.append(item)
+    return {
+        "type": "kitchen.show_menu",
+        "eyebrow": f"{menu.get('date','')} {menu.get('weekday','')} · {menu.get('style','家常')}",
+        "title": "今日晚餐",
+        "message": " · ".join(bits) if bits else "选择一道菜查看步骤",
+        "items": items,
+        "footer": "再次进入菜谱会自动继续上次看到的步骤",
+    }
+
+
+def _kitchen_recipe_payload(menu: dict[str, Any], recipe: dict[str, Any], step: int) -> dict[str, Any]:
+    steps = recipe.get("steps") or []
+    if not steps:
+        raise KitchenMenuError(f"recipe has no steps: {recipe.get('name')}")
+    step = max(0, min(int(step), len(steps) - 1))
+    timer_hint = _kitchen_step_timer_hint(recipe, step)
+    return {
+        "type": "kitchen.show_recipe",
+        "eyebrow": f"{menu.get('date','')} · 今日菜谱",
+        "title": str(recipe.get("name") or "菜谱"),
+        "type_label": str(recipe.get("type_label") or ""),
+        "estimated_text": str(recipe.get("estimated_text") or ""),
+        "step": step,
+        "total_steps": len(steps),
+        "step_text": str(steps[step]),
+        "timer_hint": timer_hint,
+        "key_points": recipe.get("key_points") or [],
+        "footer": "语音可说：下一步 / 上一步 / 开始计时 / 还有多久",
+    }
+
+
+def _kitchen_shopping_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "kitchen.show_shopping",
+        "eyebrow": f"{menu.get('date','')} · 采购",
+        "title": "超市购物单",
+        "message": "",
+        "groups": menu.get("shopping") or [],
+        "footer": "今日菜单购物清单",
+    }
+
+
+def _kitchen_timeline_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "kitchen.show_timeline",
+        "eyebrow": f"{menu.get('date','')} · 烹饪安排",
+        "title": "省事操作顺序",
+        "message": "",
+        "items": menu.get("timeline") or [],
+        "footer": "按顺序做，减少厨房同时开战",
+    }
+
+
+async def _kitchen_show_menu(menu: dict[str, Any]) -> int:
+    global KITCHEN_CURRENT_STATE
+    KITCHEN_CURRENT_STATE = {
+        "screen": "menu",
+        "date": str(menu.get("date") or ""),
+        "dish": "",
+        "step": 0,
+    }
+    return await kitchen_broadcast(_kitchen_menu_payload(menu))
+
+
+async def _kitchen_show_today_menu() -> tuple[int, dict[str, Any]]:
+    menu = _kitchen_load()
+    delivered = await _kitchen_show_menu(menu)
+    return delivered, menu
+
+
+async def _kitchen_open_recipe(recipe: dict[str, Any], step: int | None = None) -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None:
+        menu = _kitchen_load()
+    steps = recipe.get("steps") or []
+    if not steps:
+        raise KitchenMenuError(f"recipe has no steps: {recipe.get('name')}")
+    date_text = str(menu.get("date") or "")
+    dish = str(recipe.get("name") or "")
+    if step is None:
+        step, _ = _kitchen_progress_get(date_text, dish, len(steps))
+    step = max(0, min(int(step), len(steps) - 1))
+    _kitchen_progress_set(date_text, dish, step, len(steps))
+    # If a finished timer brought the cook back to exactly this step, opening
+    # the page is the acknowledgement: don't let the top alert reappear later.
+    finished = _kitchen_timer_for_step(dish, step)
+    if finished is not None and finished.status == "finished":
+        _kitchen_timer_remove(finished)
+    KITCHEN_CURRENT_STATE = {
+        "screen": "recipe",
+        "date": date_text,
+        "dish": dish,
+        "step": step,
+    }
+    return await kitchen_broadcast(_kitchen_recipe_payload(menu, recipe, step))
+
+
+async def _kitchen_open_recipe_by_name(name: str, step: int | None = None) -> tuple[int, dict[str, Any] | None]:
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_load()
+    recipe = recipe_for(menu, name) or match_recipe(menu, name)
+    if recipe is None:
+        return 0, None
+    delivered = await _kitchen_open_recipe(recipe, step)
+    return delivered, recipe
+
+
+async def _kitchen_show_shopping() -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_load()
+    KITCHEN_CURRENT_STATE = {
+        "screen": "shopping",
+        "date": str(menu.get("date") or ""),
+        "dish": "",
+        "step": 0,
+    }
+    return await kitchen_broadcast(_kitchen_shopping_payload(menu))
+
+
+async def _kitchen_show_timeline() -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_load()
+    KITCHEN_CURRENT_STATE = {
+        "screen": "timeline",
+        "date": str(menu.get("date") or ""),
+        "dish": "",
+        "step": 0,
+    }
+    return await kitchen_broadcast(_kitchen_timeline_payload(menu))
+
+
+async def _kitchen_move_step(delta: int) -> tuple[int, dict[str, Any] | None, int]:
+    menu = KITCHEN_CURRENT_MENU
+    dish = str(KITCHEN_CURRENT_STATE.get("dish") or "")
+    if menu is None or not dish:
+        return 0, None, 0
+    recipe = recipe_for(menu, dish)
+    if recipe is None:
+        return 0, None, 0
+    steps = recipe.get("steps") or []
+    if not steps:
+        return 0, recipe, 0
+    current = int(KITCHEN_CURRENT_STATE.get("step") or 0)
+    target = max(0, min(current + int(delta), len(steps) - 1))
+    delivered = await _kitchen_open_recipe(recipe, target)
+    return delivered, recipe, target
+
+
+def _kitchen_recipe_context(recipe: dict[str, Any], *, step: int) -> str:
+    steps = recipe.get("steps") or []
+    lines = [f"当前菜品：{recipe.get('name','')}"]
+    if recipe.get("estimated_text"):
+        lines.append(f"预计用时：{recipe.get('estimated_text')}")
+    if recipe.get("ingredients"):
+        lines.append("食材：" + "；".join(str(x) for x in recipe.get("ingredients") or []))
+    if recipe.get("seasoning"):
+        lines.append("调味：" + "；".join(str(x) for x in recipe.get("seasoning") or []))
+    if steps:
+        step = max(0, min(step, len(steps) - 1))
+        lines.append(f"当前步骤：第{step + 1}/{len(steps)}步，{steps[step]}")
+        lines.append("完整步骤：" + "；".join(f"{i+1}.{x}" for i, x in enumerate(steps)))
+    if recipe.get("key_points"):
+        lines.append("关键点：" + "；".join(str(x) for x in recipe.get("key_points") or []))
+    return "\n".join(lines)
+
+
+def _kitchen_agent_context_text() -> str:
+    menu = KITCHEN_CURRENT_MENU
+    state = KITCHEN_CURRENT_STATE
+    if menu is None:
+        return "KitchenTerminal 当前没有已加载菜单。"
+    items = "、".join(str(x.get("name") or "") for x in menu.get("items") or [])
+    lines = [
+        "KitchenTerminal 当前上下文：",
+        f"- 日期：{menu.get('date','')}",
+        f"- 今日菜单：{items}",
+        f"- 当前屏幕：{state.get('screen','idle')}",
+    ]
+    dish = str(state.get("dish") or "")
+    if dish:
+        recipe = recipe_for(menu, dish)
+        if recipe is not None:
+            detail = _kitchen_recipe_context(recipe, step=int(state.get("step") or 0))
+            lines.append(detail)
+            lines.append("当用户说“这个 / 这道菜 / 现在这个”时，优先指当前 KitchenTerminal 菜品和步骤。")
+    active_timers = [t for t in KITCHEN_TIMERS.values() if t.status in {"running", "paused"}]
+    if active_timers:
+        timer_bits = []
+        for timer in sorted(active_timers, key=lambda x: x.created_at)[-6:]:
+            timer_bits.append(
+                f"{timer.dish}第{timer.step + 1}步:{timer.status},剩余{_kitchen_format_duration(_kitchen_timer_remaining(timer))}"
+            )
+        lines.append("厨房计时器：" + "；".join(timer_bits))
+    lines.append("厨房指令集：外部 HomeAgent 使用“厨房”作为固定域前缀，例如“厨房显示今天菜单 / 厨房打开河虾 / 厨房结束今天烹饪”；KitchenTerminal 自身麦克风来源可省略“厨房”。显示/拉取/加载今日菜单；打开/继续某道菜；下一步/上一步/返回菜单；购物清单；烧菜顺序；开始/暂停/继续/增减/取消/查询计时；结束今日烹饪；保存私房菜。自然语言可按这些意图归一处理。")
+    return "\n".join(lines)[:3500]
+
+
+def _kitchen_voice_namespace(transcript: str) -> tuple[str, bool]:
+    """Return text with wake-word/domain prefixes removed and whether 厨房 was explicit."""
+    text = str(transcript or "").strip()
+    text = re.sub(r"^逐光[，,、\s]*", "", text).strip()
+    named = False
+    m = re.match(r"^(?:请)?(?:在)?厨房(?:终端|屏)?[，,、：:\s]*", text)
+    if m:
+        named = True
+        text = text[m.end():].strip()
+    return text, named
+
+
+def _kitchen_voice_source_is_terminal(session: ClientSession | None) -> bool:
+    if session is None:
+        return False
+    return str(getattr(session, "device_id", "") or "").lower().startswith("kitchenterminal")
+
+
+def _kitchen_voice_query_after_open(transcript: str) -> str:
+    text, _ = _kitchen_voice_namespace(transcript)
+    text = re.sub(r"^(?:请)?(?:在)?厨房终端", "", text)
+    text = re.sub(r"^(?:帮我)?(?:打开|显示|看看|看一下|看)", "", text)
+    text = re.sub(r"[。！？!?]+$", "", text).strip()
+    return text
+
+
+def _kitchen_fast_control_intent(transcript: str) -> str | None:
+    """Classify deterministic KitchenTerminal controls without OpenClaw.
+
+    This is deliberately conservative: only imperative/navigation commands live
+    here. Recipe Q&A can still use OpenClaw when it is healthy.
+    """
+    text, _ = _kitchen_voice_namespace(transcript)
+    compact = re.sub(r"[\s，。！？、,.!?：:；;]", "", text)
+
+    today_exact = {
+        "显示今天的菜单", "显示今天菜单", "显示今日菜单", "显示今天的菜谱", "显示今天菜谱",
+        "打开今天的菜单", "打开今天菜单", "打开今日菜单", "打开今天的菜谱",
+        "加载今天的菜单", "加载今天菜单", "加载今日菜单", "拉取今天的菜单", "拉取今天菜单",
+        "调出今天的菜单", "调出今天菜单", "调出今日菜单",
+        "推送菜单", "推送今天菜单", "推送今天的菜单", "推送今日菜单", "菜单推送",
+        "发送菜单", "发送今天菜单", "发送今日菜单", "同步菜单", "同步今日菜单",
+        "今天吃什么", "今天晚饭吃什么",
+        "今天的菜单", "今日菜单", "今天菜单", "今天晚餐", "今日晚餐",
+    }
+    if compact in today_exact:
+        return "menu.today"
+    if (("今天" in compact or "今日" in compact) and any(x in compact for x in ("菜单", "菜谱", "晚餐", "晚饭"))
+            and any(x in compact for x in ("显示", "打开", "加载", "拉取", "调出", "看看", "看下", "推送", "发送", "同步", "投送"))):
+        return "menu.today"
+    # With the explicit 厨房 namespace already stripped by _kitchen_voice_namespace(),
+    # terse commands such as “厨房推送菜单” should stay entirely local and must
+    # never fall through to OpenClaw.
+    if any(x in compact for x in ("菜单", "菜谱")) and any(x in compact for x in ("推送", "发送", "同步", "投送")):
+        return "menu.today"
+
+    if "购物清单" in compact and any(x in compact for x in ("显示", "打开", "看", "给我", "调出", "加载")):
+        return "menu.shopping"
+    if any(x in compact for x in ("烧菜顺序", "烹饪顺序", "做菜顺序", "操作时间线")):
+        return "menu.timeline"
+    if compact in {"下一步", "下一页", "继续", "接下来", "然后呢", "往下", "继续下一步", "接下来怎么做", "下一步怎么做"}:
+        return "step.next"
+    if compact in {"上一步", "上一页", "返回上一步", "往回一步", "退一步", "刚才那一步"}:
+        return "step.prev"
+    if compact in {"返回菜单", "回到菜单", "回菜单", "回到今日菜单", "回到今天的菜单", "看菜单"}:
+        return "menu.back"
+    if any(x in compact for x in ("结束今天的烹饪", "结束今日烹饪", "今天做完了", "今天烧完了", "今天就到这里", "结束烹饪")):
+        return "day.finish"
+    return None
+
+
+def _kitchen_offline_fallback(transcript: str) -> str | None:
+    """Best-effort KitchenTerminal answer when OpenClaw is temporarily down."""
+    text = str(transcript or "").strip()
+    recipe, step = _kitchen_current_recipe()
+    if recipe is None:
+        return None
+    steps = recipe.get("steps") or []
+    if not steps:
+        return None
+    step = max(0, min(int(step), len(steps) - 1))
+    dish = str(recipe.get("name") or "当前菜谱")
+    step_text = str(steps[step]).strip()
+    hint = _kitchen_step_timer_hint(recipe, step)
+
+    if any(x in text for x in ("多久", "多长时间", "几分钟", "几秒", "时间")) and hint:
+        default_sec = int(hint.get("default_sec") or 0)
+        max_sec = int(hint.get("max_sec") or default_sec)
+        if max_sec > default_sec:
+            return (f"逐光暂时无法连接 OpenClaw。{dish}第{step + 1}步建议先计时"
+                    f"{_kitchen_format_duration(default_sec)}，需要时可延长到{_kitchen_format_duration(max_sec)}。")
+        return f"逐光暂时无法连接 OpenClaw。{dish}第{step + 1}步建议计时{_kitchen_format_duration(default_sec)}。"
+
+    if any(x in text for x in ("怎么做", "怎么烧", "怎么煮", "怎么炒", "怎么烤", "这一步", "现在做什么", "接下来做什么")):
+        return f"逐光暂时无法连接 OpenClaw，不过当前菜谱仍可使用。{dish}第{step + 1}步：{step_text[:180]}"
+
+    if any(x in text for x in ("注意", "关键", "提醒", "要点")):
+        points = [str(x).strip() for x in (recipe.get("key_points") or []) if str(x).strip()]
+        if points:
+            return "逐光暂时无法连接 OpenClaw。当前菜谱关键点：" + "；".join(points[:3])
+    return None
+
+
+async def _apply_kitchen_voice_command(session: ClientSession | None, transcript: str) -> str | None:
+    text = transcript.strip()
+    compact = re.sub(r"[\s，。！？、,.!?]", "", text)
+    _, kitchen_namespace = _kitchen_voice_namespace(text)
+    terminal_source = _kitchen_voice_source_is_terminal(session)
+    kitchen_named = kitchen_namespace or ("厨房终端" in text) or ("厨房屏" in text)
+    fast_intent = _kitchen_fast_control_intent(text)
+    if fast_intent and not (kitchen_named or terminal_source):
+        # A3.0b keeps 厨房 as the domain namespace on other HomeAI devices.
+        # Future iPad PTT is already a KitchenTerminal source, so it may omit the prefix.
+        fast_intent = None
+    if fast_intent:
+        print(f"[KITCHEN-INTENT] intent={fast_intent} source=local-fastpath namespace={'kitchen-terminal' if terminal_source else '厨房'} transcript={text!r}")
+
+    show_today = (fast_intent == "menu.today") or (
+        (kitchen_named or terminal_source)
+        and (("今天" in text or "今日" in text) and any(word in text for word in ("菜谱", "菜单", "晚餐", "晚饭")))
+        and (
+            any(word in text for word in ("显示", "打开", "看看", "看一下", "拉取", "加载", "调出", "调出来", "放到厨房", "投到厨房"))
+            or compact in {"今天菜单", "今日菜单", "今天晚餐", "今日晚餐"}
+        )
+    )
+    if show_today:
+        try:
+            delivered, menu = await _kitchen_show_today_menu()
+        except KitchenMenuError as exc:
+            print(f"[KITCHEN-VOICE] today menu failed: {exc}")
+            return "我没有找到今天可以显示的菜单。"
+        count = len(menu.get("items") or [])
+        if delivered:
+            return f"已经在厨房终端打开今天的菜单，共{count}道。"
+        return f"今天的菜单已经准备好了，共{count}道，不过厨房终端现在没有连接。"
+
+    active = KITCHEN_CURRENT_STATE.get("screen") != "idle" and KITCHEN_CURRENT_MENU is not None
+
+    if fast_intent == "menu.shopping":
+        try:
+            delivered = await _kitchen_show_shopping()
+        except KitchenMenuError:
+            return "我没有找到今天的购物清单。"
+        return "购物清单已经显示在厨房终端。" if delivered else "购物清单已经准备好，但厨房终端现在没有连接。"
+
+    if fast_intent == "menu.timeline":
+        try:
+            delivered = await _kitchen_show_timeline()
+        except KitchenMenuError:
+            return "我没有找到今天的烧菜顺序。"
+        return "今天的烧菜顺序已经显示在厨房终端。" if delivered else "烧菜顺序已经准备好，但厨房终端现在没有连接。"
+
+    if fast_intent == "step.next" and active:
+        delivered, recipe, step = await _kitchen_move_step(1)
+        if recipe is None:
+            return "厨房终端现在没有打开具体菜谱。"
+        steps = recipe.get("steps") or []
+        if not steps:
+            return "这道菜没有可用步骤。"
+        prefix = "已经是最后一步。" if step >= len(steps) - 1 else "下一步。"
+        return prefix + str(steps[step])[:120]
+
+    if fast_intent == "step.prev" and active:
+        delivered, recipe, step = await _kitchen_move_step(-1)
+        if recipe is None:
+            return "厨房终端现在没有打开具体菜谱。"
+        steps = recipe.get("steps") or []
+        return "上一步。" + (str(steps[step])[:120] if steps else "")
+
+    if fast_intent == "menu.back" and active:
+        await _kitchen_show_menu(KITCHEN_CURRENT_MENU)
+        return "已经返回今天的菜单。"
+
+    finish_phrases = ("结束今天的烹饪", "结束今日烹饪", "今天做完了", "今天烧完了", "今天就到这里", "结束烹饪")
+    if fast_intent == "day.finish" or any(phrase in text for phrase in finish_phrases):
+        try:
+            await _kitchen_begin_finish(speak=False)
+        except KitchenMenuError:
+            return "今天还没有加载厨房菜单。"
+        return "已经打开今日烹饪的结束确认。确认后，我会问你有没有菜谱要保存到私房菜。"
+
+    screen = str(KITCHEN_CURRENT_STATE.get("screen") or "")
+    if screen == "finish" and compact in {"逐光确认结束", "确认结束", "确认", "结束吧", "是的结束", "结束"}:
+        await _kitchen_confirm_finish(speak=False)
+        return "今天的计时器已经关闭。有没有想保存到私房菜的菜谱？你可以说保存河虾，全部保存，或者都不保存。"
+
+    if screen == "save_private":
+        if any(phrase in text for phrase in ("都不保存", "不保存", "没有要保存", "没有", "直接结束")):
+            await _kitchen_finalize_day([], speak=False)
+            return "好的，今天没有保存新的私房菜。今日烹饪已经结束，辛苦了。"
+        menu = KITCHEN_CURRENT_MENU
+        if menu is not None and any(word in text for word in ("保存", "私房菜")):
+            names: list[str] = []
+            if any(phrase in text for phrase in ("全部保存", "都保存", "全都保存")):
+                names = [str(x.get("name") or "") for x in menu.get("items") or [] if str(x.get("name") or "")]
+            else:
+                for item in menu.get("items") or []:
+                    name = str(item.get("name") or "")
+                    parts = [p for p in re.split(r"[·（）()\s]+", name) if p]
+                    if name and (name in text or any(len(part) >= 2 and part in text for part in parts)):
+                        names.append(name)
+                if not names:
+                    query = re.sub(r"逐光|保存|到|进|私房菜|菜谱|这道菜", "", text).strip(" ，。！？、")
+                    matched = match_recipe(menu, query) if query else None
+                    if matched is not None:
+                        names = [str(matched.get("name") or "")]
+            if names:
+                _, saved = await _kitchen_finalize_day(names, speak=False)
+                if saved:
+                    return "已经把" + "、".join(saved) + "保存到私房菜。今天的烹饪也结束了，辛苦了。"
+            return "我没有确定你想保存哪道菜。可以直接说，比如，保存河虾。"
+
+    # Kitchen timers are local Gateway state, so common voice controls do not
+    # need an OpenClaw round-trip. Current recipe/step is the default target.
+    timer_context = kitchen_named or active or ("计时" in text) or ("定时" in text)
+    if timer_context and any(phrase in text for phrase in ("还有多久", "还剩多久", "剩多久", "剩多长时间")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有正在运行的厨房计时器。"
+        if timer.status == "finished":
+            return f"{timer.dish}第{timer.step + 1}步的计时已经结束。"
+        remaining = _kitchen_timer_remaining(timer)
+        prefix = "暂停中，" if timer.status == "paused" else ""
+        return f"{timer.dish}第{timer.step + 1}步{prefix}还剩{_kitchen_format_duration(remaining)}。"
+
+    if timer_context and any(phrase in text for phrase in ("暂停计时", "暂停定时", "计时暂停")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有可以暂停的厨房计时器。"
+        _kitchen_timer_pause(timer)
+        return f"已经暂停{timer.dish}的计时，还剩{_kitchen_format_duration(_kitchen_timer_remaining(timer))}。"
+
+    if timer_context and any(phrase in text for phrase in ("继续计时", "恢复计时", "继续定时", "恢复定时")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有可以继续的厨房计时器。"
+        _kitchen_timer_resume(timer)
+        return f"已经继续{timer.dish}的计时，还剩{_kitchen_format_duration(_kitchen_timer_remaining(timer))}。"
+
+    if timer_context and any(phrase in text for phrase in ("取消计时", "停止计时", "取消定时", "停止定时")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有可以取消的厨房计时器。"
+        dish = timer.dish
+        _kitchen_timer_remove(timer)
+        return f"已经取消{dish}的计时。"
+
+    duration = _kitchen_duration_from_voice(text)
+    if timer_context and duration is not None and any(word in text for word in ("再加", "加上", "增加", "延长")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有可以延长的厨房计时器。"
+        _kitchen_timer_adjust(timer, duration)
+        return f"已经增加{_kitchen_format_duration(duration)}，现在还剩{_kitchen_format_duration(_kitchen_timer_remaining(timer))}。"
+
+    if timer_context and duration is not None and any(word in text for word in ("减少", "减掉", "减去")):
+        timer = _kitchen_pick_timer(text)
+        if timer is None:
+            return "现在没有可以调整的厨房计时器。"
+        _kitchen_timer_adjust(timer, -duration)
+        return f"已经减少{_kitchen_format_duration(duration)}，现在还剩{_kitchen_format_duration(_kitchen_timer_remaining(timer))}。"
+
+    start_timer = timer_context and (
+        any(phrase in text for phrase in ("开始计时", "开始定时", "启动计时", "启动定时"))
+        or (("计时" in text or "定时" in text) and duration is not None)
+    )
+    if start_timer:
+        try:
+            timer = _kitchen_timer_start(duration)
+        except KitchenMenuError:
+            return "当前步骤没有默认计时。你可以直接说，比如，计时三十秒。"
+        return f"好的，{timer.dish}第{timer.step + 1}步开始计时{_kitchen_format_duration(timer.duration_sec)}。"
+
+    if (kitchen_named or active) and "购物清单" in text and any(word in text for word in ("显示", "打开", "看看", "看", "给我")):
+        try:
+            delivered = await _kitchen_show_shopping()
+        except KitchenMenuError:
+            return "我没有找到今天的购物清单。"
+        return "购物清单已经显示在厨房终端。" if delivered else "购物清单已经准备好，但厨房终端现在没有连接。"
+
+    if (kitchen_named or active) and any(word in text for word in ("烧菜顺序", "烹饪顺序", "做菜顺序", "操作时间线")):
+        try:
+            delivered = await _kitchen_show_timeline()
+        except KitchenMenuError:
+            return "我没有找到今天的烧菜顺序。"
+        return "今天的烧菜顺序已经显示在厨房终端。" if delivered else "烧菜顺序已经准备好，但厨房终端现在没有连接。"
+
+    if active and (compact in {"逐光下一步", "下一步", "下一页", "继续", "接下来", "然后呢", "往下", "继续下一步"} or any(p in text for p in ("下一步怎么做", "接下来怎么做", "然后怎么做"))):
+        delivered, recipe, step = await _kitchen_move_step(1)
+        if recipe is None:
+            return "厨房终端现在没有打开具体菜谱。"
+        steps = recipe.get("steps") or []
+        if not steps:
+            return "这道菜没有可用步骤。"
+        text_step = str(steps[step])
+        if step >= len(steps) - 1:
+            prefix = "已经是最后一步。"
+        else:
+            prefix = "下一步。"
+        return prefix + text_step[:120]
+
+    if active and (compact in {"逐光上一步", "上一步", "上一页", "返回上一步", "往回一步", "退一步"} or "刚才那一步" in text):
+        delivered, recipe, step = await _kitchen_move_step(-1)
+        if recipe is None:
+            return "厨房终端现在没有打开具体菜谱。"
+        steps = recipe.get("steps") or []
+        return "上一步。" + (str(steps[step])[:120] if steps else "")
+
+    if active and (compact in {"逐光返回菜单", "返回菜单", "回到菜单", "回菜单", "今日菜单", "回到今日菜单", "看菜单"} or "回到今天的菜单" in text):
+        await _kitchen_show_menu(KITCHEN_CURRENT_MENU)
+        return "已经返回今天的菜单。"
+
+    if kitchen_named or (active and any(word in text for word in ("打开", "显示", "看看", "看一下", "继续做", "接着做", "切到", "回到", "做到哪"))):
+        try:
+            menu = KITCHEN_CURRENT_MENU
+            if menu is None or str(menu.get("date") or "") != _kitchen_today():
+                menu = _kitchen_load()
+            query = _kitchen_voice_query_after_open(text)
+            recipe = match_recipe(menu, query)
+            if recipe is None:
+                # Fallback: match any unique dish name fragment appearing in the utterance.
+                candidates = []
+                for item in menu.get("items") or []:
+                    name = str(item.get("name") or "")
+                    if name and (name in text or any(part and part in text for part in re.split(r"[·（）()\s]+", name))):
+                        r = recipe_for(menu, name)
+                        if r is not None and r not in candidates:
+                            candidates.append(r)
+                if len(candidates) == 1:
+                    recipe = candidates[0]
+            if recipe is not None:
+                delivered = await _kitchen_open_recipe(recipe, None)
+                steps = recipe.get("steps") or []
+                current_step = int(KITCHEN_CURRENT_STATE.get("step") or 0)
+                current_text = str(steps[current_step])[:100] if steps else ""
+                prefix = f"已经继续打开{recipe.get('name')}第{current_step + 1}步。"
+                if delivered:
+                    return prefix + current_text
+                return f"{recipe.get('name')}第{current_step + 1}步已经准备好，但厨房终端现在没有连接。"
+        except KitchenMenuError:
+            pass
+
+    return None
+
+
+def _kitchen_qa_public() -> dict[str, Any]:
+    return {
+        "status": str(KITCHEN_QA_STATE.get("status") or "idle"),
+        "request_id": str(KITCHEN_QA_STATE.get("request_id") or ""),
+        "transcript": str(KITCHEN_QA_STATE.get("transcript") or ""),
+        "answer": str(KITCHEN_QA_STATE.get("answer") or ""),
+        "error": str(KITCHEN_QA_STATE.get("error") or ""),
+        "audio_event_id": str(KITCHEN_QA_STATE.get("audio_event_id") or ""),
+        "started_at": float(KITCHEN_QA_STATE.get("started_at") or 0.0),
+        "updated_at": float(KITCHEN_QA_STATE.get("updated_at") or 0.0),
+    }
+
+
+def _kitchen_qa_set(
+    status: str,
+    *,
+    request_id: str | None = None,
+    transcript: str | None = None,
+    answer: str | None = None,
+    error: str | None = None,
+    audio_event_id: str | None = None,
+    reset: bool = False,
+) -> dict[str, Any]:
+    now = time.time()
+    if reset:
+        KITCHEN_QA_STATE.update({
+            "status": "idle", "request_id": "", "transcript": "", "answer": "",
+            "error": "", "audio_event_id": "", "started_at": 0.0, "updated_at": now,
+        })
+        return _kitchen_qa_public()
+    if request_id is not None:
+        KITCHEN_QA_STATE["request_id"] = request_id
+    KITCHEN_QA_STATE["status"] = str(status or "idle")
+    if transcript is not None:
+        KITCHEN_QA_STATE["transcript"] = transcript
+    if answer is not None:
+        KITCHEN_QA_STATE["answer"] = answer
+    if error is not None:
+        KITCHEN_QA_STATE["error"] = error
+    if audio_event_id is not None:
+        KITCHEN_QA_STATE["audio_event_id"] = audio_event_id
+    if status in {"listening", "uploading"}:
+        KITCHEN_QA_STATE["started_at"] = now
+        KITCHEN_QA_STATE["transcript"] = ""
+        KITCHEN_QA_STATE["answer"] = ""
+        KITCHEN_QA_STATE["error"] = ""
+        KITCHEN_QA_STATE["audio_event_id"] = ""
+    KITCHEN_QA_STATE["updated_at"] = now
+    return _kitchen_qa_public()
+
+
+async def _kitchen_qa_notify(session: KitchenSession, msg: dict[str, Any]) -> None:
+    try:
+        await send_json(session.ws, msg)
+    except Exception:
+        # Completion is recovered from /kitchen/view if the upload socket drops.
+        pass
+
+
+def build_kitchen_agent_prompt(transcript: str) -> str:
+    context = _kitchen_agent_context_text()
+    return f"""你是家庭AI助手“逐光”，现在通过 KitchenTerminal 与用户在厨房里语音交流。
+回答要自然、简洁、适合直接语音播报。默认 1～4 句，通常控制在 180 个中文字符以内；只有用户明确要求详细步骤时才展开。
+不要使用 Markdown 表格，不要输出标题符号，不要复述系统说明。
+
+你会收到 KitchenTerminal 的实时上下文，包括今天菜单、当前菜品、当前步骤、完整菜谱关键点和正在运行的计时器。用户说“这个”“这一步”“现在这个”时，优先指当前菜品与当前步骤。
+如果问题是“为什么这么做”“没有某个调料怎么办”“太咸/太淡怎么补救”“这个步骤要多久”等，直接结合当前菜谱回答。
+如果用户询问食物是否已经熟、颜色/状态是否正常，但你没有视觉输入，不要假装看见食物；请给出用户可以现场判断的具体标准，需要时再问一个最关键的确认问题。
+不要声称已经操作 KitchenTerminal。页面切换、计时器、结束烹饪等确定性控制由 Gateway 本地指令完成。
+
+{context}
+
+用户现在问：{transcript}
+"""
+
+
+async def openclaw_kitchen_chat(transcript: str) -> str:
+    headers = {"Content-Type": "application/json"}
+    if OPENCLAW_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+    kitchen_user = os.getenv("HOMEAI_KITCHEN_OPENCLAW_USER", "home-ai-kitchen:main").strip() or "home-ai-kitchen:main"
+    payload = {
+        "model": OPENCLAW_MODEL,
+        "user": kitchen_user,
+        "stream": False,
+        "messages": [{"role": "user", "content": build_kitchen_agent_prompt(transcript)}],
+    }
+    async with _openclaw_http_client(OPENCLAW_KITCHEN_TIMEOUT_SEC) as client:
+        r = await _post_with_retry(
+            client,
+            f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        body = r.json()
+    choices = body.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenClaw returned no choices: {body}")
+    content = choices[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+    answer = str(content).strip()
+    if not answer:
+        raise RuntimeError("OpenClaw returned empty KitchenTerminal answer")
+    return answer
+
+
+async def _process_kitchen_qa(session: KitchenSession) -> None:
+    if session.qa_processing:
+        return
+    session.qa_processing = True
+    request_id = session.qa_request_id or ("kq-" + uuid.uuid4().hex[:12])
+    wav_bytes = bytes(session.qa_audio)
+    started = time.perf_counter()
+    try:
+        if len(wav_bytes) < 800:
+            raise RuntimeError("录音太短，请再说一次")
+        if len(wav_bytes) > KITCHEN_QA_MAX_BYTES:
+            raise RuntimeError("录音过长，请控制在二十五秒左右")
+        if not (wav_bytes.startswith(b"RIFF") and wav_bytes[8:12] == b"WAVE"):
+            raise RuntimeError("录音格式不是 WAV")
+
+        _best_effort_write_bytes(HOMEAI_DEBUG_DIR / "latest_input_kitchen.wav", wav_bytes)
+        state = _kitchen_qa_set("recognizing", request_id=request_id)
+        await _kitchen_qa_notify(session, {"type": "kitchen.qa.state", "qa": state})
+        print(f"[KITCHEN-QA] recognizing id={request_id} bytes={len(wav_bytes)}")
+
+        asr_started = time.perf_counter()
+        transcript, asr_used = await transcribe_audio(wav_bytes)
+        asr_ms = int((time.perf_counter() - asr_started) * 1000)
+        transcript = str(transcript or "").strip()
+        if not transcript:
+            raise RuntimeError("没有识别到语音，请再说一次")
+        print(f"[KITCHEN-QA][ASR:{asr_used}] {transcript}")
+        state = _kitchen_qa_set("thinking", request_id=request_id, transcript=transcript)
+        await _kitchen_qa_notify(session, {"type": "kitchen.qa.transcript", "text": transcript, "qa": state})
+
+        agent_started = time.perf_counter()
+        answer = await _apply_kitchen_voice_command(session, transcript)
+        route = "local-control" if answer is not None else "openclaw"
+        if answer is None:
+            print(f"[KITCHEN-QA] OpenClaw begin id={request_id} model={OPENCLAW_MODEL}")
+            try:
+                answer = await openclaw_kitchen_chat(transcript)
+            except Exception as exc:
+                fallback = _kitchen_offline_fallback(transcript)
+                if fallback is None:
+                    raise
+                answer = fallback
+                route = "offline-fallback"
+                print(f"[KITCHEN-QA] OpenClaw unavailable; fallback id={request_id} error={type(exc).__name__}: {exc}")
+        agent_ms = int((time.perf_counter() - agent_started) * 1000)
+        answer = str(answer or "").strip()
+        if not answer:
+            raise RuntimeError("逐光没有生成回答")
+        print(f"[KITCHEN-QA] answer route={route} id={request_id} chars={len(answer)}")
+        _vlog(f"[KITCHEN-QA-TEXT] id={request_id} text={answer!r}")
+
+        state = _kitchen_qa_set("speaking", request_id=request_id, transcript=transcript, answer=answer)
+        await _kitchen_qa_notify(session, {"type": "kitchen.qa.answer", "text": answer, "qa": state})
+
+        tts_started = time.perf_counter()
+        audio = await _kitchen_speak(answer, kind="assistant", source_id=request_id)
+        tts_ms = int((time.perf_counter() - tts_started) * 1000)
+        audio_event_id = str((audio or {}).get("event_id") or "")
+        state = _kitchen_qa_set(
+            "done", request_id=request_id, transcript=transcript, answer=answer,
+            error="", audio_event_id=audio_event_id,
+        )
+        total_ms = int((time.perf_counter() - started) * 1000)
+        print(f"[KITCHEN-QA] done id={request_id} asr={asr_ms}ms agent={agent_ms}ms tts={tts_ms}ms total={total_ms}ms audio={audio_event_id or 'none'}")
+        await _kitchen_qa_notify(session, {
+            "type": "kitchen.qa.result", "ok": True, "transcript": transcript,
+            "answer": answer, "audio": audio, "qa": state,
+        })
+    except Exception as exc:
+        message = str(exc)[:240] or type(exc).__name__
+        state = _kitchen_qa_set("error", request_id=request_id, error=message)
+        print(f"[KITCHEN-QA-ERROR] id={request_id} {type(exc).__name__}: {exc}")
+        _log_traceback()
+        await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": message, "qa": state})
+    finally:
+        session.qa_processing = False
+        session.qa_receiving = False
+        session.qa_audio.clear()
+
+
+async def handle_kitchen_connection(ws: Any) -> None:
+    session = KitchenSession(ws=ws)
+    KITCHEN_SESSIONS.append(session)
+    print("[KITCHEN] terminal connected")
+    try:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                if session.qa_receiving and not session.qa_processing:
+                    if len(session.qa_audio) + len(raw) > KITCHEN_QA_MAX_BYTES:
+                        session.qa_receiving = False
+                        session.qa_audio.clear()
+                        state = _kitchen_qa_set("error", request_id=session.qa_request_id, error="录音过长，请控制在二十五秒左右")
+                        await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": state["error"], "qa": state})
+                    else:
+                        session.qa_audio.extend(raw)
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = str(msg.get("type") or "")
+            if kind == "kitchen.hello":
+                device_id = str(msg.get("device_id") or KITCHEN_DEVICE_ID).strip()
+                session.device_id = device_id or KITCHEN_DEVICE_ID
+                session.hello_received = True
+                await send_json(ws, {
+                    "type": "kitchen.ready",
+                    "protocol": KITCHEN_PROTOCOL,
+                    "device_id": session.device_id,
+                })
+                await send_json(ws, {
+                    "type": "kitchen.sync",
+                    "protocol": KITCHEN_PROTOCOL,
+                    "view": KITCHEN_CURRENT_VIEW,
+                })
+                print(f"[KITCHEN] hello id={session.device_id}")
+            elif kind == "kitchen.qa.start":
+                if session.qa_processing:
+                    await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": "上一条问题还在处理中", "qa": _kitchen_qa_public()})
+                    continue
+                session.qa_request_id = str(msg.get("request_id") or ("kq-" + uuid.uuid4().hex[:12]))[:80]
+                session.qa_audio.clear()
+                session.qa_receiving = True
+                state = _kitchen_qa_set("uploading", request_id=session.qa_request_id)
+                await _kitchen_qa_notify(session, {"type": "kitchen.qa.state", "qa": state})
+                print(f"[KITCHEN-QA] upload start id={session.qa_request_id} device={session.device_id}")
+            elif kind == "kitchen.qa.stop":
+                if not session.qa_receiving:
+                    await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": "没有收到录音", "qa": _kitchen_qa_public()})
+                    continue
+                session.qa_receiving = False
+                print(f"[KITCHEN-QA] upload complete id={session.qa_request_id} bytes={len(session.qa_audio)}")
+                await _process_kitchen_qa(session)
+            elif kind == "kitchen.qa.cancel":
+                session.qa_receiving = False
+                session.qa_audio.clear()
+                _kitchen_qa_set("idle", reset=True)
+            elif kind == "kitchen.item.select":
+                session.current_item = str(msg.get("item") or "")
+                print(f"[KITCHEN] item.select id={session.device_id} index={msg.get('index')} item={session.current_item!r}")
+                try:
+                    delivered, recipe = await _kitchen_open_recipe_by_name(session.current_item, 0)
+                    if recipe is None:
+                        print(f"[KITCHEN-WARN] no recipe for selected item={session.current_item!r}")
+                except KitchenMenuError as exc:
+                    print(f"[KITCHEN-WARN] selected item open failed: {exc}")
+            elif kind == "kitchen.nav":
+                action = str(msg.get("action") or "").strip().lower()
+                try:
+                    if action == "next":
+                        await _kitchen_move_step(1)
+                    elif action == "prev":
+                        await _kitchen_move_step(-1)
+                    elif action == "menu":
+                        menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+                        await _kitchen_show_menu(menu)
+                    elif action == "shopping":
+                        await _kitchen_show_shopping()
+                    elif action == "timeline":
+                        await _kitchen_show_timeline()
+                except KitchenMenuError as exc:
+                    print(f"[KITCHEN-WARN] nav action={action!r} failed: {exc}")
+            elif kind == "kitchen.state":
+                session.current_view = str(msg.get("view") or session.current_view)
+                session.current_item = str(msg.get("item") or session.current_item)
+                try:
+                    session.current_step = max(0, int(msg.get("step") or 0))
+                except (TypeError, ValueError):
+                    session.current_step = 0
+    except ConnectionClosed as exc:
+        print(f"[KITCHEN] terminal closed code={getattr(exc, 'code', None)} reason={getattr(exc, 'reason', '')!r}")
+    finally:
+        # If the dedicated Q&A upload socket disappears after qa.start but before
+        # qa.stop, the old code left the global state stuck at `uploading`. The
+        # iPad then kept rendering a busy Q&A button which looked completely dead.
+        if session.qa_receiving and not session.qa_processing:
+            abandoned_id = session.qa_request_id
+            session.qa_receiving = False
+            session.qa_audio.clear()
+            _kitchen_qa_set("error", request_id=abandoned_id, error="录音连接中断，请重新点击问逐光")
+            print(f"[KITCHEN-QA-WARN] abandoned upload reset id={abandoned_id or 'unknown'}")
+        if session in KITCHEN_SESSIONS:
+            KITCHEN_SESSIONS.remove(session)
+        print(f"[KITCHEN] terminal disconnected id={session.device_id}")
+
+
+def _is_loopback_peer(ws: Any) -> bool:
+    peer = getattr(ws, "remote_address", None)
+    if isinstance(peer, tuple) and peer:
+        host = str(peer[0] or "")
+        return host in {"127.0.0.1", "::1"} or host.startswith("::ffff:127.")
+    return False
+
+
+async def handle_kitchen_control(ws: Any) -> None:
+    # Local-only A1 debug/control socket used by kitchen_send.py.
+    if not _is_loopback_peer(ws):
+        await ws.close(code=1008, reason="kitchen control is localhost-only")
+        return
+    print("[KITCHEN] local control connected")
+    try:
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                continue
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            kind = str(msg.get("type") or "")
+            if kind in {"kitchen.show_idle", "kitchen.show_menu", "kitchen.show_message"}:
+                delivered = await kitchen_broadcast(msg)
+                await send_json(ws, {
+                    "type": "kitchen.control.ack",
+                    "status": "applied",
+                    "command": kind,
+                    "clients": delivered,
+                    "revision": KITCHEN_CURRENT_VIEW.get("revision"),
+                })
+            elif kind == "kitchen.control.today":
+                try:
+                    delivered, menu = await _kitchen_show_today_menu()
+                    await send_json(ws, {
+                        "type": "kitchen.control.ack",
+                        "status": "applied",
+                        "command": kind,
+                        "clients": delivered,
+                        "date": menu.get("date"),
+                        "dishes": len(menu.get("items") or []),
+                    })
+                except KitchenMenuError as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.recipe":
+                try:
+                    raw_step = msg.get("step")
+                    delivered, recipe = await _kitchen_open_recipe_by_name(str(msg.get("dish") or ""), int(raw_step) if raw_step is not None else None)
+                    if recipe is None:
+                        raise KitchenMenuError("dish not found")
+                    await send_json(ws, {
+                        "type": "kitchen.control.ack",
+                        "status": "applied",
+                        "command": kind,
+                        "clients": delivered,
+                        "dish": recipe.get("name"),
+                        "step": KITCHEN_CURRENT_STATE.get("step"),
+                    })
+                except (KitchenMenuError, ValueError, TypeError) as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.shopping":
+                try:
+                    delivered = await _kitchen_show_shopping()
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "clients": delivered})
+                except KitchenMenuError as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.timeline":
+                try:
+                    delivered = await _kitchen_show_timeline()
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "clients": delivered})
+                except KitchenMenuError as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.finish":
+                try:
+                    delivered = await _kitchen_begin_finish(speak=False)
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "clients": delivered})
+                except KitchenMenuError as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.finish_confirm":
+                delivered = await _kitchen_confirm_finish(speak=False)
+                await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "clients": delivered})
+            elif kind == "kitchen.control.finish_save":
+                names = msg.get("dishes") if isinstance(msg.get("dishes"), list) else []
+                delivered, saved = await _kitchen_finalize_day([str(x) for x in names], speak=False)
+                await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "clients": delivered, "saved": saved})
+            elif kind == "kitchen.control.timer_start":
+                try:
+                    raw_seconds = msg.get("seconds")
+                    timer = _kitchen_timer_start(int(raw_seconds) if raw_seconds is not None else None)
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "timer": _kitchen_timer_public(timer)})
+                except (KitchenMenuError, ValueError, TypeError) as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind in {"kitchen.control.timer_adjust", "kitchen.control.timer_set", "kitchen.control.timer_pause", "kitchen.control.timer_resume", "kitchen.control.timer_cancel"}:
+                timer = KITCHEN_TIMERS.get(str(msg.get("timer_id") or "")) or _kitchen_pick_timer()
+                if timer is None:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": "timer not found"})
+                    continue
+                try:
+                    if kind == "kitchen.control.timer_adjust":
+                        _kitchen_timer_adjust(timer, int(msg.get("seconds") or 0))
+                    elif kind == "kitchen.control.timer_set":
+                        _kitchen_timer_set(timer, int(msg.get("seconds") or 0))
+                    elif kind == "kitchen.control.timer_pause":
+                        _kitchen_timer_pause(timer)
+                    elif kind == "kitchen.control.timer_resume":
+                        _kitchen_timer_resume(timer)
+                    else:
+                        _kitchen_timer_remove(timer)
+                        timer = None
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "applied", "command": kind, "timer": (_kitchen_timer_public(timer) if timer is not None else None), "timers": _kitchen_timer_snapshot()})
+                except (KitchenMenuError, ValueError, TypeError) as exc:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": str(exc)})
+            elif kind == "kitchen.control.speak":
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": "text is empty"})
+                    continue
+                event = await _kitchen_speak(text, kind=str(msg.get("kind") or "debug"))
+                await send_json(ws, {"type": "kitchen.control.ack", "status": "applied" if event else "rejected", "command": kind, "audio": event})
+            elif kind == "kitchen.control.status":
+                await send_json(ws, {
+                    "type": "kitchen.control.status",
+                    "protocol": KITCHEN_PROTOCOL,
+                    "clients": len(KITCHEN_SESSIONS),
+                    "menu_dir": str(KITCHEN_MENU_DIR),
+                    "state": KITCHEN_CURRENT_STATE,
+                    "view": KITCHEN_CURRENT_VIEW,
+                    "timers": _kitchen_timer_snapshot(),
+                    "audio": _kitchen_audio_public(),
+                })
+            else:
+                await send_json(ws, {"type": "kitchen.control.ack", "status": "rejected", "message": "unsupported control command"})
+    except ConnectionClosed:
+        pass
+    finally:
+        print("[KITCHEN] local control disconnected")
+
+
 async def handle_connection(ws) -> None:
     request = getattr(ws, "request", None)
     path = getattr(request, "path", "") if request is not None else ""
-    if path and path.split("?", 1)[0] != WS_PATH:
+    clean_path = path.split("?", 1)[0] if path else WS_PATH
+
+    if clean_path == KITCHEN_WS_PATH:
+        await handle_kitchen_connection(ws)
+        return
+    if clean_path == KITCHEN_CONTROL_PATH:
+        await handle_kitchen_control(ws)
+        return
+    if clean_path != WS_PATH:
         await ws.close(code=1008, reason="wrong path")
         return
 
@@ -5783,14 +8097,14 @@ async def handle_connection(ws) -> None:
                         reason="device_hello",
                     )
                 else:
-                    print(
+                    _vlog(
                         f"[DISPLAY] policy unsupported; skip id={session.device_id}"
                     )
 
                 if _supports_info_feed(session):
                     await send_info_sync(session)
                 else:
-                    print(
+                    _vlog(
                         f"[INFO] feed unsupported; skip id={session.device_id}"
                     )
 
@@ -5817,7 +8131,7 @@ async def handle_connection(ws) -> None:
                 busy = bool(msg.get("busy"))
                 manual_wake = bool(msg.get("manual_wake_active"))
 
-                print(
+                _vlog(
                     f"[DISPLAY] device ACK requested={requested} "
                     f"status={status} sleeping={sleeping} "
                     f"busy={busy} manual_wake={manual_wake} "
@@ -5837,7 +8151,7 @@ async def handle_connection(ws) -> None:
                     # Some existing firmware paths can emit the same final
                     # applied ACK twice. It is already confirmed, so this is
                     # benign and should not pollute logs as a stale warning.
-                    print(
+                    _vlog(
                         f"[DISPLAY] duplicate ACK ignored "
                         f"command_id={command_id}"
                     )
@@ -5853,7 +8167,7 @@ async def handle_connection(ws) -> None:
                 requested = str(msg.get("requested") or "")
                 status = str(msg.get("status") or "")
                 visible = bool(msg.get("visible"))
-                print(
+                _vlog(
                     f"[GLASS2] device ACK requested={requested} "
                     f"status={status} visible={visible} command_id={command_id}"
                 )
@@ -5870,7 +8184,7 @@ async def handle_connection(ws) -> None:
                     )
 
             elif kind == "info.ack":
-                print(f"[INFO] device ack revision={FEED_REVISION}")
+                _vlog(f"[INFO] device ack revision={FEED_REVISION}")
 
             elif kind == "ptt.start":
                 if _is_speaker_session(session):
@@ -5917,13 +8231,18 @@ async def handle_connection(ws) -> None:
                 await send_state(ws, "idle")
 
             elif kind == "playback.slot_ready":
-                print("[AUDIO] device TTS slot ready")
+                _vlog("[AUDIO] device TTS slot ready")
                 if session.playback_sequence_active:
+                    session.playback_completed_segments = min(
+                        session.playback_total_segments,
+                        session.playback_completed_segments + 1,
+                    )
                     session.playback_slot_ready_event.set()
 
             elif kind == "playback.done":
                 print("[AUDIO] device playback done")
                 if session.playback_sequence_active:
+                    session.playback_completed_segments = session.playback_total_segments
                     session.playback_done_event.set()
                 else:
                     session.processing = False
@@ -5944,6 +8263,10 @@ async def handle_connection(ws) -> None:
         reason = getattr(exc, "reason", "")
         print(f"[WS] client connection closed code={code} reason={reason!r}")
     finally:
+        if session.playback_sequence_active:
+            # Wake any send_pcm_for_playback waiter immediately. Without this,
+            # a dead speaker socket can sit until the playback timeout expires.
+            session.playback_error_event.set()
         if session.display_policy_task is not None:
             session.display_policy_task.cancel()
         if session in ACTIVE_SESSIONS:
@@ -5988,6 +8311,12 @@ async def preflight(*, require_openclaw: bool = True) -> int:
         f"rate={VOLCENGINE_TTS_SAMPLE_RATE}"
     )
     print(f"[CFG] OpenClaw={OPENCLAW_BASE_URL} model={OPENCLAW_MODEL}")
+    print(
+        f"[CFG] OpenClaw http trust_env={_openclaw_http_trust_env()} "
+        f"timeouts=chat:{OPENCLAW_CHAT_TIMEOUT_SEC:.0f}s/"
+        f"kitchen:{OPENCLAW_KITCHEN_TIMEOUT_SEC:.0f}s/"
+        f"info:{OPENCLAW_INFO_TIMEOUT_SEC:.0f}s"
+    )
     print(
         f"[CFG] OpenClaw transport={OPENCLAW_TRANSPORT} "
         f"ssh={OPENCLAW_SSH_USER}@{OPENCLAW_SSH_HOST} "
@@ -6044,6 +8373,10 @@ async def preflight(*, require_openclaw: bool = True) -> int:
     if MODE != "full":
         print("[WARN] P0_MODE is not 'full'; full AI conversation is disabled.")
 
+    if OPENCLAW_TRANSPORT == "embedded_ssh" and (not OPENCLAW_SSH_USER or not OPENCLAW_SSH_HOST):
+        print("[FAIL] embedded SSH requires OPENCLAW_SSH_USER and OPENCLAW_SSH_HOST in persistent config.")
+        return 2
+
     for kind, primary, fallback in (
         ("ASR", ASR_PROVIDER, ASR_FALLBACK),
         ("TTS", TTS_PROVIDER, TTS_FALLBACK),
@@ -6083,7 +8416,7 @@ async def preflight(*, require_openclaw: bool = True) -> int:
         headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with _openclaw_http_client(10) as client:
             r = await client.get(f"{OPENCLAW_BASE_URL}/v1/models", headers=headers)
             r.raise_for_status()
             body = r.json()
@@ -6124,6 +8457,8 @@ async def main() -> None:
 
     REMINDER_LOCK = asyncio.Lock()
     load_reminder_queue()
+    load_kitchen_timers()
+    load_kitchen_progress()
     load_info_skill_cache()
     load_gold_quote_cache()
 
@@ -6168,32 +8503,36 @@ async def main() -> None:
     else:
         print("[MODE] loopback: Mic -> Gateway -> StickS3 speaker")
     print(f"[WS] listening on ws://{HOST}:{PORT}{WS_PATH}")
+    print(f"[KITCHEN] UI http://<gateway-lan-ip>:{PORT}{KITCHEN_HTTP_PATH}")
+    print(f"[KITCHEN] WS ws://<gateway-lan-ip>:{PORT}{KITCHEN_WS_PATH}")
     async with websockets.serve(
         handle_connection,
         HOST,
         PORT,
         max_size=2 * 1024 * 1024,
         ping_interval=None,  # P0: avoid false disconnects during embedded audio work
+        process_request=gateway_http_request,
     ):
         info_task = asyncio.create_task(info_skill_poll_loop())
         gold_task = asyncio.create_task(gold_quote_loop())
         display_task = asyncio.create_task(display_schedule_loop())
         display_reconcile_task = asyncio.create_task(display_reconcile_loop())
         reminder_task = asyncio.create_task(reminder_dispatch_loop())
+        kitchen_timer_task = asyncio.create_task(kitchen_timer_loop())
         notification_listener_task = asyncio.create_task(openclaw_voice_session_listener_loop())
         try:
             await asyncio.Future()
         finally:
-            info_task.cancel()
-            gold_task.cancel()
-            display_task.cancel()
-            display_reconcile_task.cancel()
-            reminder_task.cancel()
-            notification_listener_task.cancel()
+            service_tasks = [
+                info_task, gold_task, display_task, display_reconcile_task,
+                reminder_task, kitchen_timer_task, notification_listener_task,
+            ]
+            for task in service_tasks:
+                task.cancel()
             transport_task.cancel()
             if OPENCLAW_TRANSPORT_MANAGER is not None:
                 await OPENCLAW_TRANSPORT_MANAGER.close()
-            await asyncio.gather(transport_task, return_exceptions=True)
+            await asyncio.gather(*service_tasks, transport_task, return_exceptions=True)
 
 
 async def check_main() -> int:

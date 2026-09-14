@@ -21,8 +21,8 @@ except Exception:  # pragma: no cover - surfaced clearly at runtime
 @dataclass(frozen=True)
 class OpenClawTransportConfig:
     mode: str = "embedded_ssh"
-    ssh_user: str = "yuanxiang"
-    ssh_host: str = "100.105.66.46"
+    ssh_user: str = ""
+    ssh_host: str = ""
     local_host: str = "127.0.0.1"
     local_port: int = 18790
     remote_host: str = "127.0.0.1"
@@ -87,6 +87,10 @@ class OpenClawTransportManager:
             return
         if mode != "embedded_ssh":
             raise RuntimeError(f"unsupported OPENCLAW_TRANSPORT={self.config.mode!r}")
+        if not self.config.ssh_user or not self.config.ssh_host:
+            raise RuntimeError(
+                "embedded SSH requires OPENCLAW_SSH_USER and OPENCLAW_SSH_HOST"
+            )
         if asyncssh is None:
             raise RuntimeError(
                 "embedded SSH transport requires asyncssh==2.14.2; "

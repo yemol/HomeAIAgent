@@ -4,73 +4,54 @@ cd "$(dirname "$0")"
 source ./homeai_env.sh
 
 mkdir -p "$HOMEAI_CONFIG_DIR"
-if [ -f "$HOMEAI_CONFIG_FILE" ]; then
+if [ ! -f "$HOMEAI_CONFIG_FILE" ]; then
+  cp ./gateway.env.example "$HOMEAI_CONFIG_FILE"
+  chmod 600 "$HOMEAI_CONFIG_FILE"
+  echo "[INFO] Created config from gateway.env.example"
+else
   STAMP="$(date +%Y%m%d_%H%M%S)"
   cp "$HOMEAI_CONFIG_FILE" "$HOMEAI_CONFIG_FILE.bak_$STAMP"
   chmod 600 "$HOMEAI_CONFIG_FILE.bak_$STAMP"
   echo "[BACKUP] $HOMEAI_CONFIG_FILE.bak_$STAMP"
 fi
 
-echo "重新配置 HomeAIAgent 持久配置。"
-read -s "VOLC_KEY?VOLCENGINE_API_KEY: "
+echo "Reconfigure HomeAIAgent persistent connection settings."
+echo "Press Enter for secret fields to keep the existing value."
+
+read -s "VOLC_KEY?VOLCENGINE_API_KEY (Enter=keep): "
 echo
-read -s "OPENCLAW_KEY?OpenClaw token: "
+read -s "OPENCLAW_KEY?OPENCLAW_TOKEN (Enter=keep): "
 echo
 
-read "SSH_USER?Air SSH user [yuanxiang]: "
-SSH_USER="${SSH_USER:-yuanxiang}"
-read "SSH_HOST?Air Tailscale IP [100.105.66.46]: "
-SSH_HOST="${SSH_HOST:-100.105.66.46}"
-read "LOCAL_PORT?Mini tunnel port [18790]: "
-LOCAL_PORT="${LOCAL_PORT:-18790}"
-read "REMOTE_PORT?Air OpenClaw port [18789]: "
-REMOTE_PORT="${REMOTE_PORT:-18789}"
+CURRENT_USER="$(homeai_config_get OPENCLAW_SSH_USER)"
+CURRENT_HOST="$(homeai_config_get OPENCLAW_SSH_HOST)"
+CURRENT_LOCAL_PORT="$(homeai_config_get OPENCLAW_LOCAL_PORT)"
+CURRENT_REMOTE_PORT="$(homeai_config_get OPENCLAW_REMOTE_PORT)"
+CURRENT_LOCAL_PORT="${CURRENT_LOCAL_PORT:-18790}"
+CURRENT_REMOTE_PORT="${CURRENT_REMOTE_PORT:-18789}"
 
-TMP="$HOMEAI_CONFIG_FILE.tmp"
-cat > "$TMP" <<EOF
-P0_MODE=full
-GATEWAY_HOST=0.0.0.0
-GATEWAY_PORT=8765
-GATEWAY_PATH=/companion
-ASR_PROVIDER=volcengine
-TTS_PROVIDER=volcengine
-ASR_FALLBACK=none
-TTS_FALLBACK=none
-VOLCENGINE_API_KEY=${VOLC_KEY}
-VOLCENGINE_ASR_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
-VOLCENGINE_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
-VOLCENGINE_ASR_CHUNK_MS=200
-VOLCENGINE_ASR_SEND_INTERVAL_MS=100
-VOLCENGINE_ASR_ENABLE_NONSTREAM=true
-VOLCENGINE_ASR_END_WINDOW_MS=800
-VOLCENGINE_ASR_FORCE_TO_SPEECH_MS=1000
-VOLCENGINE_ASR_CONNECT_TIMEOUT=8
-VOLCENGINE_ASR_FINAL_TIMEOUT=12
-VOLCENGINE_TTS_ENDPOINT=wss://openspeech.bytedance.com/api/v3/tts/unidirectional/stream
-VOLCENGINE_TTS_RESOURCE_ID=seed-tts-2.0
-VOLCENGINE_TTS_VOICE=zh_female_vv_uranus_bigtts
-VOLCENGINE_TTS_SAMPLE_RATE=16000
-VOLCENGINE_TTS_SPEECH_RATE=0
-VOLCENGINE_TTS_LOUDNESS_RATE=0
-DEVICE_TTS_SEGMENT_MAX_BYTES=786432
-DEVICE_TTS_PLAYBACK_MARGIN_SEC=15
-OPENAI_API_KEY=
-OPENCLAW_BASE_URL=http://127.0.0.1:${LOCAL_PORT}
-OPENCLAW_TOKEN=${OPENCLAW_KEY}
-OPENCLAW_MODEL=openclaw/default
-OPENCLAW_USER=home-ai-agent:main
-MAX_AGENT_CHARS=600
-OPENCLAW_TRANSPORT=embedded_ssh
-OPENCLAW_SSH_USER=${SSH_USER}
-OPENCLAW_SSH_HOST=${SSH_HOST}
-OPENCLAW_LOCAL_PORT=${LOCAL_PORT}
-OPENCLAW_REMOTE_PORT=${REMOTE_PORT}
-OPENCLAW_SSH_CONNECT_TIMEOUT_SEC=10
-OPENCLAW_SSH_RECONNECT_MIN_SEC=2
-OPENCLAW_SSH_RECONNECT_MAX_SEC=30
-OPENCLAW_SSH_STARTUP_WAIT_SEC=15
-EOF
-chmod 600 "$TMP"
-mv "$TMP" "$HOMEAI_CONFIG_FILE"
-unset VOLC_KEY OPENCLAW_KEY
-echo "[OK] Updated: $HOMEAI_CONFIG_FILE"
+read "SSH_USER?OpenClaw SSH user [${CURRENT_USER:-required}]: "
+SSH_USER="${SSH_USER:-$CURRENT_USER}"
+[ -n "$SSH_USER" ] || { echo "[FAIL] SSH user cannot be empty."; exit 3; }
+
+read "SSH_HOST?OpenClaw Tailscale IP / hostname [${CURRENT_HOST:-required}]: "
+SSH_HOST="${SSH_HOST:-$CURRENT_HOST}"
+[ -n "$SSH_HOST" ] || { echo "[FAIL] SSH host cannot be empty."; exit 3; }
+
+read "LOCAL_PORT?Local tunnel port [$CURRENT_LOCAL_PORT]: "
+LOCAL_PORT="${LOCAL_PORT:-$CURRENT_LOCAL_PORT}"
+read "REMOTE_PORT?Remote OpenClaw port [$CURRENT_REMOTE_PORT]: "
+REMOTE_PORT="${REMOTE_PORT:-$CURRENT_REMOTE_PORT}"
+
+[ -z "$VOLC_KEY" ] || homeai_upsert_config_value VOLCENGINE_API_KEY "$VOLC_KEY"
+[ -z "$OPENCLAW_KEY" ] || homeai_upsert_config_value OPENCLAW_TOKEN "$OPENCLAW_KEY"
+homeai_upsert_config_value OPENCLAW_SSH_USER "$SSH_USER"
+homeai_upsert_config_value OPENCLAW_SSH_HOST "$SSH_HOST"
+homeai_upsert_config_value OPENCLAW_LOCAL_PORT "$LOCAL_PORT"
+homeai_upsert_config_value OPENCLAW_REMOTE_PORT "$REMOTE_PORT"
+homeai_upsert_config_value OPENCLAW_BASE_URL "http://127.0.0.1:${LOCAL_PORT}"
+chmod 600 "$HOMEAI_CONFIG_FILE"
+unset VOLC_KEY OPENCLAW_KEY SSH_USER SSH_HOST
+
+echo "[OK] Updated connection settings without replacing unrelated config keys:"
+echo "     $HOMEAI_CONFIG_FILE"

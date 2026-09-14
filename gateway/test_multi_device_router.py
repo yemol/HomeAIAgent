@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
-import asyncio
 import os
 import sys
-from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(__file__))
 import companion_gateway as cg

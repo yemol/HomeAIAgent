@@ -33,7 +33,77 @@ homeai_source_config() {
   set +a
 }
 
-homeai_apply_a46_voice_migration() {
+
+homeai_config_get() {
+  local key="$1"
+  local cfg="${2:-$HOMEAI_CONFIG_FILE}"
+  [ -f "$cfg" ] || return 0
+  grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$cfg" 2>/dev/null \
+    | tail -n 1 | cut -d= -f2- || true
+}
+
+homeai_upsert_config_value() {
+  local key="$1"
+  local value="$2"
+  local cfg="${3:-$HOMEAI_CONFIG_FILE}"
+  local tmp="${cfg}.tmp.$$"
+  mkdir -p "$(dirname "$cfg")"
+  [ -f "$cfg" ] || : > "$cfg"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^[[:space:]]*(export[[:space:]]+)?" key "=" {
+      if (!done) {
+        print key "=" value
+        done = 1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) print key "=" value
+    }
+  ' "$cfg" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$cfg"
+}
+
+
+homeai_missing_required_config() {
+  local missing=()
+  local key value
+  for key in \
+    VOLCENGINE_API_KEY \
+    OPENCLAW_TOKEN \
+    OPENCLAW_SSH_USER \
+    OPENCLAW_SSH_HOST
+  do
+    value="$(homeai_config_get "$key")"
+    if [ -z "$value" ]; then
+      missing+=("$key")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    printf '%s\n' "${missing[@]}"
+    return 1
+  fi
+  return 0
+}
+
+homeai_require_complete_config() {
+  local missing
+  missing="$(homeai_missing_required_config || true)"
+  if [ -n "$missing" ]; then
+    echo "[FAIL] Persistent config is incomplete: $HOMEAI_CONFIG_FILE"
+    echo "$missing" | while IFS= read -r key; do
+      [ -n "$key" ] && echo "       missing: $key"
+    done
+    echo "Run ./configure_mac.sh once to repair the persistent config."
+    echo "The values are written to $HOMEAI_CONFIG_FILE and survive reboot/project replacement."
+    exit 2
+  fi
+}
+
+homeai_enforce_standard_voice() {
   # Standard-voice convergence guard.
   # Do not rely on a one-time marker: every Gateway start verifies the persisted
   # values and rewrites only the TTS resource/voice fields when they drift.
@@ -52,8 +122,8 @@ homeai_apply_a46_voice_migration() {
   if [ "$current_voice" != "$desired_voice" ] || [ "$current_resource" != "$desired_resource" ]; then
     local stamp tmp backup
     stamp="$(date +%Y%m%d_%H%M%S)"
-    backup="$cfg.bak_a46_a1r7_standard_voice_$stamp"
-    tmp="$cfg.tmp_a46_a1r7_standard_voice_$$"
+    backup="$cfg.bak_standard_voice_$stamp"
+    tmp="$cfg.tmp_standard_voice_$$"
     cp "$cfg" "$backup"
     chmod 600 "$backup"
 

@@ -7,7 +7,8 @@ source ./homeai_runtime.sh
 
 homeai_migrate_legacy_env "./.env"
 homeai_require_config
-homeai_apply_a46_voice_migration
+homeai_require_complete_config
+homeai_enforce_standard_voice
 homeai_activate_runtime "./requirements.txt"
 homeai_source_config
 
@@ -32,6 +33,14 @@ if [ "$TRANSPORT" = "embedded_ssh" ] && nc -z 127.0.0.1 "$LOCAL_PORT" >/dev/null
   echo "Stop any legacy manual SSH tunnel (or old HomeAIAgent process), then run ./run_full.sh again."
   exit 3
 fi
+
+# Source file must remain UTF-8; fail early with a clear message if a copy/editor changed encoding.
+python - <<'PY'
+from pathlib import Path
+p = Path("companion_gateway.py")
+p.read_bytes().decode("utf-8")
+print("[SOURCE-ENCODING] companion_gateway.py UTF-8 OK")
+PY
 
 # One service launch only. companion_gateway.py now owns SSH transport,
 # OpenClaw preflight, retries, device WebSocket, speech, notification and info.
