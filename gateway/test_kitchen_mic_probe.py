@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KitchenTerminal microphone/Q&A UI regression guard (R12)."""
+"""KitchenTerminal microphone/Q&A/media-output UI regression guard (R16)."""
 import re
 import shutil
 import subprocess
@@ -20,6 +20,13 @@ required = [
     "qa_ptt:true",
     "加载今日菜单",
     "font-size:28px",
+    'id="kitchenPlayer"',
+    'x-webkit-airplay="allow"',
+    "webkitShowPlaybackTargetPicker",
+    "webkitCurrentPlaybackTargetIsWireless",
+    "HTMLAudioElement unavailable",
+    "media_audio:true",
+    "airplay:true",
 ]
 for token in required:
     assert token in html, token
@@ -31,13 +38,15 @@ for removed in [
     "function stopTracks(",
     ".mic-grid{",
     "audio_test",
+    "decodeAudioData",
+    "audioCtx=",
 ]:
     assert removed not in html, removed
 
 # Every literal $('id') reference must point to an element that exists in the HTML.
 ids = set(re.findall(r'id="([^"]+)"', html))
 refs = set(re.findall(r"\$\('([^']+)'\)", html))
-dynamic_ids = {"stepTimerHost", "currentTimerTime"}
+dynamic_ids = {"stepTimerHost", "currentTimerTime", "idleTimerHost", "idleStandaloneTime"}
 missing = sorted(refs - ids - dynamic_ids)
 assert not missing, f"missing DOM ids: {missing}"
 
@@ -51,4 +60,4 @@ if node:
         js.write_text(scripts[0], encoding="utf-8")
         subprocess.run([node, "--check", str(js)], check=True)
 
-print("KitchenTerminal R12 microphone/Q&A UI regression: PASS")
+print("KitchenTerminal R16 microphone/Q&A/media-output UI regression: PASS")

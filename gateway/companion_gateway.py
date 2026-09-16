@@ -279,7 +279,7 @@ MODE = os.getenv("P0_MODE", "full").strip().lower()
 # KitchenTerminal A3.0b FIX1. The iPad loads its UI from this same Gateway process.
 # KitchenTerminal includes the validated “问逐光” PTT Q&A pipeline.
 KITCHEN_PROTOCOL = "homeai-kitchen/1.9"
-KITCHEN_UI_VERSION = "A3.0c UI1"
+KITCHEN_UI_VERSION = "A3.0b FIX1 R16"
 KITCHEN_HTTP_PATH = os.getenv("HOMEAI_KITCHEN_HTTP_PATH", "/kitchen").strip() or "/kitchen"
 KITCHEN_WS_PATH = os.getenv("HOMEAI_KITCHEN_WS_PATH", "/kitchen/ws").strip() or "/kitchen/ws"
 KITCHEN_CONTROL_PATH = os.getenv("HOMEAI_KITCHEN_CONTROL_PATH", "/kitchen/control").strip() or "/kitchen/control"
@@ -816,7 +816,7 @@ def save_reminder_queue() -> bool:
     try:
         HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
         body = {
-            "version": 2,
+            "version": 3,
             "saved_at": _iso_now(),
             "pending": [asdict(item) for item in REMINDER_PENDING],
             "delivered": REMINDER_DELIVERED[-REMINDER_DELIVERED_HISTORY:],
@@ -3728,6 +3728,7 @@ class KitchenTimer:
     dish: str
     step: int
     duration_sec: int
+    kind: str = "recipe"  # recipe | standalone
     status: str = "running"  # running | paused | finished
     started_at: float = 0.0
     ends_at: float = 0.0
@@ -3741,7 +3742,7 @@ class KitchenTimer:
 KITCHEN_SESSIONS: list[KitchenSession] = []
 KITCHEN_CURRENT_VIEW: dict[str, Any] = {
     "type": "kitchen.show_idle",
-    "title": "小K",
+    "title": "厨房终端",
     "message": "等待逐光发送菜单",
     "revision": "boot",
 }
@@ -3773,8 +3774,9 @@ KITCHEN_QA_STATE: dict[str, Any] = {
 
 KITCHEN_TIMERS: dict[str, KitchenTimer] = {}
 
-# KitchenTerminal A3.0b FIX1 local-audio state. Audio is synthesized by the Gateway
-# and played by the iPad via Web Audio. The latest event is intentionally
+# KitchenTerminal media-audio state. Audio is synthesized by the Gateway and
+# played through one persistent HTMLAudioElement so iPadOS system media routing
+# (including AirPlay/HomePod) can own the output path. The latest event remains
 # ephemeral; menu voice should not unexpectedly replay hours later.
 KITCHEN_AUDIO_CACHE: dict[str, bytes] = {}
 KITCHEN_AUDIO_ORDER: list[str] = []
@@ -6110,6 +6112,8 @@ def _kitchen_timer_public(timer: KitchenTimer) -> dict[str, Any]:
         "dish": timer.dish,
         "step": int(timer.step),
         "duration_sec": int(timer.duration_sec),
+        "kind": str(timer.kind or "recipe"),
+        "label": "独立计时" if timer.kind == "standalone" else timer.dish,
         "status": timer.status,
         "remaining_sec": _kitchen_timer_remaining(timer),
         "ends_at": float(timer.ends_at or 0.0),
@@ -6139,7 +6143,7 @@ def _kitchen_timer_snapshot() -> list[dict[str, Any]]:
 def save_kitchen_progress() -> bool:
     try:
         HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"schema": 1, "progress": KITCHEN_RECIPE_PROGRESS}
+        payload = {"schema": 2, "progress": KITCHEN_RECIPE_PROGRESS}
         tmp = KITCHEN_PROGRESS_STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(KITCHEN_PROGRESS_STATE_FILE)
@@ -6155,6 +6159,8 @@ def load_kitchen_progress() -> None:
         return
     try:
         data = json.loads(KITCHEN_PROGRESS_STATE_FILE.read_text(encoding="utf-8"))
+        schema = int(data.get("schema") or 1) if isinstance(data, dict) else 1
+        migrate_prep_step = schema < 2
         raw = data.get("progress") if isinstance(data, dict) else None
         if isinstance(raw, dict):
             for date_text, dishes in raw.items():
@@ -6163,11 +6169,15 @@ def load_kitchen_progress() -> None:
                 clean: dict[str, int] = {}
                 for dish, step in dishes.items():
                     try:
-                        clean[str(dish)] = max(0, int(step))
+                        value = max(0, int(step))
+                        clean[str(dish)] = value + (1 if migrate_prep_step else 0)
                     except (TypeError, ValueError):
                         continue
                 if clean:
                     KITCHEN_RECIPE_PROGRESS[str(date_text)] = clean
+        if migrate_prep_step and KITCHEN_RECIPE_PROGRESS:
+            save_kitchen_progress()
+            print("[KITCHEN-PROGRESS] migrated schema=1->2 for prep-first recipe steps")
         print(f"[KITCHEN-PROGRESS] loaded dates={len(KITCHEN_RECIPE_PROGRESS)} file={KITCHEN_PROGRESS_STATE_FILE}")
     except Exception as exc:
         print(f"[KITCHEN-PROGRESS-WARN] load failed: {type(exc).__name__}: {exc}")
@@ -6197,7 +6207,7 @@ def _kitchen_idle_payload(message: str = "等待逐光发送菜单") -> dict[str
     return {
         "type": "kitchen.show_idle",
         "eyebrow": "HOME AI · 厨房",
-        "title": "小K",
+        "title": "厨房终端",
         "message": message,
         "can_pull_today": True,
         "footer": "可以在 iPad 直接加载今日菜单，也可以对逐光说“显示今天的菜单”",
@@ -6219,7 +6229,7 @@ def save_kitchen_timers() -> bool:
     try:
         HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "saved_at": datetime.now().astimezone().isoformat(),
             "timers": [asdict(t) for t in KITCHEN_TIMERS.values()],
         }
@@ -6238,16 +6248,20 @@ def load_kitchen_timers() -> None:
         return
     try:
         data = json.loads(KITCHEN_TIMER_STATE_FILE.read_text(encoding="utf-8"))
+        version = int(data.get("version") or 1) if isinstance(data, dict) else 1
+        migrate_prep_step = version < 2
         rows = data.get("timers") if isinstance(data, dict) else []
         now = time.time()
         for raw in rows if isinstance(rows, list) else []:
             if not isinstance(raw, dict):
                 continue
+            raw_kind = str(raw.get("kind") or "recipe")
             timer = KitchenTimer(
                 timer_id=str(raw.get("timer_id") or ""),
-                dish=str(raw.get("dish") or ""),
-                step=max(0, int(raw.get("step") or 0)),
+                dish=str(raw.get("dish") or ("独立计时" if raw_kind == "standalone" else "")),
+                step=max(0, int(raw.get("step") or 0)) + (1 if migrate_prep_step and raw_kind != "standalone" else 0),
                 duration_sec=_kitchen_clamp_timer_seconds(int(raw.get("duration_sec") or KITCHEN_TIMER_MIN_SEC)),
+                kind=("standalone" if raw_kind == "standalone" else "recipe"),
                 status=str(raw.get("status") or "running"),
                 started_at=float(raw.get("started_at") or 0.0),
                 ends_at=float(raw.get("ends_at") or 0.0),
@@ -6265,6 +6279,9 @@ def load_kitchen_timers() -> None:
             if timer.status == "finished" and timer.finished_at and now - timer.finished_at > 86400:
                 continue
             KITCHEN_TIMERS[timer.timer_id] = timer
+        if migrate_prep_step and KITCHEN_TIMERS:
+            save_kitchen_timers()
+            print("[KITCHEN-TIMER] migrated version=1->2 for prep-first recipe steps")
         print(f"[KITCHEN-TIMER] loaded count={len(KITCHEN_TIMERS)} file={KITCHEN_TIMER_STATE_FILE}")
     except Exception as exc:
         print(f"[KITCHEN-TIMER-WARN] load failed: {type(exc).__name__}: {exc}")
@@ -6355,6 +6372,32 @@ def _kitchen_timer_start(seconds: int | None = None) -> KitchenTimer:
     KITCHEN_TIMERS[timer.timer_id] = timer
     save_kitchen_timers()
     print(f"[KITCHEN-TIMER] start id={timer.timer_id} dish={dish!r} step={step+1} sec={seconds}")
+    return timer
+
+
+def _kitchen_timer_start_standalone(seconds: int) -> KitchenTimer:
+    seconds = _kitchen_clamp_timer_seconds(seconds)
+    # The idle-page timer is intentionally singular. Replacing it must never
+    # disturb recipe timers already running in parallel.
+    for old_id, old_timer in list(KITCHEN_TIMERS.items()):
+        if old_timer.kind == "standalone":
+            KITCHEN_TIMERS.pop(old_id, None)
+    now = time.time()
+    timer = KitchenTimer(
+        timer_id="kt-" + uuid.uuid4().hex[:12],
+        dish="独立计时",
+        step=0,
+        duration_sec=seconds,
+        kind="standalone",
+        status="running",
+        started_at=now,
+        ends_at=now + seconds,
+        created_at=now,
+        updated_at=now,
+    )
+    KITCHEN_TIMERS[timer.timer_id] = timer
+    save_kitchen_timers()
+    print(f"[KITCHEN-TIMER] standalone start id={timer.timer_id} sec={seconds}")
     return timer
 
 
@@ -6511,6 +6554,11 @@ def _kitchen_audio_public() -> dict[str, Any] | None:
 
 
 async def _kitchen_timer_alert(timer: KitchenTimer) -> bool:
+    if timer.kind == "standalone":
+        # Standalone alarms are looped by the iPad's persistent HTMLAudioElement
+        # until the user explicitly dismisses them. No one-shot TTS is needed.
+        print(f"[KITCHEN-TIMER] standalone alarm armed id={timer.timer_id}")
+        return True
     text = f"{timer.dish}第{timer.step + 1}步计时结束，可以检查一下状态了。"
     event = await _kitchen_speak(text, kind="timer", source_id=timer.timer_id)
     if event is None:
@@ -6620,8 +6668,11 @@ def _kitchen_private_recipe_markdown(menu: dict[str, Any], recipe: dict[str, Any
     seasoning = recipe.get('seasoning') or []
     if seasoning:
         lines += ['', '## 🧂 调味', ''] + [f'- {x}' for x in seasoning]
-    steps = recipe.get('steps') or []
-    hints = recipe.get('step_timers') or []
+    prep_items = recipe.get('prep_items') or []
+    if prep_items:
+        lines += ['', '## 🔪 备菜', ''] + [f'- {x}' for x in prep_items]
+    steps = recipe.get('cook_steps') or recipe.get('steps') or []
+    hints = recipe.get('cook_step_timers') or recipe.get('step_timers') or []
     if steps:
         lines += ['', '## 👨‍🍳 做法', '']
         for idx, step in enumerate(steps):
@@ -6728,6 +6779,34 @@ async def _kitchen_finalize_day(selected_names: list[str] | None = None, *, spea
     return delivered, saved
 
 
+def _kitchen_alarm_wav() -> bytes:
+    """Short two-tone chime for the standalone timer; the browser loops it."""
+    sample_rate = 16000
+    duration = 1.25
+    frames = int(sample_rate * duration)
+    pcm = array.array("h")
+    windows = ((0.00, 0.18, 880.0), (0.28, 0.46, 880.0), (0.72, 0.92, 660.0))
+    for i in range(frames):
+        t = i / sample_rate
+        value = 0.0
+        for start, end, freq in windows:
+            if start <= t < end:
+                local = (t - start) / max(0.001, end - start)
+                env = min(1.0, local / 0.08, (1.0 - local) / 0.12)
+                value += 0.30 * max(0.0, env) * math.sin(2.0 * math.pi * freq * t)
+        pcm.append(int(max(-1.0, min(1.0, value)) * 32767))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    return out.getvalue()
+
+
+KITCHEN_STANDALONE_ALARM_WAV = _kitchen_alarm_wav()
+
+
 def _kitchen_html() -> bytes:
     # KitchenTerminal: HTTP polling is authoritative; WebSocket is an optional
     # fast path. Timers and Q&A recovery state are Gateway-owned.
@@ -6737,34 +6816,35 @@ def _kitchen_html() -> bytes:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<title>小K · __KITCHEN_UI_VERSION__</title>
+<title>KitchenTerminal __KITCHEN_UI_VERSION__</title>
 <style>
-:root{color-scheme:light;--bg:#f4f1e8;--card:#fffdf7;--ink:#171717;--muted:#777267;--line:#d9d3c7;--accent:#1d6b47;--danger:#9c2f2f;--soft:#eee9dd;--safe-top:calc(env(safe-area-inset-top,0px) + 18px)}
+:root{color-scheme:light;--bg:#f4f1e8;--card:#fffdf7;--ink:#171717;--muted:#777267;--line:#d9d3c7;--accent:#1d6b47;--danger:#9c2f2f;--soft:#eee9dd}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;width:100%;height:100%;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;color:var(--ink);overflow:hidden}button,input{font:inherit;color:inherit}button{touch-action:manipulation}
-#app{height:100%;display:flex;flex-direction:column;padding:var(--safe-top) 14px 10px}header{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}.brand{font-weight:760;font-size:21px}.version{font-size:12px;color:var(--muted);margin-left:7px}.status{font-size:13px;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--danger)}.dot.online{background:var(--accent)}.status-pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:700;white-space:nowrap}.status-pill.ready{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}.status-pill.wait{color:var(--muted)}.status-pill.bad{border-color:#d3aaaa;color:var(--danger);background:#fff8f8}.help-btn{appearance:none;border:1px solid var(--line);background:#fff;border-radius:999px;min-height:32px;padding:6px 12px;font-size:13px;font-weight:750;color:var(--ink)}
+#app{height:100%;display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 18px) 14px 10px}header{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}.brand{font-weight:760;font-size:21px}.version{font-size:12px;color:var(--muted);margin-left:7px}.status{font-size:13px;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--danger)}.dot.online{background:var(--accent)}.status-pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:700;white-space:nowrap}.status-pill.ready{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}.status-pill.wait{color:var(--muted)}.status-pill.bad{border-color:#d3aaaa;color:var(--danger);background:#fff8f8}.help-btn{appearance:none;border:1px solid var(--line);background:#fff;border-radius:999px;min-height:32px;padding:6px 12px;font-size:13px;font-weight:750;color:var(--ink)}.audio-route-btn{cursor:pointer}.audio-route-btn.wireless{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}
 #timerStrip{display:none;gap:10px;overflow-x:auto;padding:7px 0 11px;white-space:nowrap}.timer-chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:10px 16px;font-size:28px;line-height:1.05;display:inline-flex;gap:10px;align-items:center;font-weight:720}.timer-chip.running{border-color:#9bbbaa}.timer-chip.paused{border-color:#d3b776}.timer-chip.finished{border-color:#c88f8f;color:var(--danger);font-weight:700}.timer-chip{cursor:pointer}.timer-chip .chip-x{border:0;background:transparent;color:var(--danger);font-size:28px;line-height:1;padding:0 0 1px 4px}.finish-btn{border-color:#c9a1a1!important;color:var(--danger)!important}.choice-list{display:grid;gap:10px;margin-top:12px}.choice-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);background:#fff;border-radius:14px;padding:14px 16px;font-size:20px;font-weight:650}.choice-row input{width:24px;height:24px}.finish-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.finish-actions button{min-height:54px;border-radius:13px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.finish-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}.finish-actions .danger{color:var(--danger);border-color:#c9a1a1}
-main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;max-width:1000px;height:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px 24px;display:flex;flex-direction:column;min-height:0}.eyebrow{font-size:14px;color:var(--muted);margin-bottom:5px}.title{font-size:38px;font-weight:780;line-height:1.12;margin:0 0 10px}.message{font-size:21px;line-height:1.4;color:#3f3b34}.content{flex:1;min-height:0;overflow:auto;padding-bottom:4px}.menu{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}.menu button,.action{appearance:none;border:1px solid var(--line);background:#fff;border-radius:15px;padding:16px 18px;text-align:left;font-size:23px;font-weight:680;min-height:66px}.menu button{display:flex;flex-direction:column;gap:5px}.menu-progress{font-size:13px;color:var(--accent);font-weight:700}.idle-actions{display:flex;justify-content:center;margin-top:34px}.idle-actions button{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:22px;min-height:108px;min-width:min(100%,420px);width:min(100%,420px);padding:18px 28px;font-size:32px;line-height:1.15;font-weight:820;letter-spacing:.5px;box-shadow:0 10px 24px rgba(29,107,71,.18)}.done-note{margin-top:18px;color:var(--muted);font-size:16px}.toolbar{display:flex;gap:10px;margin-top:14px}.toolbar .action{flex:1;text-align:center;font-size:17px;min-height:52px;padding:10px}.recipe-meta{font-size:16px;color:var(--muted);margin-bottom:10px}.step-card{border:1px solid var(--line);background:#fff;border-radius:18px;padding:20px;margin-top:5px}.step-label{font-size:15px;color:var(--accent);font-weight:700;margin-bottom:8px}.step-text{font-size:30px;line-height:1.4;font-weight:650}.tips{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.tips h3{font-size:15px;margin:0 0 7px;color:var(--muted)}.tips ul{margin:0;padding-left:21px}.tips li{font-size:16px;line-height:1.4;margin:4px 0}
+main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;max-width:1000px;height:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px 24px;display:flex;flex-direction:column;min-height:0}.eyebrow{font-size:14px;color:var(--muted);margin-bottom:5px}.title{font-size:38px;font-weight:780;line-height:1.12;margin:0 0 10px}.message{font-size:21px;line-height:1.4;color:#3f3b34}.content{flex:1;min-height:0;overflow:auto;padding-bottom:4px}.menu{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}.menu button,.action{appearance:none;border:1px solid var(--line);background:#fff;border-radius:15px;padding:16px 18px;text-align:left;font-size:23px;font-weight:680;min-height:66px}.menu button{display:flex;flex-direction:column;gap:5px}.menu-progress{font-size:13px;color:var(--accent);font-weight:700}.idle-actions{display:flex;justify-content:center;margin-top:34px}.idle-actions button{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:22px;min-height:108px;min-width:min(100%,420px);width:min(100%,420px);padding:18px 28px;font-size:32px;line-height:1.15;font-weight:820;letter-spacing:.5px;box-shadow:0 10px 24px rgba(29,107,71,.18)}.idle-timer{width:min(100%,520px);margin:22px auto 0;border:1px solid var(--line);background:#fff;border-radius:20px;padding:18px 20px}.idle-timer-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.idle-timer-title{font-size:21px;font-weight:780}.idle-timer-note{font-size:14px;color:var(--muted)}.idle-timer-time{font-size:50px;line-height:1;font-weight:820;font-variant-numeric:tabular-nums;letter-spacing:1px;margin:16px 0 14px;text-align:center}.idle-timer-time.finished{color:var(--danger)}.idle-timer-actions{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.idle-timer-actions button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:48px;padding:8px;font-size:16px;font-weight:700}.idle-timer-actions button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.idle-timer-actions button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}.idle-timer-presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.idle-timer-presets button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:48px;font-size:16px;font-weight:700}.done-note{margin-top:18px;color:var(--muted);font-size:16px}.toolbar{display:flex;gap:10px;margin-top:14px}.toolbar .action{flex:1;text-align:center;font-size:17px;min-height:52px;padding:10px}.recipe-meta{font-size:16px;color:var(--muted);margin-bottom:10px}.step-card{border:1px solid var(--line);background:#fff;border-radius:18px;padding:20px;margin-top:5px}.step-label{font-size:15px;color:var(--accent);font-weight:700;margin-bottom:8px}.step-text{font-size:30px;line-height:1.4;font-weight:650;white-space:pre-line}.tips{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.tips h3{font-size:15px;margin:0 0 7px;color:var(--muted)}.tips ul{margin:0;padding-left:21px}.tips li{font-size:16px;line-height:1.4;margin:4px 0}
 .step-timer{margin-top:16px;border:1px solid #bfd2c7;background:#f7fbf8;border-radius:17px;padding:14px}.step-timer.finished{border-color:#d7aaaa;background:#fff7f7}.timer-title{font-size:15px;color:var(--muted);font-weight:700}.timer-time{font-size:42px;line-height:1;font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:1px;margin-top:3px}.timer-state{font-size:14px;color:var(--muted);margin-top:5px}.timer-controls{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.timer-controls button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:46px;padding:8px;font-size:15px;font-weight:650}.timer-controls button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.timer-controls button.danger{color:var(--danger)}
 .nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding-top:13px}.nav button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:13px;padding:12px;font-size:17px;font-weight:650;min-height:50px}.nav button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.list-group{margin:0 0 16px}.list-group h3{font-size:19px;margin:0 0 7px}.list-group ul,.timeline{margin:0;padding-left:23px}.list-group li,.timeline li{font-size:19px;line-height:1.45;margin:6px 0}.timeline li{margin:9px 0}footer{padding-top:8px;text-align:center;font-size:12px;color:var(--muted)}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.32);display:none;align-items:center;justify-content:center;padding:18px;z-index:20}.modal.show{display:flex}.modal-card{width:min(430px,94vw);background:#fffdf7;border-radius:20px;border:1px solid var(--line);padding:20px}.modal-card h2{font-size:23px;margin:0 0 14px}.time-inputs{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}.time-inputs input{width:100%;font-size:34px;text-align:center;border:1px solid var(--line);border-radius:13px;padding:10px;background:#fff}.time-inputs span{font-size:28px;font-weight:700}.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.modal-actions button{min-height:48px;border-radius:12px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.modal-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}
 .qa-dock{width:100%;max-width:1000px;margin:9px auto 0;border:1px solid var(--line);background:#fffdf7;border-radius:19px;padding:10px 12px;display:flex;align-items:center;gap:14px;min-height:92px}.qa-btn{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:17px;min-width:230px;min-height:72px;padding:12px 22px;font-size:24px;font-weight:820;box-shadow:0 4px 14px rgba(29,107,71,.18)}.qa-btn.recording{background:var(--danger);border-color:var(--danger);box-shadow:0 4px 14px rgba(156,47,47,.18)}.qa-btn.busy{background:#706c63;border-color:#706c63;box-shadow:none}.qa-copy{flex:1;min-width:0}.qa-status{font-size:15px;font-weight:760;color:var(--accent)}.qa-transcript{font-size:14px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}.qa-answer{font-size:16px;line-height:1.35;margin-top:4px;max-height:50px;overflow:auto}.qa-clear{appearance:none;border:0;background:transparent;color:var(--muted);font-size:25px;line-height:1;padding:6px}.help-list{margin:4px 0 0;padding-left:22px}.help-list li{font-size:16px;line-height:1.5;margin:8px 0}.help-note{font-size:14px;line-height:1.45;color:var(--muted);background:var(--soft);border-radius:12px;padding:10px 12px;margin-top:12px}
-@media(max-width:700px){#app{padding:var(--safe-top) 10px 8px}header{align-items:flex-start}.brand{font-size:18px}.version{display:none}.status{gap:5px;max-width:68%;}.status-pill{padding:6px 8px;font-size:11px}.help-btn{padding:5px 10px;font-size:12px}.menu{grid-template-columns:1fr}.panel{padding:17px}.title{font-size:31px}.step-text{font-size:26px}.timer-time{font-size:37px}.toolbar{flex-direction:column}.nav{gap:7px}.nav button{font-size:15px;padding:9px}.timer-controls{grid-template-columns:1fr 1fr}.message{font-size:19px}.qa-dock{gap:9px;padding:8px;min-height:82px}.qa-btn{min-width:176px;min-height:64px;font-size:21px;padding:10px 14px}.qa-answer{font-size:15px}}
+@media(max-width:700px){#app{padding:calc(env(safe-area-inset-top,0px) + 18px) 10px 8px}header{align-items:flex-start}.brand{font-size:18px}.version{display:none}.status{gap:5px;max-width:68%;}.status-pill{padding:6px 8px;font-size:11px}.help-btn{padding:5px 10px;font-size:12px}.menu{grid-template-columns:1fr}.panel{padding:17px}.title{font-size:31px}.step-text{font-size:26px}.timer-time{font-size:37px}.toolbar{flex-direction:column}.nav{gap:7px}.nav button{font-size:15px;padding:9px}.timer-controls{grid-template-columns:1fr 1fr}.message{font-size:19px}.qa-dock{gap:9px;padding:8px;min-height:82px}.qa-btn{min-width:176px;min-height:64px;font-size:21px;padding:10px 14px}.qa-answer{font-size:15px}.idle-timer-actions,.idle-timer-presets{grid-template-columns:1fr 1fr}.idle-timer-time{font-size:44px}}
 </style>
 </head>
 <body>
 <div id="app">
-<header><div><span class="brand">小K</span><span class="version">__KITCHEN_UI_VERSION__</span></div><div class="status"><span id="micState" class="status-pill wait">🎙 麦克风 检测中</span><span id="audioState" class="status-pill wait">🔊 语音 待激活</span><button id="helpBtn" class="help-btn">？ 帮助</button><span id="dot" class="dot"></span><span id="statusText">连接中</span></div></header>
+<header><div><span class="brand">KitchenTerminal</span><span class="version">__KITCHEN_UI_VERSION__</span></div><div class="status"><span id="micState" class="status-pill wait">🎙 麦克风 检测中</span><span id="audioState" class="status-pill wait">🔊 语音 待激活</span><button id="audioRouteBtn" type="button" class="help-btn audio-route-btn">🔊 播放设备</button><button id="helpBtn" class="help-btn">？ 帮助</button><span id="dot" class="dot"></span><span id="statusText">连接中</span></div></header>
 <div id="timerStrip"></div>
-<main><section class="panel"><div id="eyebrow" class="eyebrow">HOME AI · 厨房</div><h1 id="title" class="title">小K</h1><div id="message" class="message">正在读取 Gateway…</div><div id="content" class="content"></div><div id="nav" class="nav" style="display:none"></div></section></main>
+<main><section class="panel"><div id="eyebrow" class="eyebrow">HOME AI · 厨房</div><h1 id="title" class="title">厨房终端</h1><div id="message" class="message">正在读取 Gateway…</div><div id="content" class="content"></div><div id="nav" class="nav" style="display:none"></div></section></main>
 <div id="qaDock" class="qa-dock"><button id="qaBtn" type="button" class="qa-btn">🎙 问逐光</button><div class="qa-copy"><div id="qaStatus" class="qa-status">可以问做法、替代食材、火候和补救办法</div><div id="qaTranscript" class="qa-transcript"></div><div id="qaAnswer" class="qa-answer"></div></div><button id="qaClear" class="qa-clear" aria-label="清除回答">×</button></div>
-<footer id="footer">小K · __KITCHEN_UI_VERSION__ · 等待 Gateway</footer>
+<footer id="footer">KitchenTerminal __KITCHEN_UI_VERSION__ · 等待 Gateway</footer>
 </div>
 <div id="timerModal" class="modal"><div class="modal-card"><h2>设置计时</h2><div class="time-inputs"><input id="minInput" inputmode="numeric" pattern="[0-9]*" value="0"><span>:</span><input id="secInput" inputmode="numeric" pattern="[0-9]*" value="30"></div><div class="modal-actions"><button id="modalCancel">取消</button><button id="modalOK" class="primary">确定</button></div></div></div>
-<div id="helpModal" class="modal"><div class="modal-card"><h2>小K 操作指南</h2><ol class="help-list"><li><strong>开始做饭：</strong>在等待页点“加载今日菜单”，选择菜品进入步骤。</li><li><strong>按步骤操作：</strong>用“上一步 / 下一步”切换；需要返回总菜单时点“返回菜单”。</li><li><strong>计时：</strong>步骤里出现建议计时后可直接开始，也可以增减时间；顶部会持续显示正在运行的计时器。</li><li><strong>问逐光：</strong>点底部的大按钮开始说话，再点一次结束。可以问火候、替代食材、做法原因和翻车补救。</li><li><strong>语音播报：</strong>首次触碰页面后会自动激活；回答和厨房提示都在这台 iPad 本地播放。</li><li><strong>结束烹饪：</strong>回到今日菜单后点“结束今日烹饪”，可选择把喜欢的菜保存到私房菜。</li></ol><div class="help-note">顶部状态只用于快速确认：麦克风、厨房语音和 Gateway 连接是否正常，不再放测试按钮。</div><div class="modal-actions" style="grid-template-columns:1fr"><button id="helpClose" class="primary">知道了</button></div></div></div>
+<div id="helpModal" class="modal"><div class="modal-card"><h2>厨房终端操作指南</h2><ol class="help-list"><li><strong>开始做饭：</strong>在等待页点“加载今日菜单”，选择菜品进入步骤。</li><li><strong>按步骤操作：</strong>用“上一步 / 下一步”切换；需要返回总菜单时点“返回菜单”。</li><li><strong>计时：</strong>步骤里可以按建议时间计时；等待首页另有独立计时器，不加载菜单也能直接使用。独立计时结束后会持续响铃，直到你主动结束提醒。</li><li><strong>问逐光：</strong>点底部的大按钮开始说话，再点一次结束。可以问火候、替代食材、做法原因和翻车补救。</li><li><strong>语音播报：</strong>厨房 TTS 走 iPad 的系统媒体播放链。点顶部“播放设备”可选择 HomePod / AirPlay；未选择无线设备时由 iPad 当前系统输出播放。</li><li><strong>结束烹饪：</strong>回到今日菜单后点“结束今日烹饪”，可选择把喜欢的菜保存到私房菜。</li></ol><div class="help-note">顶部状态用于快速确认麦克风、厨房语音、AirPlay 播放目标和 Gateway 连接状态。麦克风录制仍使用独立采集链，不受语音输出设备切换影响。</div><div class="modal-actions" style="grid-template-columns:1fr"><button id="helpClose" class="primary">知道了</button></div></div></div>
+<audio id="kitchenPlayer" preload="auto" playsinline x-webkit-airplay="allow" aria-hidden="true" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;left:-9999px;top:-9999px"></audio>
 <script>
 (function(){
   var ws=null,retry=1000,httpOK=false,wsOK=false,lastRevision='',currentView=null,latestTimers=[],drafts={},modalTarget=null;
-  var audioCtx=null,audioUnlocked=false,audioMuted=false,lastAudioId='',pendingAudio=null,audioPlaying=false;
+  var kitchenPlayer=null,audioUnlocked=false,audioMuted=false,lastAudioId='',pendingAudio=null,audioPlaying=false,audioWireless=false,audioRouteAvailable=false,standaloneAlarmId='';
   var qaRecording=false,qaBusy=false,qaStream=null,qaCtx=null,qaSource=null,qaProcessor=null,qaChunks=[],qaSampleRate=0,qaStartedAt=0,qaAutoStop=null,qaSocket=null;
   var kitchenProtocol='__KITCHEN_PROTOCOL__',qaMaxMs=__KITCHEN_QA_MAX_MS__;
   var deviceId='KitchenTerminal-iPadMini';
@@ -6774,13 +6854,18 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
   function clearView(){$('content').innerHTML='';$('nav').innerHTML='';$('nav').style.display='none';$('nav').style.gridTemplateColumns='1fr 1fr 1fr';}
   function el(tag,cls,text){var x=document.createElement(tag);if(cls)x.className=cls;if(text!==undefined&&text!==null)x.textContent=String(text);return x;}
   function xhrGet(url,cb){var x=new XMLHttpRequest();x.open('GET',url+(url.indexOf('?')>=0?'&':'?')+'_='+Date.now(),true);x.onreadystatechange=function(){if(x.readyState!==4)return;if(x.status>=200&&x.status<300){httpOK=true;setStatus();cb(null,x.responseText);}else{httpOK=false;setStatus();cb(new Error('HTTP '+x.status),'');}};x.onerror=function(){httpOK=false;setStatus();cb(new Error('network'),'');};x.send(null);}
-  function showError(text){$('message').textContent=text;$('footer').textContent='小K · __KITCHEN_UI_VERSION__ · 页面错误';}
+  function showError(text){$('message').textContent=text;$('footer').textContent='KitchenTerminal __KITCHEN_UI_VERSION__ · 页面错误';}
   function micStatusState(){var b=$('micState');if(!b)return;var secure=!!window.isSecureContext,gum=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);if(secure&&gum){b.textContent='🎙 麦克风 已就绪';b.className='status-pill ready';}else{b.textContent='🎙 麦克风 不可用';b.className='status-pill bad';}}
-  function audioButtonState(){var b=$('audioState');if(!b)return;if(audioMuted){b.textContent='🔇 语音 已静音';b.className='status-pill bad';}else if(audioUnlocked){b.textContent='🔊 语音 已就绪';b.className='status-pill ready';}else{b.textContent='🔊 语音 待激活';b.className='status-pill wait';}}
-  function unlockAudio(){try{var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unsupported');if(!audioCtx)audioCtx=new C();var p=audioCtx.resume();audioUnlocked=true;audioMuted=false;try{localStorage.setItem('kitchen.audio_enabled','1');localStorage.setItem('kitchen.audio_muted','0');}catch(e){}audioButtonState();if(p&&p.then){p.then(function(){if(pendingAudio)playKitchenAudio(pendingAudio);}).catch(function(){});}else if(pendingAudio){playKitchenAudio(pendingAudio);}}catch(e){var b=$('audioState');if(b){b.textContent='🔇 语音 不可用';b.className='status-pill bad';}showError('无法开启厨房语音：'+String(e));}}
-  try{audioMuted=false;localStorage.setItem('kitchen.audio_muted','0');}catch(e){}micStatusState();audioButtonState();
-  function opportunisticUnlock(){if(!audioUnlocked)unlockAudio();}
+  var audioPrimeSrc='data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+  function initKitchenPlayer(){if(kitchenPlayer)return kitchenPlayer;kitchenPlayer=$('kitchenPlayer');if(!kitchenPlayer)return null;try{kitchenPlayer.setAttribute('x-webkit-airplay','allow');}catch(e){}try{audioWireless=!!kitchenPlayer.webkitCurrentPlaybackTargetIsWireless;}catch(e){audioWireless=false;}kitchenPlayer.addEventListener('webkitcurrentplaybacktargetiswirelesschanged',function(){try{audioWireless=!!kitchenPlayer.webkitCurrentPlaybackTargetIsWireless;}catch(e){audioWireless=false;}audioButtonState();},false);kitchenPlayer.addEventListener('webkitplaybacktargetavailabilitychanged',function(ev){audioRouteAvailable=!!(ev&&String(ev.availability||'')==='available');audioButtonState();},false);return kitchenPlayer;}
+  function audioButtonState(){var b=$('audioState'),r=$('audioRouteBtn');if(!b)return;if(audioMuted){b.textContent='🔇 语音 已静音';b.className='status-pill bad';}else if(audioWireless){b.textContent='📡 AirPlay 已连接';b.className='status-pill ready';}else if(audioUnlocked){b.textContent='🔊 语音 已就绪';b.className='status-pill ready';}else{b.textContent='🔊 语音 待激活';b.className='status-pill wait';}if(r){r.className='help-btn audio-route-btn'+(audioWireless?' wireless':'');r.textContent=audioWireless?'📡 AirPlay':'🔊 播放设备';}}
+  function finishAudioUnlock(){audioUnlocked=true;audioMuted=false;try{localStorage.setItem('kitchen.audio_enabled','1');localStorage.setItem('kitchen.audio_muted','0');}catch(e){}audioButtonState();if(pendingAudio)playKitchenAudio(pendingAudio);}
+  function unlockAudio(){try{var p=initKitchenPlayer();if(!p)throw new Error('HTMLAudioElement unavailable');if(audioUnlocked){audioButtonState();return;}p.onended=null;p.onerror=null;p.src=audioPrimeSrc;p.load();var started=p.play();if(started&&started.then){started.then(function(){try{p.pause();try{p.currentTime=0;}catch(e){}}catch(e){}finishAudioUnlock();}).catch(function(err){var b=$('audioState');if(b){b.textContent='🔇 语音 待授权';b.className='status-pill bad';}console.log('kitchen media unlock failed',err);});}else{try{p.pause();try{p.currentTime=0;}catch(e){}}catch(e){}finishAudioUnlock();}}catch(e){var b=$('audioState');if(b){b.textContent='🔇 语音 不可用';b.className='status-pill bad';}showError('无法开启厨房语音：'+String(e));}}
+  function pickAudioOutput(ev){if(ev){try{ev.preventDefault();ev.stopPropagation();}catch(e){}}var p=initKitchenPlayer();if(!p)return;unlockAudio();if(typeof p.webkitShowPlaybackTargetPicker==='function'){try{p.webkitShowPlaybackTargetPicker();return;}catch(e){console.log('AirPlay picker failed',e);}}$('qaStatus').textContent='当前浏览器没有提供网页内播放设备选择器，可在 iPad 控制中心选择 AirPlay。';}
+  try{audioMuted=false;localStorage.setItem('kitchen.audio_muted','0');}catch(e){}initKitchenPlayer();micStatusState();audioButtonState();
+  function opportunisticUnlock(ev){if(ev&&ev.target&&ev.target.id==='audioRouteBtn')return;if(!audioUnlocked)unlockAudio();}
   document.addEventListener('click',opportunisticUnlock,false);
+  $('audioRouteBtn').addEventListener('click',pickAudioOutput,false);
   function openHelp(){$('helpModal').className='modal show';}
   function closeHelp(){$('helpModal').className='modal';}
   $('helpBtn').onclick=openHelp;$('helpClose').onclick=closeHelp;
@@ -6793,9 +6878,13 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
   function qaCleanupCapture(){if(qaAutoStop){clearTimeout(qaAutoStop);qaAutoStop=null;}try{if(qaProcessor){qaProcessor.disconnect();qaProcessor.onaudioprocess=null;}}catch(e){}try{if(qaSource)qaSource.disconnect();}catch(e){}qaStopTracks(qaStream);qaStream=null;qaProcessor=null;qaSource=null;if(qaCtx){try{qaCtx.close();}catch(e){}}qaCtx=null;}
   function qaStart(){if(qaBusy){$('qaStatus').textContent='上一条问题还在处理中，请稍候…';return;}if(qaRecording){qaStop();return;}unlockAudio();var gum=navigator.mediaDevices&&navigator.mediaDevices.getUserMedia;if(!gum){qaRender({status:'error',error:'当前页面无法使用麦克风，请确认使用 HTTPS 地址。',updated_at:Date.now()/1000});return;}$('qaBtn').disabled=false;$('qaBtn').className='qa-btn busy';$('qaBtn').textContent='请求麦克风…';$('qaStatus').textContent='正在请求麦克风权限…';navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(stream){qaStream=stream;var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unavailable');qaCtx=new C();try{qaCtx.resume();}catch(e){}qaSampleRate=qaCtx.sampleRate||48000;qaSource=qaCtx.createMediaStreamSource(stream);qaProcessor=qaCtx.createScriptProcessor(4096,1,1);qaChunks=[];qaProcessor.onaudioprocess=function(ev){if(!qaRecording)return;var input=ev.inputBuffer.getChannelData(0);qaChunks.push(new Float32Array(input));};qaSource.connect(qaProcessor);qaProcessor.connect(qaCtx.destination);qaRecording=true;qaStartedAt=Date.now();$('qaBtn').disabled=false;$('qaBtn').className='qa-btn recording';$('qaBtn').textContent='⏹ 结束提问';$('qaStatus').textContent='正在听…再次点击结束';$('qaTranscript').textContent='';$('qaAnswer').textContent='';qaAutoStop=setTimeout(function(){if(qaRecording)qaStop();},qaMaxMs);}).catch(function(err){qaCleanupCapture();qaRecording=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'无法取得麦克风：'+String(err&&err.message?err.message:err),updated_at:Date.now()/1000});});}
   function qaStop(){if(!qaRecording)return;qaRecording=false;var duration=(Date.now()-qaStartedAt)/1000,parts=qaChunks.slice(),rate=qaSampleRate||48000;qaCleanupCapture();$('qaBtn').className='qa-btn busy';$('qaBtn').disabled=true;$('qaBtn').textContent='处理中…';if(duration<0.35||!parts.length){qaBusy=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'录音太短，请再说一次。',updated_at:Date.now()/1000});return;}var joined=qaFloatConcat(parts),down=qaDownsample(joined,rate,16000),wav=qaWav(down,16000);qaSend(wav);}
-  function qaSend(wav){qaBusy=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='kq-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);qaRender({status:'uploading',request_id:rid,updated_at:Date.now()/1000});try{qaSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');qaSocket.binaryType='arraybuffer';}catch(e){qaBusy=false;qaRender({status:'error',error:'无法建立语音上传连接',updated_at:Date.now()/1000});return;}var finished=false;qaSocket.onopen=function(){try{qaSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,mic_probe:true,qa_ptt:true}}));qaSocket.send(JSON.stringify({type:'kitchen.qa.start',request_id:rid,format:'audio/wav',sample_rate:16000}));qaSocket.send(wav);qaSocket.send(JSON.stringify({type:'kitchen.qa.stop',request_id:rid}));}catch(e){qaRender({status:'error',error:'发送录音失败',updated_at:Date.now()/1000});}};qaSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.qa)qaRender(m.qa);if(m.type==='kitchen.qa.transcript'&&m.text)$('qaTranscript').textContent='你：'+m.text;if(m.type==='kitchen.qa.answer'&&m.text)$('qaAnswer').textContent='逐光：'+m.text;if(m.type==='kitchen.qa.result'){finished=true;qaBusy=false;if(m.qa)qaRender(m.qa);if(m.audio)syncAudio(m.audio);try{qaSocket.close();}catch(e){}}if(m.type==='kitchen.qa.error'){finished=true;qaBusy=false;qaRender(m.qa||{status:'error',error:m.message||'语音问答失败',updated_at:Date.now()/1000});try{qaSocket.close();}catch(e){}}}catch(e){}};qaSocket.onerror=function(){};qaSocket.onclose=function(){qaSocket=null;if(!finished){/* HTTP polling is authoritative and can recover the final result. */}};}
+  function qaSend(wav){qaBusy=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='kq-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);qaRender({status:'uploading',request_id:rid,updated_at:Date.now()/1000});try{qaSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');qaSocket.binaryType='arraybuffer';}catch(e){qaBusy=false;qaRender({status:'error',error:'无法建立语音上传连接',updated_at:Date.now()/1000});return;}var finished=false;qaSocket.onopen=function(){try{qaSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,media_audio:true,airplay:true,mic_probe:true,qa_ptt:true}}));qaSocket.send(JSON.stringify({type:'kitchen.qa.start',request_id:rid,format:'audio/wav',sample_rate:16000}));qaSocket.send(wav);qaSocket.send(JSON.stringify({type:'kitchen.qa.stop',request_id:rid}));}catch(e){qaRender({status:'error',error:'发送录音失败',updated_at:Date.now()/1000});}};qaSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.qa)qaRender(m.qa);if(m.type==='kitchen.qa.transcript'&&m.text)$('qaTranscript').textContent='你：'+m.text;if(m.type==='kitchen.qa.answer'&&m.text)$('qaAnswer').textContent='逐光：'+m.text;if(m.type==='kitchen.qa.result'){finished=true;qaBusy=false;if(m.qa)qaRender(m.qa);if(m.audio)syncAudio(m.audio);try{qaSocket.close();}catch(e){}}if(m.type==='kitchen.qa.error'){finished=true;qaBusy=false;qaRender(m.qa||{status:'error',error:m.message||'语音问答失败',updated_at:Date.now()/1000});try{qaSocket.close();}catch(e){}}}catch(e){}};qaSocket.onerror=function(){};qaSocket.onclose=function(){qaSocket=null;if(!finished){/* HTTP polling is authoritative and can recover the final result. */}};}
   function qaTap(ev){if(ev){try{ev.preventDefault();}catch(e){}}qaStart();}if(window.PointerEvent){$('qaBtn').addEventListener('pointerup',qaTap,false);}else{$('qaBtn').addEventListener('click',qaTap,false);}$('qaClear').onclick=function(){$('qaTranscript').textContent='';$('qaAnswer').textContent='';action('qa_dismiss',{},function(){qaRender({status:'idle',updated_at:Date.now()/1000});});};
-  function playKitchenAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;if(!audioUnlocked||audioPlaying)return;if(Number(a.expires_at||0)>0&&Number(a.expires_at)<Date.now()/1000){lastAudioId=a.event_id;pendingAudio=null;return;}audioPlaying=true;fetch(a.url+'&_='+Date.now()).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.arrayBuffer();}).then(function(buf){return audioCtx.decodeAudioData(buf);}).then(function(decoded){var src=audioCtx.createBufferSource();src.buffer=decoded;src.connect(audioCtx.destination);src.onended=function(){audioPlaying=false;lastAudioId=a.event_id;pendingAudio=null;ackAudio(a.event_id);};src.start(0);}).catch(function(e){audioPlaying=false;console.log('kitchen audio failed',e);});}
+  function playKitchenAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;if(standaloneAlarmId||!audioUnlocked||audioPlaying)return;if(Number(a.expires_at||0)>0&&Number(a.expires_at)<Date.now()/1000){lastAudioId=a.event_id;pendingAudio=null;return;}var p=initKitchenPlayer();if(!p)return;audioPlaying=true;p.onended=function(){audioPlaying=false;lastAudioId=a.event_id;pendingAudio=null;ackAudio(a.event_id);audioButtonState();};p.onerror=function(){audioPlaying=false;console.log('kitchen media playback failed code='+(p.error?p.error.code:'unknown'));audioButtonState();};try{p.src=a.url+'&_='+Date.now();p.load();var started=p.play();if(started&&started.catch){started.catch(function(e){audioPlaying=false;console.log('kitchen media play rejected',e);audioButtonState();});}}catch(e){audioPlaying=false;console.log('kitchen media playback failed',e);audioButtonState();}}
+  function finishedStandalone(){for(var i=0;i<latestTimers.length;i++){var t=latestTimers[i];if(t.kind==='standalone'&&t.status==='finished')return t;}return null;}
+  function startStandaloneAlarm(t){if(!t||!t.timer_id||standaloneAlarmId===t.timer_id)return;if(audioPlaying)return;var p=initKitchenPlayer();if(!p||!audioUnlocked)return;standaloneAlarmId=t.timer_id;try{p.onended=null;p.onerror=function(){console.log('standalone timer alarm playback failed');};p.loop=true;p.src='/kitchen/alarm.wav?_='+Date.now();p.load();var started=p.play();if(started&&started.catch){started.catch(function(e){standaloneAlarmId='';p.loop=false;console.log('standalone timer alarm rejected',e);});}}catch(e){standaloneAlarmId='';try{p.loop=false;}catch(_e){}console.log('standalone timer alarm failed',e);}}
+  function stopStandaloneAlarm(){if(!standaloneAlarmId)return;standaloneAlarmId='';var p=initKitchenPlayer();if(p){try{p.loop=false;p.pause();p.removeAttribute('src');p.load();}catch(e){}}audioPlaying=false;if(pendingAudio)playKitchenAudio(pendingAudio);}
+  function syncStandaloneAlarm(){var t=finishedStandalone();if(t){startStandaloneAlarm(t);}else{stopStandaloneAlarm();}}
   function syncAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;playKitchenAudio(a);}
   function ackAudio(id){if(!id)return;xhrGet('/kitchen/action?action=audio_ack&value='+encodeURIComponent(id),function(){});}
   function action(name,params,cb){var url='/kitchen/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!==''){url+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}}xhrGet(url,function(err,text){if(err){if(cb)cb(err);return;}try{var r=JSON.parse(text);if(r&&r.timers)syncTimers(r.timers);if(r&&r.audio)syncAudio(r.audio);if(r&&r.qa)qaRender(r.qa);if(r&&r.view)render(r.view,true);if(cb)cb(null,r);}catch(e){showError('操作响应解析失败');if(cb)cb(e);}});}
@@ -6807,12 +6896,14 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
   function draftKey(v){return (v&&v.title?v.title:'')+'#'+String(v&&v.step!==undefined?v.step:0);}
   function suggested(v){var key=draftKey(v);if(drafts[key])return drafts[key];var hint=v&&v.timer_hint?v.timer_hint:null;var sec=hint&&hint.default_sec?Number(hint.default_sec):30;sec=Math.max(5,Math.min(5999,sec));drafts[key]=sec;return sec;}
   function setDraft(v,sec){sec=Math.max(5,Math.min(5999,Math.round(sec)));drafts[draftKey(v)]=sec;renderStepTimer(v);}
-  function renderTimerStrip(){var strip=$('timerStrip');strip.innerHTML='';var shown=0;for(var i=0;i<latestTimers.length;i++){(function(t){if(t.status==='finished'&&currentView&&currentView.type==='kitchen.show_recipe'&&t.dish===currentView.title&&Number(t.step)===Number(currentView.step)){return;}var chip=el('div','timer-chip '+t.status);var label=t.dish+' · '+(Number(t.step)+1)+'步';var right=t.status==='finished'?'时间到':fmt(remaining(t));chip.appendChild(el('span','',label));chip.appendChild(el('strong','',right));chip.onclick=function(){action('timer_open',{timer_id:t.timer_id});};if(t.status==='finished'){var x=el('button','chip-x','×');x.setAttribute('aria-label','关闭提醒');x.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();action('timer_dismiss',{timer_id:t.timer_id});};chip.appendChild(x);}strip.appendChild(chip);shown++;})(latestTimers[i]);}strip.style.display=shown?'flex':'none';}
-  function syncTimers(timers){latestTimers=(timers&&timers.length!==undefined)?timers:[];renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe')renderStepTimer(currentView);}
+  function renderTimerStrip(){var strip=$('timerStrip');strip.innerHTML='';var shown=0;for(var i=0;i<latestTimers.length;i++){(function(t){if(t.status==='finished'&&t.kind!=='standalone'&&currentView&&currentView.type==='kitchen.show_recipe'&&t.dish===currentView.title&&Number(t.step)===Number(currentView.step)){return;}var chip=el('div','timer-chip '+t.status);var label=t.kind==='standalone'?'独立计时':(t.dish+' · '+(Number(t.step)+1)+'步');var right=t.status==='finished'?'时间到':fmt(remaining(t));chip.appendChild(el('span','',label));chip.appendChild(el('strong','',right));chip.onclick=function(){if(t.kind==='standalone'){openModal(Math.max(5,remaining(t)||t.duration_sec),{timer:t});}else{action('timer_open',{timer_id:t.timer_id});}};if(t.status==='finished'){var x=el('button','chip-x','×');x.setAttribute('aria-label','关闭提醒');x.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();action('timer_dismiss',{timer_id:t.timer_id});};chip.appendChild(x);}strip.appendChild(chip);shown++;})(latestTimers[i]);}strip.style.display=shown?'flex':'none';}
+  function syncTimers(timers){latestTimers=(timers&&timers.length!==undefined)?timers:[];renderTimerStrip();syncStandaloneAlarm();if(currentView&&currentView.type==='kitchen.show_recipe')renderStepTimer(currentView);if(currentView&&currentView.type==='kitchen.show_idle')renderIdleStandaloneTimer();}
   function timerButton(text,fn,cls){var b=el('button',cls||'',text);b.onclick=fn;return b;}
   function openModal(seconds,target){seconds=Math.max(5,Math.min(5999,Math.round(seconds||30)));$('minInput').value=Math.floor(seconds/60);$('secInput').value=seconds%60;modalTarget=target;$('timerModal').className='modal show';setTimeout(function(){try{$('minInput').focus();}catch(e){}},50);}
   function closeModal(){$('timerModal').className='modal';modalTarget=null;}
-  $('modalCancel').onclick=closeModal;$('modalOK').onclick=function(){var m=parseInt($('minInput').value||'0',10)||0,s=parseInt($('secInput').value||'0',10)||0,total=m*60+s;total=Math.max(5,Math.min(5999,total));var target=modalTarget;closeModal();if(!target)return;if(target.timer){action('timer_set',{timer_id:target.timer.timer_id,seconds:total});}else if(target.view){setDraft(target.view,total);}};
+  $('modalCancel').onclick=closeModal;$('modalOK').onclick=function(){var m=parseInt($('minInput').value||'0',10)||0,s=parseInt($('secInput').value||'0',10)||0,total=m*60+s;total=Math.max(5,Math.min(5999,total));var target=modalTarget;closeModal();if(!target)return;if(target.timer){action('timer_set',{timer_id:target.timer.timer_id,seconds:total});}else if(target.standalone){action('timer_standalone_start',{seconds:total});}else if(target.view){setDraft(target.view,total);}};
+  function standaloneTimer(){for(var i=0;i<latestTimers.length;i++){if(latestTimers[i].kind==='standalone')return latestTimers[i];}return null;}
+  function renderIdleStandaloneTimer(){var host=$('idleTimerHost');if(!host)return;host.innerHTML='';var t=standaloneTimer(),box=el('div','idle-timer');var head=el('div','idle-timer-head');head.appendChild(el('div','idle-timer-title','⏱ 独立计时器'));head.appendChild(el('div','idle-timer-note',t?(t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'请结束提醒')):'无需加载菜单'));box.appendChild(head);if(!t){var presets=el('div','idle-timer-presets');[[300,'5分钟'],[600,'10分钟'],[900,'15分钟']].forEach(function(x){presets.appendChild(timerButton(x[1],function(){action('timer_standalone_start',{seconds:x[0]});}));});presets.appendChild(timerButton('自定义',function(){openModal(300,{standalone:true});},'primary'));box.appendChild(presets);}else{var tt=el('div','idle-timer-time'+(t.status==='finished'?' finished':''),t.status==='finished'?'时间到':fmt(remaining(t)));tt.id='idleStandaloneTime';box.appendChild(tt);var c=el('div','idle-timer-actions');if(t.status==='running'){c.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary'));c.appendChild(timerButton('＋1分钟',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:60});}));c.appendChild(timerButton('重新设置',function(){openModal(Math.max(5,remaining(t)),{timer:t});}));c.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}else if(t.status==='paused'){c.appendChild(timerButton('▶ 继续',function(){action('timer_resume',{timer_id:t.timer_id});},'primary'));c.appendChild(timerButton('＋1分钟',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:60});}));c.appendChild(timerButton('重新设置',function(){openModal(Math.max(5,remaining(t)||t.duration_sec),{timer:t});}));c.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}else{var done=timerButton('结束提醒',function(){action('timer_dismiss',{timer_id:t.timer_id});},'danger');done.style.gridColumn='1 / -1';c.appendChild(done);}box.appendChild(c);}host.appendChild(box);}
   function renderStepTimer(v){var host=$('stepTimerHost');if(!host)return;host.innerHTML='';var hint=v.timer_hint||null,t=timerForView(v);if(!hint&&!t)return;var box=el('div','step-timer'+(t&&t.status==='finished'?' finished':''));var left=el('div');left.appendChild(el('div','timer-title',t?'本步骤计时':'建议计时'));var sec=t?remaining(t):suggested(v);var timeEl=el('div','timer-time',fmt(sec));timeEl.id='currentTimerTime';timeEl.onclick=function(){openModal(sec,t?{timer:t}:{view:v});};left.appendChild(timeEl);var state='';if(t){state=t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'时间到');}else if(hint){state='默认 '+fmt(hint.default_sec)+(Number(hint.max_sec)>Number(hint.default_sec)?' · 可延长到 '+fmt(hint.max_sec):'');}left.appendChild(el('div','timer-state',state));box.appendChild(left);var controls=el('div','timer-controls');var step=stepSize(sec);
     if(!t){controls.appendChild(timerButton('－'+fmt(step),function(){setDraft(v,suggested(v)-step);}));controls.appendChild(timerButton('▶ 开始',function(){action('timer_start',{seconds:suggested(v)});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){setDraft(v,suggested(v)+step);}));controls.appendChild(timerButton('设置',function(){openModal(suggested(v),{view:v});}));}
     else if(t.status==='running'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}
@@ -6820,15 +6911,15 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
     else{controls.appendChild(timerButton('＋'+fmt(step)+'继续',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});},'primary'));controls.appendChild(timerButton('重新计时',function(){action('timer_start',{seconds:suggested(v)});}));controls.appendChild(timerButton('完成',function(){action('timer_dismiss',{timer_id:t.timer_id});}));}
     box.appendChild(controls);host.appendChild(box);
   }
-  function tickTimers(){renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe'){var t=timerForView(currentView),n=$('currentTimerTime');if(t&&n)n.textContent=fmt(remaining(t));}}
+  function tickTimers(){renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe'){var t=timerForView(currentView),n=$('currentTimerTime');if(t&&n)n.textContent=fmt(remaining(t));}if(currentView&&currentView.type==='kitchen.show_idle'){var st=standaloneTimer(),sn=$('idleStandaloneTime');if(st&&sn&&st.status!=='finished')sn.textContent=fmt(remaining(st));}}
   function render(v,force){
     if(!v||!v.type)return;var rev=String(v.revision||'');if(!force&&rev&&rev===lastRevision){currentView=v;return;}if(rev)lastRevision=rev;currentView=v;clearView();
-    $('eyebrow').textContent=v.eyebrow||'HOME AI · 厨房';$('title').textContent=v.title||'小K';$('message').textContent=v.message||'';$('footer').textContent=(v.footer||'')+' · __KITCHEN_UI_VERSION__';
-    if(v.type==='kitchen.show_idle'){var ia=el('div','idle-actions');var pull=el('button','','加载今日菜单');pull.onclick=function(){action('today');};ia.appendChild(pull);$('content').appendChild(ia);return;}
+    $('eyebrow').textContent=v.eyebrow||'HOME AI · 厨房';$('title').textContent=v.title||'厨房终端';$('message').textContent=v.message||'';$('footer').textContent=(v.footer||'')+' · __KITCHEN_UI_VERSION__';
+    if(v.type==='kitchen.show_idle'){var ia=el('div','idle-actions');var pull=el('button','','加载今日菜单');pull.onclick=function(){action('today');};ia.appendChild(pull);$('content').appendChild(ia);var ih=el('div','');ih.id='idleTimerHost';$('content').appendChild(ih);renderIdleStandaloneTimer();return;}
     if(v.type==='kitchen.show_done'){var note=el('div','done-note','稍后会自动回到等待页面。');$('content').appendChild(note);return;}
     if(v.type==='kitchen.show_message')return;
-    if(v.type==='kitchen.show_menu'){var grid=el('div','menu');var items=(v.items&&v.items.length!==undefined)?v.items:[];for(var i=0;i<items.length;i++){(function(index){var item=items[index];var label=(typeof item==='string')?item:((item&&item.name)?item.name:('菜品 '+(index+1)));var b=el('button','');b.appendChild(el('span','',label));if(item&&item.has_progress&&Number(item.total_steps)>0){b.appendChild(el('span','menu-progress','继续 · 第 '+(Number(item.progress_step)+1)+' / '+Number(item.total_steps)+' 步'));}b.onclick=function(){action('recipe',{value:label});};grid.appendChild(b);})(i);}$('content').appendChild(grid);var tools=el('div','toolbar');var shop=el('button','action','购物清单');shop.onclick=function(){action('shopping');};tools.appendChild(shop);var time=el('button','action','烧菜顺序');time.onclick=function(){action('timeline');};tools.appendChild(time);var finish=el('button','action finish-btn','结束今日烹饪');finish.onclick=function(){action('finish_start');};tools.appendChild(finish);$('content').appendChild(tools);return;}
-    if(v.type==='kitchen.show_recipe'){$('message').textContent='';var metaText=(v.type_label||'菜谱')+(v.estimated_text?' · '+v.estimated_text:'');$('content').appendChild(el('div','recipe-meta',metaText));var card=el('div','step-card');var stepNum=(parseInt(v.step,10)||0)+1,total=parseInt(v.total_steps,10)||1;card.appendChild(el('div','step-label','步骤 '+stepNum+' / '+total));card.appendChild(el('div','step-text',v.step_text||'（本步骤内容为空）'));var timerHost=el('div','');timerHost.id='stepTimerHost';card.appendChild(timerHost);var tips=v.key_points||[];if(tips.length){var box=el('div','tips');box.appendChild(el('h3','','关键提醒'));var ul=el('ul');for(var j=0;j<tips.length;j++){ul.appendChild(el('li','',tips[j]));}box.appendChild(ul);card.appendChild(box);}$('content').appendChild(card);renderStepTimer(v);$('nav').style.display='grid';$('nav').appendChild(navButton('← 上一步','prev',false));$('nav').appendChild(navButton('返回菜单','menu',false));$('nav').appendChild(navButton('下一步 →','next',true));return;}
+    if(v.type==='kitchen.show_menu'){var grid=el('div','menu');var items=(v.items&&v.items.length!==undefined)?v.items:[];for(var i=0;i<items.length;i++){(function(index){var item=items[index];var label=(typeof item==='string')?item:((item&&item.name)?item.name:('菜品 '+(index+1)));var b=el('button','');b.appendChild(el('span','',label));if(item&&item.has_progress&&Number(item.total_steps)>0){var pstep=Number(item.progress_step)||0;var ptxt=pstep===0?'继续 · 备菜':('继续 · 第 '+(pstep+1)+' / '+Number(item.total_steps)+' 步');b.appendChild(el('span','menu-progress',ptxt));}b.onclick=function(){action('recipe',{value:label});};grid.appendChild(b);})(i);}$('content').appendChild(grid);var tools=el('div','toolbar');var shop=el('button','action','购物清单');shop.onclick=function(){action('shopping');};tools.appendChild(shop);var time=el('button','action','烧菜顺序');time.onclick=function(){action('timeline');};tools.appendChild(time);var finish=el('button','action finish-btn','结束今日烹饪');finish.onclick=function(){action('finish_start');};tools.appendChild(finish);$('content').appendChild(tools);return;}
+    if(v.type==='kitchen.show_recipe'){$('message').textContent='';var metaText=(v.type_label||'菜谱')+(v.estimated_text?' · '+v.estimated_text:'');$('content').appendChild(el('div','recipe-meta',metaText));var card=el('div','step-card');var stepNum=(parseInt(v.step,10)||0)+1,total=parseInt(v.total_steps,10)||1;var stepLabel=(v.step_kind==='prep')?('备菜 · '+stepNum+' / '+total):('步骤 '+stepNum+' / '+total);card.appendChild(el('div','step-label',stepLabel));card.appendChild(el('div','step-text',v.step_text||'（本步骤内容为空）'));var timerHost=el('div','');timerHost.id='stepTimerHost';card.appendChild(timerHost);var tips=v.key_points||[];if(tips.length){var box=el('div','tips');box.appendChild(el('h3','','关键提醒'));var ul=el('ul');for(var j=0;j<tips.length;j++){ul.appendChild(el('li','',tips[j]));}box.appendChild(ul);card.appendChild(box);}$('content').appendChild(card);renderStepTimer(v);$('nav').style.display='grid';$('nav').appendChild(navButton('← 上一步','prev',false));$('nav').appendChild(navButton('返回菜单','menu',false));$('nav').appendChild(navButton('下一步 →','next',true));return;}
     if(v.type==='kitchen.show_finish'){var wrap=el('div','step-card');wrap.appendChild(el('div','step-label','今日收尾'));wrap.appendChild(el('div','step-text',v.message||'确认结束今天的烹饪？'));var fa=el('div','finish-actions');var back=el('button','','继续烹饪');back.onclick=function(){action('menu');};fa.appendChild(back);var yes=el('button','danger','确认结束');yes.onclick=function(){action('finish_confirm');};fa.appendChild(yes);wrap.appendChild(fa);$('content').appendChild(wrap);return;}
     if(v.type==='kitchen.show_save_private'){var items2=v.items||[],list=el('div','choice-list');for(var z=0;z<items2.length;z++){var row=el('label','choice-row');var ck=document.createElement('input');ck.type='checkbox';ck.value=items2[z];ck.className='private-choice';row.appendChild(ck);row.appendChild(el('span','',items2[z]));list.appendChild(row);}$('content').appendChild(list);var sa=el('div','finish-actions');var none=el('button','','不保存，直接结束');none.onclick=function(){action('finish_no_save');};sa.appendChild(none);var save=el('button','primary','保存所选并结束');save.onclick=function(){var picked=[],nodes=document.querySelectorAll('.private-choice:checked');for(var n=0;n<nodes.length;n++)picked.push(nodes[n].value);action('finish_save',{value:JSON.stringify(picked)});};sa.appendChild(save);$('content').appendChild(sa);return;}
     if(v.type==='kitchen.show_shopping'){var groups=v.groups||[];for(var g=0;g<groups.length;g++){var box2=el('section','list-group');box2.appendChild(el('h3','',groups[g].name||''));var ul2=el('ul'),gi=groups[g].items||[];for(var q=0;q<gi.length;q++){ul2.appendChild(el('li','',gi[q]));}box2.appendChild(ul2);$('content').appendChild(box2);}$('nav').style.display='grid';$('nav').style.gridTemplateColumns='1fr';$('nav').appendChild(navButton('返回今日菜单','menu',true));return;}
@@ -6836,7 +6927,7 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
     showError('未知页面类型：'+v.type);
   }
   function poll(){xhrGet('/kitchen/view',function(err,text){if(err)return;try{var m=JSON.parse(text);if(m&&m.timers)syncTimers(m.timers);if(m&&m.audio)syncAudio(m.audio);if(m&&m.qa)qaRender(m.qa);if(m&&m.view)render(m.view,false);}catch(e){showError('Gateway 状态解析失败');}});}
-  function connectWS(){var scheme=(location.protocol==='https:')?'wss:':'ws:';try{ws=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');}catch(e){wsOK=false;setStatus();return;}ws.onopen=function(){retry=1000;wsOK=true;setStatus();try{ws.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,mic_probe:true,qa_ptt:true}}));}catch(e){}};ws.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.type==='kitchen.ready'){wsOK=true;setStatus();return;}if(m.type==='kitchen.sync'&&m.view){render(m.view,false);return;}if(m.type&&m.type.indexOf('kitchen.show_')===0){render(m,false);return;}}catch(e){}};ws.onclose=function(){wsOK=false;setStatus();setTimeout(connectWS,retry);retry=Math.min(Math.floor(retry*1.6),10000);};ws.onerror=function(){try{ws.close();}catch(e){}};}
+  function connectWS(){var scheme=(location.protocol==='https:')?'wss:':'ws:';try{ws=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');}catch(e){wsOK=false;setStatus();return;}ws.onopen=function(){retry=1000;wsOK=true;setStatus();try{ws.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,media_audio:true,airplay:true,mic_probe:true,qa_ptt:true}}));}catch(e){}};ws.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.type==='kitchen.ready'){wsOK=true;setStatus();return;}if(m.type==='kitchen.sync'&&m.view){render(m.view,false);return;}if(m.type&&m.type.indexOf('kitchen.show_')===0){render(m,false);return;}}catch(e){}};ws.onclose=function(){wsOK=false;setStatus();setTimeout(connectWS,retry);retry=Math.min(Math.floor(retry*1.6),10000);};ws.onerror=function(){try{ws.close();}catch(e){}};}
   window.onerror=function(msg){showError('页面脚本错误：'+String(msg));return false;};
   poll();setInterval(poll,1000);setInterval(tickTimers,250);connectWS();
 })();
@@ -6851,7 +6942,9 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
     return html.encode("utf-8")
 
 
-def _http_response(status: int, reason: str, body: bytes, content_type: str) -> Response:
+def _http_response(
+    status: int, reason: str, body: bytes, content_type: str, *, extra_headers: dict[str, str] | None = None
+) -> Response:
     headers = Headers()
     headers["Content-Type"] = content_type
     headers["Content-Length"] = str(len(body))
@@ -6859,7 +6952,47 @@ def _http_response(status: int, reason: str, body: bytes, content_type: str) -> 
     headers["Pragma"] = "no-cache"
     headers["Expires"] = "0"
     headers["X-Content-Type-Options"] = "nosniff"
+    for key, value in (extra_headers or {}).items():
+        headers[key] = value
     return Response(status, reason, headers, body)
+
+
+def _kitchen_audio_http_response(wav: bytes, range_header: str = "") -> Response:
+    """Serve WAV media with byte-range support for iOS HTMLMediaElement/AirPlay."""
+    total = len(wav)
+    base_headers = {"Accept-Ranges": "bytes"}
+    raw = str(range_header or "").strip()
+    if not raw:
+        return _http_response(200, "OK", wav, "audio/wav", extra_headers=base_headers)
+
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", raw)
+    if not match or total <= 0:
+        return _http_response(416, "Range Not Satisfiable", b"", "audio/wav", extra_headers={
+            "Accept-Ranges": "bytes", "Content-Range": f"bytes */{total}"
+        })
+
+    start_text, end_text = match.groups()
+    if start_text:
+        start = int(start_text)
+        end = int(end_text) if end_text else total - 1
+    else:
+        suffix = int(end_text or "0")
+        if suffix <= 0:
+            return _http_response(416, "Range Not Satisfiable", b"", "audio/wav", extra_headers={
+                "Accept-Ranges": "bytes", "Content-Range": f"bytes */{total}"
+            })
+        start = max(0, total - suffix)
+        end = total - 1
+
+    if start < 0 or start >= total or end < start:
+        return _http_response(416, "Range Not Satisfiable", b"", "audio/wav", extra_headers={
+            "Accept-Ranges": "bytes", "Content-Range": f"bytes */{total}"
+        })
+    end = min(end, total - 1)
+    part = wav[start:end + 1]
+    return _http_response(206, "Partial Content", part, "audio/wav", extra_headers={
+        "Accept-Ranges": "bytes", "Content-Range": f"bytes {start}-{end}/{total}"
+    })
 
 
 async def gateway_http_request(connection: Any, request: Any) -> Response | None:
@@ -6885,12 +7018,18 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
             "server_time": datetime.now().astimezone().isoformat(),
         }, ensure_ascii=False).encode("utf-8")
         return _http_response(200, "OK", body, "application/json; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/alarm.wav":
+        request_headers = getattr(request, "headers", None)
+        range_header = request_headers.get("Range", "") if request_headers is not None else ""
+        return _kitchen_audio_http_response(KITCHEN_STANDALONE_ALARM_WAV, range_header)
     if path == KITCHEN_HTTP_PATH + "/audio":
         event_id = str((query.get("id") or [""])[0])
         wav = KITCHEN_AUDIO_CACHE.get(event_id)
         if wav is None:
             return _http_response(404, "Not Found", b"audio event not found", "text/plain; charset=utf-8")
-        return _http_response(200, "OK", wav, "audio/wav")
+        request_headers = getattr(request, "headers", None)
+        range_header = request_headers.get("Range", "") if request_headers is not None else ""
+        return _kitchen_audio_http_response(wav, range_header)
 
     if path == KITCHEN_HTTP_PATH + "/action":
         action = str((query.get("action") or [""])[0]).strip().lower()
@@ -6944,14 +7083,17 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
                 timer = KITCHEN_TIMERS.get(timer_id)
                 if timer is None:
                     raise KitchenMenuError("timer not found")
-                delivered, recipe = await _kitchen_open_recipe_by_name(timer.dish, timer.step)
-                if recipe is None:
-                    raise KitchenMenuError(f"recipe not found: {timer.dish}")
+                if timer.kind != "standalone":
+                    delivered, recipe = await _kitchen_open_recipe_by_name(timer.dish, timer.step)
+                    if recipe is None:
+                        raise KitchenMenuError(f"recipe not found: {timer.dish}")
             elif action == "audio_ack":
                 _kitchen_clear_audio(event_id=value)
             elif action == "timer_start":
                 seconds = int(seconds_text) if seconds_text else None
                 _kitchen_timer_start(seconds)
+            elif action == "timer_standalone_start":
+                _kitchen_timer_start_standalone(int(seconds_text or "300"))
             elif action in {"timer_adjust", "timer_set", "timer_pause", "timer_resume", "timer_cancel", "timer_dismiss"}:
                 timer = KITCHEN_TIMERS.get(timer_id) if timer_id else _kitchen_pick_timer()
                 if timer is None:
@@ -7078,6 +7220,7 @@ def _kitchen_recipe_payload(menu: dict[str, Any], recipe: dict[str, Any], step: 
         "step": step,
         "total_steps": len(steps),
         "step_text": str(steps[step]),
+        "step_kind": str((recipe.get("step_kinds") or [])[step] if step < len(recipe.get("step_kinds") or []) else "cook"),
         "timer_hint": timer_hint,
         "key_points": recipe.get("key_points") or [],
         "footer": "语音可说：下一步 / 上一步 / 开始计时 / 还有多久",

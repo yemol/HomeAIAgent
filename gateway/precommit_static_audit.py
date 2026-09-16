@@ -82,8 +82,8 @@ if main.exists():
             if refs <= 1:
                 errors.append(f'unreferenced top-level definition: {node.name} line {node.lineno}')
 
-    if 'KITCHEN_UI_VERSION = "A3.0b FIX1 R12"' not in source:
-        errors.append('Kitchen UI version marker is not R12')
+    if 'KITCHEN_UI_VERSION = "A3.0b FIX1 R16"' not in source:
+        errors.append('Kitchen UI version marker is not R16')
 
 if errors:
     print('[STATIC-AUDIT] FAIL')

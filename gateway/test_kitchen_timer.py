@@ -31,18 +31,20 @@ menu:
     menu = parse_kitchen_menu(text)
     recipe = match_recipe(menu, "测试菜")
     assert recipe is not None
-    assert recipe["step_timers"][0]["default_sec"] == 900
-    assert recipe["step_timers"][0]["max_sec"] == 1200
-    assert recipe["step_timers"][0]["source"] == "explicit"
-    assert recipe["step_timers"][1]["default_sec"] == 30
-    assert recipe["step_timers"][1]["max_sec"] == 40
+    assert recipe["step_timers"][0] is None
+    assert recipe["step_kinds"][0] == "prep"
+    assert recipe["step_timers"][1]["default_sec"] == 900
+    assert recipe["step_timers"][1]["max_sec"] == 1200
+    assert recipe["step_timers"][1]["source"] == "explicit"
+    assert recipe["step_timers"][2]["default_sec"] == 30
+    assert recipe["step_timers"][2]["max_sec"] == 40
 
     g.KITCHEN_CURRENT_MENU = menu
     g.KITCHEN_CURRENT_STATE = {
         "screen": "recipe",
         "date": "2026-09-13",
         "dish": "测试菜",
-        "step": 0,
+        "step": 1,
     }
     g.KITCHEN_TIMERS.clear()
     timer = g._kitchen_timer_start()
@@ -55,12 +57,13 @@ menu:
     assert timer.status == "running"
     public = g._kitchen_timer_public(timer)
     assert public["dish"] == "测试菜"
-    assert public["step"] == 0
+    assert public["step"] == 1
 
     html = g._kitchen_html().decode("utf-8")
     assert "KitchenTerminal A3.0b" in html
     assert "homeai-kitchen/1.9" in html
     assert "timer_start" in html
+    assert "备菜 · " in html
 
     g.KITCHEN_TIMERS.clear()
     g.save_kitchen_timers()

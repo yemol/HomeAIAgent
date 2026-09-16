@@ -1,6 +1,6 @@
 # HomeAIAgent Gateway
 
-当前完整替换基线：**A3.0b FIX1 R12 FULL CLEAN**
+当前完整替换基线：**A3.0b FIX1 R16 FULL CLEAN**
 
 Gateway 运行在 Mac mini，是 HomeAIAgent 设备、KitchenTerminal、NetworkSpeaker 与上游 AI/语音服务之间的本地调度中心。
 
@@ -72,15 +72,28 @@ https://<Mac-mini>.ts.net/kitchen
 核心流程：
 
 ```text
-加载今日菜单
-→ 选择菜品 / 步骤
+等待首页可直接使用独立计时器
+或加载今日菜单
+→ 选择菜品
+→ 每道菜先进入「备菜」步骤，一次确认食材 / 调味 / 提前处理
+→ 再进入正式烹饪步骤
 → 需要时启动计时器
 → 问逐光处理复杂烹饪问题
-→ iPad 本地播放厨房回答
+→ iPad 系统媒体播放厨房回答，可路由到 HomePod / AirPlay
 → 结束今日烹饪 / 可选保存私房菜
 ```
 
-确定性厨房操作优先走 Gateway 本地 Fast-path，不依赖 OpenClaw：今日菜单、上一/下一步、上一/下一道菜、购物清单、烧菜顺序、计时器、结束烹饪等。
+确定性厨房操作优先走 Gateway 本地 Fast-path，不依赖 OpenClaw：今日菜单、上一/下一步、上一/下一道菜、购物清单、烧菜顺序、菜谱计时器、独立计时器、结束烹饪等。
+
+### 独立计时器
+
+等待首页在“加载今日菜单”下方提供独立计时器，可直接选择 5 / 10 / 15 分钟或自定义时间，不需要加载任何菜单。独立计时状态由 Gateway 持久化，刷新页面后仍可恢复。时间到后，iPad 使用同一个系统媒体 `HTMLAudioElement` 循环播放提示音，直到用户主动点击“结束提醒”。因此已选择的 HomePod / AirPlay 输出仍可沿用。
+
+### KitchenTerminal 音频输出
+
+厨房 TTS 使用一个长期存在的 `HTMLAudioElement` 播放，不再用 `AudioContext.decodeAudioData()` 输出。这样声音进入 iPadOS 的系统媒体链，可以跟随系统当前输出设备，并在支持的 WebKit 环境中通过顶部「播放设备」按钮调用系统 AirPlay 选择器。
+
+`/kitchen/audio` 支持 HTTP byte range（206 Partial Content），用于 Safari / iPadOS 媒体栈和 AirPlay 的标准媒体请求。问逐光的麦克风录音仍使用独立 Web Audio 采集链，输出设备切换不会改动录音链。
 
 ## NetworkSpeaker
 
@@ -151,7 +164,7 @@ precommit_static_audit.py  仓库洁净度与静态检查
 
 ## 冻结原则
 
-R12 作为当前阶段完整替换基线。冻结期间只接受明确缺陷修复，不做大范围架构拆分或功能扩张。下一阶段再考虑把 `companion_gateway.py` 中 Device Router、Kitchen、Info、Audio Router 等职责拆成独立模块。
+R16 作为当前 KitchenTerminal 完整替换基线。R16 继承 R15 的 AirPlay、顶部安全留白与独立计时器，并把“每道菜第 1 步必须是备菜”提升为 Gateway 数据层硬规则。即使菜单文件漏写统一备菜、旧菜单对象残留或未来调用路径绕过生成 Skill，KitchenTerminal 仍会在打开菜谱前强制规范化为 prep-first；仅复用来源中已经存在的清洗、切配、泡发、腌制等文字，不凭空猜测处理方式。冻结期间只接受明确缺陷修复，不做大范围架构拆分或无关功能扩张。下一阶段再考虑把 `companion_gateway.py` 中 Device Router、Kitchen、Info、Audio Router 等职责拆成独立模块。
 
 ## Persistent configuration and full replacement
 

@@ -52,6 +52,9 @@ menu:
 #### 食材
 - 白菜 300g
 - 肉丸 250g
+#### 备菜
+- 白菜洗净切段。
+- 粉丝提前泡软。
 #### 做法
 1. 水开后下肉丸。
 2. 加白菜和粉丝煮熟。
@@ -63,6 +66,39 @@ menu:
 2. 小排炖煮时准备汤。
 """
 
+
+NO_PREP_SAMPLE = """---
+type: dinner-menu
+schema: kitchen-menu-v1
+date: 2026-09-15
+weekday: 周二
+servings: 3
+menu:
+  - name: 番茄炒蛋
+    category: vegetable
+    cook_order: 1
+---
+## 🛒 一、超市购物单
+- 番茄 2个
+- 鸡蛋 3个
+
+## 📋 二、今晚菜单
+1. **番茄炒蛋**
+
+## 🍳 四、烹饪步骤
+### 1. 番茄炒蛋
+#### 食材
+- 番茄 2个
+- 鸡蛋 3个
+#### 调味
+- 盐 适量
+#### 做法
+1. 番茄洗净切块，鸡蛋打散。
+2. 炒鸡蛋后盛出，再炒番茄并回锅。
+
+## ⏱️ 五、省事操作时间线
+1. 先做番茄炒蛋。
+"""
 
 def main() -> int:
     if len(sys.argv) > 2:
@@ -81,9 +117,48 @@ def main() -> int:
     assert len(menu["recipes"]) >= 2
     ribs = match_recipe(menu, "小排")
     assert ribs and "糖醋小排" in ribs["name"]
-    assert len(ribs["steps"]) == 2
+    assert len(ribs["steps"]) == 3
+    assert ribs["step_kinds"] == ["prep", "cook", "cook"]
+    assert ribs["step_timers"][0] is None
+    assert "【食材】排骨 500g" in ribs["steps"][0]
+    assert "【调味】料酒 1勺" in ribs["steps"][0]
+    assert "排骨洗净" in ribs["steps"][0]
+    soup = match_recipe(menu, "白菜肉丸")
+    assert soup and "白菜洗净切段" in soup["steps"][0]
+    assert "粉丝提前泡软" in soup["steps"][0]
     assert menu["shopping"]
     assert menu["timeline"]
+
+    # Permanent project invariant: even a legacy/newly generated menu which
+    # completely omits the prep section must still expose prep as step 0.
+    no_prep = parse_kitchen_menu(NO_PREP_SAMPLE, source="<no-prep-sample>")
+    tomato = match_recipe(no_prep, "番茄炒蛋")
+    assert tomato is not None
+    assert tomato["step_kinds"][0] == "prep"
+    assert tomato["step_timers"][0] is None
+    assert "备菜" in tomato["steps"][0]
+    assert "番茄 2个" in tomato["steps"][0]
+    assert "盐 适量" in tomato["steps"][0]
+    assert "番茄洗净切块" in tomato["steps"][0]
+    assert no_prep["prep_policy"] == "required-v1"
+
+    # A stale recipe object must be normalized again by recipe_for/match_recipe.
+    stale = {
+        "recipes": [{
+            "name": "测试菜",
+            "ingredients": ["豆腐 1盒"],
+            "seasoning": ["盐 少许"],
+            "prep_items": [],
+            "steps": ["下锅煮熟。"],
+            "step_timers": [None],
+            "step_kinds": ["cook"],
+        }]
+    }
+    repaired = match_recipe(stale, "测试菜")
+    assert repaired is not None
+    assert repaired["step_kinds"][0] == "prep"
+    assert len(repaired["steps"]) == 2
+
     print("Kitchen menu parser regression: PASS")
     return 0
 

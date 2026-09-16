@@ -1,3 +1,22 @@
+# KitchenTerminal A3.0d VOICE1.1 (2026-09-14)
+
+- Fix real ASR forms `小 k ...` / `小 K ...` not matching the `小K` KitchenTerminal namespace.
+- Namespace parser now accepts optional whitespace between `小` and `K/k`, including full-width K forms.
+- The exact logged phrases `小 k 获取今日菜单。`, `小 K 显示今日菜单。`, and `小 K 获取今日菜单。` are covered by the local fast-path self-test.
+- `小K获取今日菜单` now reaches `_kitchen_show_today_menu()` directly, which reloads today's menu source and broadcasts a fresh `kitchen.show_menu` payload to the connected iPad.
+- No OpenClaw round-trip is used for this deterministic command.
+- StickS3 firmware, NetworkSpeaker, HTTPS/Tailscale microphone path, timers and recipe-progress logic are unchanged.
+
+# KitchenTerminal A3.0d VOICE1 (2026-09-14)
+
+- `小K` is now the primary external voice-command namespace.
+- Example: `小K获取今日菜单`.
+- `获取` is added as a deterministic local synonym for loading today's menu.
+- Legacy `厨房` prefix remains accepted for backward compatibility.
+- KitchenTerminal's own iPad microphone may still omit the prefix.
+- Spoken confirmations now refer to the terminal as `小K`.
+- Internal protocol names, device IDs, `/kitchen` routes, timers, recipe progress, HTTPS microphone path, OpenClaw transport, StickS3 firmware and NetworkSpeaker remain unchanged.
+
 # KitchenTerminal A3.0c UI1 (2026-09-14)
 
 - User-visible KitchenTerminal name changed to `小K`.

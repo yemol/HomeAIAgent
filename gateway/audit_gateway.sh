@@ -43,8 +43,11 @@ TESTS=(
   test_kitchen_menu.py
   test_kitchen_mic_probe.py
   test_kitchen_progress.py
+  test_kitchen_prep_migration.py
+  test_kitchen_prep_required.py
   test_kitchen_qa.py
   test_kitchen_timer.py
+  test_kitchen_standalone_timer.py
   test_kitchen_voice_fastpath.py
   test_long_tts_segmentation.py
   test_multi_device_router.py

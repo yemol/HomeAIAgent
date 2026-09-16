@@ -110,6 +110,15 @@ def _section(body: str, title_fragment: str) -> str:
     return (match.group("content").strip() if match else "")
 
 
+def _section_first(body: str, title_fragments: list[str]) -> str:
+    """Return the first matching level-2 section from a small alias set."""
+    for fragment in title_fragments:
+        content = _section(body, fragment)
+        if content:
+            return content
+    return ""
+
+
 def _bullets(text: str) -> list[str]:
     return [
         re.sub(r"^[-*+]\s+", "", line).strip()
@@ -254,6 +263,7 @@ def _parse_recipes(cooking: str) -> list[dict[str, Any]]:
             "estimated_text": _strip_bold_field(block, "预计用时"),
             "ingredients": _bullets(subs.get("食材", "")),
             "seasoning": _bullets(subs.get("调味", "")),
+            "prep_items": _bullets(subs.get("备菜", "")),
             "steps": steps,
             "step_timers": step_timers,
             "key_points": _bullets(subs.get("关键点", "")),
@@ -281,6 +291,12 @@ def _parse_shopping(shopping: str) -> list[dict[str, Any]]:
 
 
 def _parse_prep(prep: str) -> list[dict[str, Any]]:
+    """Parse meal-level prep notes.
+
+    Preferred format uses ``### 菜名`` headings.  Older dinner notes may only
+    contain bullets; those are kept as an unnamed entry and matched to a dish
+    conservatively by ingredient names.
+    """
     entries: list[dict[str, Any]] = []
     matches = list(re.finditer(r"^###\s+(.+?)\s*$", prep, re.M))
     for idx, match in enumerate(matches):
@@ -288,8 +304,139 @@ def _parse_prep(prep: str) -> list[dict[str, Any]]:
         end = matches[idx + 1].start() if idx + 1 < len(matches) else len(prep)
         items = _bullets(prep[start:end])
         if items:
-            entries.append({"name": match.group(1).strip(), "items": items})
+            name = re.sub(r"^\d+[.)、]\s*", "", match.group(1).strip())
+            entries.append({"name": name, "items": items})
+    if not entries:
+        items = _bullets(prep)
+        if items:
+            entries.append({"name": "", "items": items})
     return entries
+
+
+def _prep_keyword(ingredient: str) -> str:
+    """Extract a conservative ingredient name for matching legacy prep notes."""
+    text = re.sub(r"[（(].*?[）)]", "", str(ingredient or "")).strip()
+    text = re.split(r"\s+|\d", text, maxsplit=1)[0].strip("：:，,、")
+    return text if len(text) >= 1 else ""
+
+
+_PREP_ACTION_HINTS = (
+    "洗净", "洗好", "切片", "切块", "切段", "切丝", "切丁", "切末",
+    "切碎", "剁碎", "拍碎", "去皮", "去壳", "去籽", "去蒂", "去根",
+    "泡发", "泡软", "浸泡", "解冻", "回温", "沥干", "腌制", "腌一下",
+    "焯水", "焯一下", "调成", "调匀", "拌匀", "称量", "提前烧", "烧开备用",
+)
+
+
+def _prep_actions_from_cook_steps(recipe: dict[str, Any]) -> list[str]:
+    """Recover explicit prep actions already present in source cooking text.
+
+    This is deliberately conservative: it only copies preparation wording which
+    already exists in the recipe.  It never invents a cut, soak, blanch or
+    marination instruction which the source did not contain.
+    """
+    recovered: list[str] = []
+    seen: set[str] = set()
+    for raw_step in recipe.get("steps") or []:
+        text = str(raw_step or "").strip()
+        if not text:
+            continue
+        for clause in re.split(r"[。；;！!]+", text):
+            clause = clause.strip(" ，,：:\t")
+            if not clause or not any(hint in clause for hint in _PREP_ACTION_HINTS):
+                continue
+            # Keep only reasonably short source clauses.  Long active cooking
+            # instructions may contain words such as '切段' incidentally and
+            # should not be copied wholesale into the prep screen.
+            if len(clause) > 60:
+                continue
+            if clause not in seen:
+                seen.add(clause)
+                recovered.append(clause)
+    return recovered
+
+
+def _prep_items_for_recipe(recipe: dict[str, Any], entries: list[dict[str, Any]]) -> list[str]:
+    name = str(recipe.get("name") or "").strip()
+    selected: list[str] = []
+    unnamed: list[str] = []
+    for entry in entries:
+        entry_name = str(entry.get("name") or "").strip()
+        items = [str(x).strip() for x in (entry.get("items") or []) if str(x).strip()]
+        if not items:
+            continue
+        if not entry_name:
+            unnamed.extend(items)
+            continue
+        if entry_name == name or entry_name in name or name in entry_name:
+            selected.extend(items)
+
+    # Legacy unheaded prep blocks are shared meal notes. Only attach bullets
+    # which mention an ingredient of this dish so unrelated prep never leaks
+    # into every recipe.
+    keywords = [_prep_keyword(x) for x in (recipe.get("ingredients") or [])]
+    keywords = [x for x in keywords if x]
+    for item in unnamed:
+        if any(keyword in item for keyword in keywords):
+            selected.append(item)
+
+    # Last-resort compatibility for menus which were generated without the
+    # mandatory prep section.  Reuse only prep wording already present in the
+    # recipe's source steps; never guess missing preparation.
+    recovered = _prep_actions_from_cook_steps(recipe)
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in list(recipe.get("prep_items") or []) + selected + recovered:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            merged.append(text)
+    return merged
+
+
+def _build_prep_step(recipe: dict[str, Any]) -> str:
+    """Build the mandatory first KitchenTerminal step for every dish."""
+    lines = ["开火前先完成这道菜的备菜："]
+    ingredients = [str(x).strip() for x in (recipe.get("ingredients") or []) if str(x).strip()]
+    seasoning = [str(x).strip() for x in (recipe.get("seasoning") or []) if str(x).strip()]
+    prep_items = [str(x).strip() for x in (recipe.get("prep_items") or []) if str(x).strip()]
+    if ingredients:
+        lines.append("【食材】" + "；".join(ingredients))
+    if seasoning:
+        lines.append("【调味】" + "；".join(seasoning))
+    if prep_items:
+        lines.append("【提前处理】")
+        lines.extend("• " + item for item in prep_items)
+    else:
+        lines.append("【提前处理】无需额外处理，确认食材、调味和所需厨具已备齐。")
+    lines.append("全部完成后，再进入下一步开火烹饪。")
+    return "\n".join(lines)
+
+
+def ensure_recipe_prep_first(recipe: dict[str, Any]) -> dict[str, Any]:
+    """Enforce the project invariant: recipe step 0 is always prep.
+
+    This guard intentionally lives below the UI layer so a stale/legacy menu
+    object, an older generated menu file, or a future alternate caller cannot
+    bypass the prep-first rule.  The function is idempotent.
+    """
+    steps = list(recipe.get("steps") or [])
+    kinds = list(recipe.get("step_kinds") or [])
+    timers = list(recipe.get("step_timers") or [])
+    if steps and kinds and kinds[0] == "prep":
+        recipe["prep_required"] = True
+        return recipe
+
+    cook_steps = list(recipe.get("cook_steps") or steps)
+    cook_timers = list(recipe.get("cook_step_timers") or timers)
+    recipe["cook_steps"] = cook_steps
+    recipe["cook_step_timers"] = cook_timers
+    recipe["steps"] = [_build_prep_step(recipe)] + cook_steps
+    recipe["step_timers"] = [None] + cook_timers
+    recipe["step_kinds"] = ["prep"] + ["cook"] * len(cook_steps)
+    recipe["prep_required"] = True
+    return recipe
 
 
 def parse_kitchen_menu(text: str, *, source: str = "") -> dict[str, Any]:
@@ -303,6 +450,14 @@ def parse_kitchen_menu(text: str, *, source: str = "") -> dict[str, Any]:
 
     cooking = _section(body, "烹饪步骤")
     recipes = _parse_recipes(cooking)
+    prep_entries = _parse_prep(_section_first(body, ["统一备菜", "提前备菜"]))
+    for recipe in recipes:
+        recipe["prep_items"] = _prep_items_for_recipe(recipe, prep_entries)
+        cook_steps = list(recipe.get("steps") or [])
+        cook_timers = list(recipe.get("step_timers") or [])
+        recipe["cook_steps"] = cook_steps
+        recipe["cook_step_timers"] = cook_timers
+        ensure_recipe_prep_first(recipe)
     recipe_by_name = {recipe["name"]: recipe for recipe in recipes}
 
     menu_items = front.get("menu") if isinstance(front.get("menu"), list) else []
@@ -331,6 +486,7 @@ def parse_kitchen_menu(text: str, *, source: str = "") -> dict[str, Any]:
 
     menu = {
         "schema": "kitchen-menu-v1",
+        "prep_policy": "required-v1",
         "source": source,
         "date": str(front.get("date")),
         "weekday": str(front.get("weekday") or ""),
@@ -341,7 +497,7 @@ def parse_kitchen_menu(text: str, *, source: str = "") -> dict[str, Any]:
         "items": normalized_menu,
         "recipes": recipes,
         "shopping": _parse_shopping(_section(body, "超市购物单")),
-        "prep": _parse_prep(_section(body, "统一备菜")),
+        "prep": prep_entries,
         "timeline": _numbered(_section(body, "省事操作时间线")),
         "body": body,
     }
@@ -389,7 +545,7 @@ def recipe_for(menu: dict[str, Any], name: str) -> dict[str, Any] | None:
     target = name.strip()
     for recipe in menu.get("recipes") or []:
         if str(recipe.get("name") or "") == target:
-            return recipe
+            return ensure_recipe_prep_first(recipe)
     return None
 
 
@@ -403,7 +559,7 @@ def match_recipe(menu: dict[str, Any], query: str) -> dict[str, Any] | None:
     for recipe in recipes:
         name = re.sub(r"[\s，。！？、,.!?]", "", str(recipe.get("name") or "")).lower()
         if q == name:
-            return recipe
+            return ensure_recipe_prep_first(recipe)
     # Query contained in dish name (e.g. 河虾 -> 葱姜盐水河虾).
     candidates = []
     for recipe in recipes:
@@ -411,5 +567,5 @@ def match_recipe(menu: dict[str, Any], query: str) -> dict[str, Any] | None:
         if q in name or name in q:
             candidates.append(recipe)
     if len(candidates) == 1:
-        return candidates[0]
+        return ensure_recipe_prep_first(candidates[0])
     return None

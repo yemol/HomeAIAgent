@@ -1,4 +1,44 @@
+## A3.0b FIX1 R16 FULL CLEAN
+
+- 将“每道菜第 1 步固定为备菜”从菜单生成约定升级为 Gateway 永久数据层规则。
+- `kitchen_menu.ensure_recipe_prep_first()` 对菜谱对象做幂等规范化，旧菜单、漏写备菜的菜单和未来替代调用路径都不能绕过。
+- 新菜单即使完全缺少 `统一备菜/提前备菜` 区块，也会生成第 1 步备菜，至少列出食材、调味与“无需额外处理”的明确说明。
+- 若旧菜单把清洗、切配、泡发、解冻、腌制、焯水、调汁等准备动作写进正式做法，Gateway 只从原文保守回收这些动作到备菜页，不凭空创造处理方式。
+- 新增 prep-required 回归测试，未来版本一旦丢失第 1 步备菜，`audit_gateway.sh` 会直接失败。
+
 # HomeAIAgent Gateway CHANGELOG
+
+## A3.0b FIX1 R15 FULL CLEAN
+
+- 基于 R14 FULL CLEAN 完整基线修改，保留 HomePod / AirPlay、备菜、问逐光、NetworkSpeaker、Info、OpenClaw 等现有功能。
+- 恢复 KitchenTerminal 顶部安全留白：使用 `safe-area-inset-top + 18px`，避免 iPad 状态栏紧贴应用头部。
+- 等待首页在“加载今日菜单”下方新增独立计时器，无需加载菜单即可使用。
+- 独立计时器支持 5 / 10 / 15 分钟快捷启动、自定义时间、暂停、继续、加 1 分钟、重新设置和取消。
+- 独立计时器由 Gateway 持久化，使用 `kitchen_timers.json` version 3，并与菜谱计时器并存；新建独立计时只替换旧独立计时，不影响菜谱计时。
+- 时间到后，通过 KitchenTerminal 同一个持久 `HTMLAudioElement` 循环播放专用提示音，直到用户主动“结束提醒”；可沿用当前 iPadOS / HomePod / AirPlay 播放目标。
+- 新增 `/kitchen/alarm.wav` 媒体端点，支持与厨房 TTS 相同的 HTTP byte-range 播放路径。
+- 当独立计时警报响铃时，新到的普通厨房 TTS 会暂存，结束提醒后再继续播放，避免互相抢占。
+- 新增独立计时器回归测试，并把安全留白、持续提醒、媒体链纳入发布前审核。
+
+## A3.0b FIX1 R14 FULL CLEAN
+
+- 基于 R13 FULL CLEAN 完整基线修改，保留备菜、计时器、问逐光、NetworkSpeaker、Info、OpenClaw 等现有功能。
+- KitchenTerminal TTS 输出从 Web Audio `AudioContext.decodeAudioData()` 改为持久 `HTMLAudioElement`，让 iPadOS 系统媒体路由接管输出。
+- 顶部新增「播放设备」按钮；在支持的 WebKit 环境调用 `webkitShowPlaybackTargetPicker()`，可直接选择 HomePod / AirPlay。
+- 监听 `webkitCurrentPlaybackTargetIsWireless`，无线目标启用时顶部显示 `AirPlay 已连接`。
+- `/kitchen/audio` 增加 HTTP byte-range / 206 Partial Content 支持，兼容 Safari / iPadOS 标准媒体加载。
+- 首次触碰页面仍会预激活音频，但不再创建 TTS `AudioContext`；问逐光麦克风采集的 AudioContext 保持独立。
+- 新增 HTML media/AirPlay UI 与 byte-range 回归检查。
+
+## A3.0b FIX1 R13 FULL CLEAN
+
+- 直接基于用户最新上传的 Gateway 完整目录修改，不回退到此前生成包。
+- KitchenTerminal 每道菜固定新增第 1 步「备菜」，开火前集中显示食材、调味和明确的提前处理事项。
+- 支持菜谱内 `#### 备菜`，同时兼容 `## 统一备菜` / `## 提前备菜`；旧菜单没有专门备菜结构时仍会从食材、调味生成安全的准备清单，不猜测不存在的处理动作。
+- 原烹饪步骤整体顺延一位，计时提示同步顺延。
+- `kitchen_progress.json` schema 1→2、`kitchen_timers.json` version 1→2 自动迁移，避免升级后已有进度/计时器错位。
+- 私房菜保存时将备菜单独写入 `## 🔪 备菜`，正式做法仍只保存烹饪步骤。
+- UI 对备菜页显示 `备菜 · 1 / N`，菜单继续进度也会显示「继续 · 备菜」。
 
 ## A3.0b FIX1 R11 FULL CLEAN
 
