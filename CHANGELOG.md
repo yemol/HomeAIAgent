@@ -1,3 +1,36 @@
+# HomeAIAgent Current Baseline Cleanup (2026-09-27)
+
+- Freeze the real-device verified A5.0-GW-R1 Selective Follow-up behavior.
+- Consolidate current architecture, deployment, A5.0, hardware, protocol and Kitchen R50.10 notes into the root `README.md`.
+- Keep only one project `CHANGELOG.md`; remove duplicated Gateway changelog, historical BUILD_INFO files, phase notes and one-off audit reports from the release package.
+- Add a project-wide `.gitignore` and make the submission cleanup script remove nested Python caches.
+- Fix `gateway/check_source_encoding.sh` so it uses the HomeAIAgent venv or `python3` fallback instead of assuming a `python` command exists.
+- Remove the unused `src/idf_component.yml.orig` backup artifact.
+- No ASR, TTS, Wake, VAD, Audio Route, Context Judge, NetworkSpeaker, Glass2 or Kitchen runtime behavior changed.
+
+# KitchenTerminal R50.10 (current)
+
+- Fix 今日采购 inventory cross-check identity matching.
+- Replace substring containment with `采购行提取食材名 -> 食材身份规范化 -> 规范身份精确匹配`.
+- Keep shape/cut distinctions such as `牛肉` vs `牛肉片` and `猪肉` vs `猪肉丝`.
+- Preserve R50.9 item-id intake-history identity fix and the existing Food OS schema.
+
+# HomeAIAgent A5.0-GW-R1 Selective Follow-up (2026-09-27)
+
+- Add a 10-second post-playback continuation window without changing the normal wake-word entry path.
+- Add an isolated OpenClaw Context Judge; only clear current-context continuations reach the existing voice session.
+- Out-of-context, ambiguous, environmental, Judge-error and pre-Judge ASR-error candidates fail closed and are silently discarded.
+- Reuse the existing StickS3 idle microphone and VAD threshold; no new permanent listening task or Gateway polling loop.
+- Begin gradual Gateway modularization with `gateway/core/session.py` and `gateway/context/followup.py`.
+- Keep NetworkSpeaker output-only; no AI/session state added to the speaker.
+
+# Wake A5.2 逐光同学 Observation (2026-09-16)
+
+- Switch wake phrase back to `逐光同学` for multi-day observation.
+- Keep Wake PGA 6 dB, 5-second cooldown, VAD, PTT, TTS and MultiNet threshold unchanged.
+- No Gateway/OpenClaw/NetworkSpeaker/KitchenTerminal changes.
+- Treat renovation-day recognition results as invalid for phrase-quality judgment.
+
 # KitchenTerminal A3.0d VOICE1.1 (2026-09-14)
 
 - Fix real ASR forms `小 k ...` / `小 K ...` not matching the `小K` KitchenTerminal namespace.

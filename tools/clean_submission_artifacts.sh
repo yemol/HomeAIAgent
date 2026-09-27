@@ -10,7 +10,9 @@ echo "[CLEAN] persistent runtime outside the project is NOT touched"
 echo "[CLEAN] .pio-local is NOT touched"
 
 # Generated build/cache directories. Never delete .pio-local.
-rm -rf -- .pio __pycache__ .pytest_cache gateway/__pycache__ tools/__pycache__ scripts/__pycache__ __MACOSX
+rm -rf -- .pio .pytest_cache __MACOSX
+find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+find . -type f -name '*.pyc' -delete
 
 # Project-local debug captures and accidental runtime-state copies only.
 find . -type f \
