@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import gzip
 import hashlib
 import io
@@ -29,6 +30,8 @@ import math
 import os
 import re
 import shutil
+import subprocess
+import sqlite3
 import array
 import struct
 import sys
@@ -43,7 +46,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -52,7 +55,9 @@ from websockets.http11 import Response
 from dotenv import load_dotenv
 
 from openclaw_transport import OpenClawTransportConfig, OpenClawTransportManager
-from kitchen_menu import KitchenMenuError, load_kitchen_menu, match_recipe, recipe_for
+from kitchen_menu import KitchenMenuError, ensure_recipe_prep_first, load_kitchen_menu, match_recipe, parse_kitchen_menu, recipe_for
+from core.session import ClientSession
+from context.followup import build_followup_judge_prompt, parse_followup_decision
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -193,6 +198,25 @@ AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS = max(1, int(
 ))
 AUDIO_ROUTE_RECONNECT_POLL_SEC = 0.10
 
+# A5.0 selective follow-up. No background timer is created: expiry is checked
+# only when a candidate arrives, so the feature adds no idle runtime task.
+FOLLOWUP_TIMEOUT_SEC = max(3.0, min(30.0, float(
+    os.getenv("HOMEAI_FOLLOWUP_TIMEOUT_SEC", "10")
+)))
+FOLLOWUP_AUDIO_FENCE_SEC = max(0.0, min(2.0, float(
+    os.getenv("HOMEAI_FOLLOWUP_AUDIO_FENCE_SEC", "0.5")
+)))
+FOLLOWUP_JUDGE_TIMEOUT_SEC = max(2.0, min(30.0, float(
+    os.getenv("HOMEAI_FOLLOWUP_JUDGE_TIMEOUT_SEC", "12")
+)))
+FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC = max(0.5, min(5.0, float(
+    os.getenv("HOMEAI_FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC", "2")
+)))
+FOLLOWUP_JUDGE_SESSION_CLEANUP = (
+    os.getenv("HOMEAI_FOLLOWUP_JUDGE_SESSION_CLEANUP", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 INFO_FRAME_WIDTH = 128
 INFO_FRAME_HEIGHT = 64
 
@@ -279,7 +303,8 @@ MODE = os.getenv("P0_MODE", "full").strip().lower()
 # KitchenTerminal A3.0b FIX1. The iPad loads its UI from this same Gateway process.
 # KitchenTerminal includes the validated “问逐光” PTT Q&A pipeline.
 KITCHEN_PROTOCOL = "homeai-kitchen/1.9"
-KITCHEN_UI_VERSION = "A3.0b FIX1 R16"
+KITCHEN_UI_VERSION = "A3.0b FIX1 R50.10 · 小K SHOPPING IDENTITY MATCH FIX"
+# Baseline compatibility marker: A3.0b FIX1 R49 · 小K COOKING COCKPIT
 KITCHEN_HTTP_PATH = os.getenv("HOMEAI_KITCHEN_HTTP_PATH", "/kitchen").strip() or "/kitchen"
 KITCHEN_WS_PATH = os.getenv("HOMEAI_KITCHEN_WS_PATH", "/kitchen/ws").strip() or "/kitchen/ws"
 KITCHEN_CONTROL_PATH = os.getenv("HOMEAI_KITCHEN_CONTROL_PATH", "/kitchen/control").strip() or "/kitchen/control"
@@ -291,7 +316,12 @@ KITCHEN_MENU_DIR = Path(
     )
 ).expanduser()
 KITCHEN_TIMER_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_timers.json"
+FOOD_DB_FILE = Path(os.getenv("HOMEAI_FOOD_DB_FILE", str(HOMEAI_DATA_DIR / "food_inventory.sqlite3"))).expanduser()
+FOOD_DEFAULT_PEOPLE = max(1, int(os.getenv("HOMEAI_FOOD_DEFAULT_PEOPLE", "3")))
 KITCHEN_PROGRESS_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_progress.json"
+KITCHEN_PREP_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_prep_checklist.json"
+KITCHEN_SHOPPING_STATE_FILE = HOMEAI_DATA_DIR / "kitchen_shopping_checklist.json"
+KITCHEN_TODAY_EXTRA_FILE = HOMEAI_DATA_DIR / "kitchen_today_extra_recipes.json"
 KITCHEN_IDLE_RETURN_DELAY_SEC = max(30, int(os.getenv("HOMEAI_KITCHEN_IDLE_RETURN_DELAY_SEC", "240")))
 KITCHEN_TIMER_MIN_SEC = max(1, int(os.getenv("HOMEAI_KITCHEN_TIMER_MIN_SEC", "5")))
 KITCHEN_TIMER_MAX_SEC = max(60, int(os.getenv("HOMEAI_KITCHEN_TIMER_MAX_SEC", str(99 * 60 + 59))))
@@ -3657,55 +3687,6 @@ async def send_info_sync(session: "ClientSession") -> None:
 
 
 @dataclass
-class ClientSession:
-    ws: Any
-
-    # Device identity/routing.
-    # - companion: owns an OpenClaw conversation
-    # - speaker: owns no LLM session; it is an audio sink bound to parent_device_id
-    device_id: str = HOMEAI_PRIMARY_DEVICE_ID
-    device_role: str = "companion"
-    parent_device_id: str = ""
-    openclaw_user: str = OPENCLAW_USER
-    audio_priority: int = 0
-    capabilities: dict[str, Any] = field(default_factory=dict)
-    hello_received: bool = False
-    connected_at: float = field(default_factory=time.time)
-
-    audio: bytearray = field(default_factory=bytearray)
-    context: dict[str, Any] = field(default_factory=dict)
-    diag_glass_mode: str = "GLASS NORMAL"
-    ptt_trigger: str = "unknown"
-    recording: bool = False
-    processing: bool = False
-    playback_sequence_active: bool = False
-    playback_done_event: asyncio.Event = field(default_factory=asyncio.Event)
-    playback_error_event: asyncio.Event = field(default_factory=asyncio.Event)
-    playback_slot_ready_event: asyncio.Event = field(default_factory=asyncio.Event)
-    # Number of fully played segments confirmed by playback.slot_ready/done.
-    # This survives a transient disconnect long enough for the route layer to
-    # resume from the first unconfirmed segment on the reconnected speaker.
-    playback_completed_segments: int = 0
-    playback_total_segments: int = 0
-
-    # NetworkSpeaker control ACKs. Commands are serialized by one companion
-    # turn, but the request_id check still protects against stale frames.
-    speaker_volume_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-
-    # Display policy handshake.
-    display_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-    display_expected_command_id: str = ""
-    display_last_ack: dict[str, Any] = field(default_factory=dict)
-    display_last_confirmed_sleeping: bool | None = None
-    display_policy_task: Any = None
-
-    # Explicit user voice control for Glass2 only. This is independent from
-    # the automatic night policy that can blank both local displays.
-    glass2_ack_queue: asyncio.Queue = field(default_factory=asyncio.Queue)
-    glass2_expected_command_id: str = ""
-
-
-@dataclass
 class KitchenSession:
     ws: Any
     device_id: str = KITCHEN_DEVICE_ID
@@ -3720,6 +3701,13 @@ class KitchenSession:
     qa_processing: bool = False
     qa_request_id: str = ""
     qa_audio: bytearray = field(default_factory=bytearray)
+    # Food photo/order scan uses a dedicated one-shot upload on the same Kitchen WS.
+    food_scan_receiving: bool = False
+    food_scan_processing: bool = False
+    food_scan_request_id: str = ""
+    food_scan_source: str = ""
+    food_scan_mime: str = "image/jpeg"
+    food_scan_image: bytearray = field(default_factory=bytearray)
 
 
 @dataclass
@@ -3747,6 +3735,7 @@ KITCHEN_CURRENT_VIEW: dict[str, Any] = {
     "revision": "boot",
 }
 KITCHEN_CURRENT_MENU: dict[str, Any] | None = None
+KITCHEN_PICKER_RECOMMENDATIONS: dict[str, dict[str, Any]] = {}
 KITCHEN_CURRENT_STATE: dict[str, Any] = {
     "screen": "idle",
     "date": "",
@@ -3756,6 +3745,9 @@ KITCHEN_CURRENT_STATE: dict[str, Any] = {
 # Per-day, per-dish last viewed step. Gateway-owned so returning to a dish
 # continues where the cook left off, even after an iPad page reload or Gateway restart.
 KITCHEN_RECIPE_PROGRESS: dict[str, dict[str, int]] = {}
+# Per-day unified prep checklist. Values are stable task IDs checked by the user.
+KITCHEN_PREP_CHECKED: dict[str, set[str]] = {}
+KITCHEN_SHOPPING_CHECKED: dict[str, set[str]] = {}
 KITCHEN_RETURN_IDLE_AT: float = 0.0
 
 # A3.0b Q&A state lives in Gateway so the iPad can recover by HTTP polling even
@@ -3789,6 +3781,711 @@ KITCHEN_LATEST_AUDIO: dict[str, Any] = {
     "provider": "",
     "source_id": "",
 }
+
+
+# Home Food A0.1. The first real-iPad baseline deliberately keeps the data model
+# small: family-use units (份 / 个 / 盒 / 瓶 / ...), plus state-only pantry items.
+# Recognition/OCR will be layered on top later; the inventory/event store is
+# already Gateway-owned so the iPad can be replaced without losing data.
+FOOD_ALLOWED_STATUS = {"充足", "一般", "快没了"}
+FOOD_ALLOWED_PRIORITY = {"这两天", "本周", "暂不着急"}
+FOOD_SCAN_MAX_BYTES = max(1024 * 1024, int(os.getenv("HOMEAI_FOOD_SCAN_MAX_BYTES", str(12 * 1024 * 1024))))
+FOOD_SCAN_MAX_SIDE = max(800, int(os.getenv("HOMEAI_FOOD_SCAN_MAX_SIDE", "2200")))
+FOOD_SCAN_TIMEOUT_SEC = max(30.0, float(os.getenv("HOMEAI_FOOD_SCAN_TIMEOUT_SEC", "120")))
+
+
+def _food_db() -> sqlite3.Connection:
+    FOOD_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(FOOD_DB_FILE), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS food_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            category TEXT NOT NULL DEFAULT '其他',
+            unit TEXT NOT NULL DEFAULT '份',
+            quantity REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            storage TEXT NOT NULL DEFAULT '',
+            priority_window TEXT NOT NULL DEFAULT '暂不着急',
+            updated_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS food_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            event_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            unit TEXT NOT NULL DEFAULT '',
+            category TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )"""
+    )
+    # R50.9: food_events used to be linked to inventory rows only by the
+    # visible name. Renaming an item therefore made its earlier add events
+    # unreachable and the displayed intake time disappeared. Add a stable
+    # item_id identity and backfill legacy history in-place. No duplicate
+    # timestamp field is introduced.
+    event_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(food_events)").fetchall()}
+    if "item_id" not in event_columns:
+        conn.execute("ALTER TABLE food_events ADD COLUMN item_id INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_food_events_item_type_created ON food_events(item_id,event_type,created_at)"
+    )
+
+    # Directly link events whose stored name still equals the current item name.
+    conn.execute(
+        """UPDATE food_events
+              SET item_id=(SELECT fi.id FROM food_items fi WHERE fi.name=food_events.name COLLATE NOCASE)
+            WHERE item_id IS NULL
+              AND EXISTS(SELECT 1 FROM food_items fi WHERE fi.name=food_events.name COLLATE NOCASE)"""
+    )
+
+    # Then walk rename history backwards. A rename event stores "old → new"
+    # in note and uses the new visible name. Processing newest to oldest lets
+    # multi-step renames (A → B → C) inherit the same immutable item id.
+    current_ids = {str(row["name"]).casefold(): int(row["id"]) for row in conn.execute("SELECT id,name FROM food_items").fetchall()}
+    rename_rows = conn.execute(
+        "SELECT id,item_id,name,note FROM food_events WHERE event_type='rename' ORDER BY id DESC"
+    ).fetchall()
+    for rename_row in rename_rows:
+        note = str(rename_row["note"] or "")
+        if "→" not in note:
+            continue
+        old_name, noted_new_name = [part.strip() for part in note.split("→", 1)]
+        if not old_name:
+            continue
+        item_id = int(rename_row["item_id"]) if rename_row["item_id"] is not None else None
+        if item_id is None:
+            for candidate in (str(rename_row["name"] or ""), noted_new_name):
+                if candidate and candidate.casefold() in current_ids:
+                    item_id = current_ids[candidate.casefold()]
+                    break
+        if item_id is None:
+            continue
+        conn.execute("UPDATE food_events SET item_id=? WHERE id=?", (item_id, int(rename_row["id"])))
+        conn.execute(
+            "UPDATE food_events SET item_id=? WHERE item_id IS NULL AND id<? AND name=? COLLATE NOCASE",
+            (item_id, int(rename_row["id"]), old_name),
+        )
+        current_ids[old_name.casefold()] = item_id
+        if noted_new_name:
+            current_ids[noted_new_name.casefold()] = item_id
+    return conn
+
+
+def _food_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _food_clean_name(value: str) -> str:
+    name = re.sub(r"\\s+", " ", str(value or "").strip())
+    if not name or len(name) > 60:
+        raise ValueError("食材名称无效")
+    return name
+
+
+def _food_add(name: str, amount: float, unit: str, category: str, source: str = "") -> None:
+    name = _food_clean_name(name)
+    unit = str(unit or "份").strip() or "份"
+    category = str(category or "其他").strip() or "其他"
+    source = str(source or "").strip()
+    if unit == "状态":
+        raise ValueError("状态型食材请使用状态更新")
+    if amount <= 0 or amount > 9999:
+        raise ValueError("数量必须大于0")
+    now = _food_now()
+    with _food_db() as conn:
+        row = conn.execute("SELECT id, unit, quantity FROM food_items WHERE name=?", (name,)).fetchone()
+        if row is None:
+            cur = conn.execute(
+                "INSERT INTO food_items(name,category,unit,quantity,status,source,priority_window,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (name, category, unit, float(amount), "", source, "暂不着急", now),
+            )
+            item_id = int(cur.lastrowid)
+        else:
+            item_id = int(row["id"])
+            # If the household changes a natural unit, use the newest unit and
+            # still preserve the accumulated numeric count for this A0.1 phase.
+            conn.execute(
+                "UPDATE food_items SET category=?,unit=?,quantity=MAX(0,quantity+?),source=?,updated_at=? WHERE id=?",
+                (category, unit, float(amount), source, now, item_id),
+            )
+        conn.execute(
+            "INSERT INTO food_events(item_id,event_type,name,amount,unit,category,source,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (item_id, "add", name, float(amount), unit, category, source, now),
+        )
+
+
+def _food_consume(name: str, amount: float) -> None:
+    name = _food_clean_name(name)
+    if amount <= 0 or amount > 9999:
+        raise ValueError("数量必须大于0")
+    now = _food_now()
+    with _food_db() as conn:
+        row = conn.execute("SELECT id,category,unit,quantity FROM food_items WHERE name=?", (name,)).fetchone()
+        if row is None or str(row["unit"]) == "状态":
+            raise ValueError("没有找到可扣减的食材")
+        actual = min(float(amount), max(0.0, float(row["quantity"])))
+        conn.execute("UPDATE food_items SET quantity=MAX(0,quantity-?),updated_at=? WHERE id=?", (actual, now, int(row["id"])))
+        conn.execute(
+            "INSERT INTO food_events(item_id,event_type,name,amount,unit,category,created_at) VALUES(?,?,?,?,?,?,?)",
+            (int(row["id"]), "consume", name, actual, str(row["unit"]), str(row["category"]), now),
+        )
+
+
+def _food_set_status(name: str, status: str, category: str = "佐料/粮油") -> None:
+    name = _food_clean_name(name)
+    status = str(status or "").strip()
+    if status not in FOOD_ALLOWED_STATUS:
+        raise ValueError("状态必须是：充足 / 一般 / 快没了")
+    now = _food_now()
+    with _food_db() as conn:
+        conn.execute(
+            """INSERT INTO food_items(name,category,unit,quantity,status,source,priority_window,updated_at)
+               VALUES(?,?, '状态',0,?,'','暂不着急',?)
+               ON CONFLICT(name) DO UPDATE SET category=excluded.category,unit='状态',quantity=0,status=excluded.status,updated_at=excluded.updated_at""",
+            (name, str(category or "佐料/粮油"), status, now),
+        )
+        item_row = conn.execute("SELECT id FROM food_items WHERE name=?", (name,)).fetchone()
+        item_id = int(item_row["id"]) if item_row is not None else None
+        conn.execute(
+            "INSERT INTO food_events(item_id,event_type,name,unit,category,note,created_at) VALUES(?,?,?,?,?,?,?)",
+            (item_id, "status", name, "状态", str(category or "佐料/粮油"), status, now),
+        )
+
+
+def _food_set_priority(name: str, priority: str) -> None:
+    name = _food_clean_name(name)
+    priority = str(priority or "").strip()
+    if priority not in FOOD_ALLOWED_PRIORITY:
+        raise ValueError("建议窗口无效")
+    now = _food_now()
+    with _food_db() as conn:
+        row = conn.execute("SELECT id FROM food_items WHERE name=?", (name,)).fetchone()
+        if row is None:
+            raise ValueError("没有找到这个食材")
+        item_id = int(row["id"])
+        cur = conn.execute("UPDATE food_items SET priority_window=?,updated_at=? WHERE id=?", (priority, now, item_id))
+        if cur.rowcount <= 0:
+            raise ValueError("没有找到这个食材")
+        conn.execute(
+            "INSERT INTO food_events(item_id,event_type,name,note,created_at) VALUES(?,?,?,?,?)",
+            (item_id, "priority", name, priority, now),
+        )
+
+
+def _food_rename(old_name: str, new_name: str) -> None:
+    old_name = _food_clean_name(old_name)
+    new_name = _food_clean_name(new_name)
+    if old_name.casefold() == new_name.casefold():
+        if old_name != new_name:
+            now = _food_now()
+            with _food_db() as conn:
+                cur = conn.execute("UPDATE food_items SET name=?,updated_at=? WHERE name=?", (new_name, now, old_name))
+                if cur.rowcount <= 0:
+                    raise ValueError("没有找到这个食材")
+        return
+    now = _food_now()
+    with _food_db() as conn:
+        row = conn.execute("SELECT id,category,unit FROM food_items WHERE name=?", (old_name,)).fetchone()
+        if row is None:
+            raise ValueError("没有找到这个食材")
+        clash = conn.execute("SELECT id FROM food_items WHERE name=?", (new_name,)).fetchone()
+        if clash is not None:
+            raise ValueError("已经有同名食材，请换一个名称")
+        conn.execute("UPDATE food_items SET name=?,updated_at=? WHERE id=?", (new_name, now, int(row["id"])))
+        conn.execute(
+            "INSERT INTO food_events(item_id,event_type,name,unit,category,note,created_at) VALUES(?,?,?,?,?,?,?)",
+            (int(row["id"]), "rename", new_name, str(row["unit"]), str(row["category"]), f"{old_name} → {new_name}", now),
+        )
+
+
+def _food_edit(old_name: str, new_name: str, quantity: float | None = None, item_id: int | None = None) -> dict[str, Any]:
+    """Edit one concrete inventory row and verify persistence before returning.
+
+    R50.4 prefers the immutable SQLite row id instead of using the visible food name
+    as the record key.  The name is kept only as a backwards-compatible fallback.
+    """
+    old_name = _food_clean_name(old_name)
+    new_name = _food_clean_name(new_name or old_name)
+    if quantity is not None and (quantity < 0 or quantity > 9999):
+        raise ValueError("库存数量必须在 0 到 9999 之间")
+    now = _food_now()
+    with _food_db() as conn:
+        if item_id is not None:
+            row = conn.execute(
+                "SELECT id,name,category,unit,quantity FROM food_items WHERE id=?",
+                (int(item_id),),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id,name,category,unit,quantity FROM food_items WHERE name=?",
+                (old_name,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("没有找到这个食材，请刷新库存后重试")
+
+        actual_old_name = str(row["name"])
+        if actual_old_name.casefold() != new_name.casefold():
+            clash = conn.execute("SELECT id FROM food_items WHERE name=?", (new_name,)).fetchone()
+            if clash is not None and int(clash["id"]) != int(row["id"]):
+                raise ValueError("已经有同名食材，请换一个名称")
+
+        old_qty = float(row["quantity"] or 0)
+        unit = str(row["unit"] or "")
+        new_qty = old_qty if quantity is None or unit == "状态" else float(quantity)
+        cur = conn.execute(
+            "UPDATE food_items SET name=?,quantity=?,updated_at=? WHERE id=?",
+            (new_name, new_qty, now, int(row["id"])),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("库存修改没有写入，请重试")
+
+        if actual_old_name != new_name:
+            conn.execute(
+                "INSERT INTO food_events(item_id,event_type,name,unit,category,note,created_at) VALUES(?,?,?,?,?,?,?)",
+                (int(row["id"]), "rename", new_name, unit, str(row["category"]), f"{actual_old_name} → {new_name}", now),
+            )
+        if unit != "状态" and abs(new_qty - old_qty) > 1e-9:
+            old_text = str(int(old_qty)) if old_qty.is_integer() else str(round(old_qty, 2))
+            new_text = str(int(new_qty)) if new_qty.is_integer() else str(round(new_qty, 2))
+            conn.execute(
+                "INSERT INTO food_events(item_id,event_type,name,amount,unit,category,source,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (int(row["id"]), "adjust", new_name, new_qty, unit, str(row["category"]), "库存盘点", f"{old_text} {unit} → {new_text} {unit}", now),
+            )
+
+        # Read back from the same transaction so a false-success can never reach the iPad.
+        check = conn.execute(
+            """SELECT fi.id,fi.name,fi.category,fi.unit,fi.quantity,fi.status,fi.source,fi.storage,fi.priority_window,fi.updated_at,
+                      (SELECT MAX(fe.created_at) FROM food_events fe
+                       WHERE fe.event_type='add' AND fe.item_id=fi.id) AS last_added_at
+                   FROM food_items fi WHERE fi.id=?""",
+            (int(row["id"]),),
+        ).fetchone()
+        if check is None or str(check["name"]) != new_name:
+            raise ValueError("库存修改校验失败，请重试")
+        return dict(check)
+
+
+def _food_snapshot() -> dict[str, Any]:
+    with _food_db() as conn:
+        rows = conn.execute(
+            """SELECT fi.id,fi.name,fi.category,fi.unit,fi.quantity,fi.status,fi.source,fi.storage,fi.priority_window,fi.updated_at,
+                      (SELECT MAX(fe.created_at) FROM food_events fe
+                       WHERE fe.event_type='add' AND fe.item_id=fi.id) AS last_added_at
+                   FROM food_items fi ORDER BY fi.category,fi.name"""
+        ).fetchall()
+        recent = conn.execute(
+            "SELECT event_type,name,amount,unit,source,note,created_at FROM food_events ORDER BY id DESC LIMIT 800"
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        unit = str(row["unit"])
+        qty = float(row["quantity"] or 0)
+        if unit != "状态" and qty <= 0:
+            continue
+        quantity: int | float = int(qty) if qty.is_integer() else round(qty, 2)
+        items.append({
+            "id": int(row["id"]), "name": str(row["name"]), "category": str(row["category"]), "unit": unit,
+            "quantity": quantity, "status": str(row["status"] or ""), "source": str(row["source"] or ""),
+            "storage": str(row["storage"] or ""), "priority_window": str(row["priority_window"] or "暂不着急"),
+            "updated_at": str(row["updated_at"] or ""), "last_added_at": str(row["last_added_at"] or ""),
+        })
+    events = [dict(x) for x in recent]
+    needs_attention = [x for x in items if x["unit"] == "状态" and x["status"] == "快没了"]
+    priority = [x for x in items if x["unit"] != "状态" and x["priority_window"] in {"这两天", "本周"}]
+    priority_rank = {"这两天": 0, "本周": 1, "暂不着急": 2}
+    recommended = sorted(
+        [x for x in items if x["unit"] != "状态"],
+        key=lambda x: (priority_rank.get(str(x.get("priority_window") or "暂不着急"), 3), str(x.get("updated_at") or ""), str(x.get("name") or "")),
+    )
+    return {
+        "ok": True,
+        "default_people": FOOD_DEFAULT_PEOPLE,
+        "items": items,
+        "priority": priority,
+        "recommended": recommended,
+        "needs_attention": needs_attention,
+        "events": events,
+        "updated_at": _food_now(),
+    }
+
+
+def _food_scan_image_payload(raw: bytes) -> tuple[bytes, str]:
+    if not raw:
+        raise ValueError("没有收到图片")
+    if len(raw) > FOOD_SCAN_MAX_BYTES:
+        raise ValueError("图片太大，请选择 12MB 以内的图片")
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            scale = min(1.0, float(FOOD_SCAN_MAX_SIDE) / max(w, h, 1))
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=84, optimize=True)
+            data = out.getvalue()
+    except Exception as exc:
+        raise ValueError("图片格式无法读取，请换一张照片或截图") from exc
+    return data, "image/jpeg"
+
+
+def _food_scan_ocr_image_payload(raw: bytes) -> bytes:
+    """Preserve text resolution for long order screenshots instead of shrinking by total image height."""
+    if not raw:
+        raise ValueError("没有收到图片")
+    if len(raw) > FOOD_SCAN_MAX_BYTES:
+        raise ValueError("图片太大，请选择 12MB 以内的图片")
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            w, h = img.size
+            # Order screenshots are often tall. Keep readable width and only cap extreme dimensions.
+            max_w, max_h = 1800, 10000
+            scale = min(1.0, float(max_w) / max(w, 1), float(max_h) / max(h, 1))
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=92, optimize=True)
+            return out.getvalue()
+    except Exception as exc:
+        raise ValueError("图片格式无法读取，请换一张照片或截图") from exc
+
+
+def _food_scan_extract_json(text: str) -> dict[str, Any]:
+    value = str(text or "").strip()
+    if not value:
+        raise ValueError("识别结果为空")
+    value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.I)
+    value = re.sub(r"\s*```$", "", value)
+    try:
+        body = json.loads(value)
+    except json.JSONDecodeError:
+        start, end = value.find("{"), value.rfind("}")
+        if start < 0 or end <= start:
+            raise ValueError("识别结果不是有效 JSON")
+        body = json.loads(value[start:end + 1])
+    if not isinstance(body, dict):
+        raise ValueError("识别结果格式不正确")
+    return body
+
+
+def _food_scan_normalize_item(row: Any, source: str) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    name = re.sub(r"\s+", " ", str(row.get("name") or "").strip())[:60]
+    if not name:
+        return None
+    category = str(row.get("category") or "其他").strip() or "其他"
+    allowed_categories = {"肉类", "海鲜", "蔬菜", "蛋类", "奶制品", "包装食品", "主食", "佐料/粮油", "其他"}
+    if category not in allowed_categories:
+        category = "其他"
+    mode = str(row.get("mode") or "quantity").strip().lower()
+    unit = str(row.get("unit") or "份").strip() or "份"
+    raw = str(row.get("raw") or row.get("original") or "").strip()[:120]
+    try:
+        confidence = max(0.0, min(1.0, float(row.get("confidence", 0.8))))
+    except (TypeError, ValueError):
+        confidence = 0.8
+    if mode == "status" or unit == "状态" or category == "佐料/粮油":
+        return {"name": name, "category": category, "mode": "status", "status": "充足", "unit": "状态", "amount": 0, "source": source, "raw": raw, "confidence": round(confidence, 2)}
+    try:
+        amount = float(row.get("amount") or 1)
+    except (TypeError, ValueError):
+        amount = 1.0
+    amount = max(0.25, min(9999.0, amount))
+    if amount.is_integer():
+        amount = int(amount)
+    allowed_units = {"份", "个", "盒", "瓶", "包", "杯", "块", "根", "颗", "袋"}
+    if unit not in allowed_units:
+        unit = "份"
+    return {"name": name, "category": category, "mode": "quantity", "status": "", "unit": unit, "amount": amount, "source": source, "raw": raw, "confidence": round(confidence, 2)}
+
+
+async def _food_scan_openclaw_json(messages: list[dict[str, Any]], *, category: str) -> tuple[dict[str, Any], str]:
+    session_key = _new_info_session_key(category)
+    headers = {"Content-Type": "application/json", "x-openclaw-session-key": session_key}
+    if OPENCLAW_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+    payload = {"model": OPENCLAW_MODEL, "stream": False, "messages": messages}
+    try:
+        async with _openclaw_http_client(FOOD_SCAN_TIMEOUT_SEC) as client:
+            response = await _post_with_retry(
+                client,
+                f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                attempts=1,
+                headers=headers,
+                json=payload,
+            )
+            body = response.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError("OpenClaw 没有返回识别结果")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        text = str(content or "")
+        return _food_scan_extract_json(text), text
+    finally:
+        try:
+            await _cleanup_openclaw_info_session(session_key, category=category, attempt=1)
+        except Exception:
+            pass
+
+
+def _food_scan_rows_to_result(parsed: dict[str, Any], source: str) -> dict[str, Any]:
+    rows = parsed.get("items") or []
+    if not isinstance(rows, list):
+        rows = []
+    items: list[dict[str, Any]] = []
+    merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str]] = []
+    for row in rows[:40]:
+        item = _food_scan_normalize_item(row, source)
+        if not item:
+            continue
+        key = (str(item.get("name") or "").casefold(), str(item.get("mode") or "quantity"), str(item.get("unit") or "份"))
+        if key not in merged:
+            merged[key] = dict(item)
+            order.append(key)
+            continue
+        current = merged[key]
+        if item.get("mode") == "quantity":
+            total = float(current.get("amount") or 0) + float(item.get("amount") or 0)
+            current["amount"] = int(total) if total.is_integer() else round(total, 2)
+        current["confidence"] = round(max(float(current.get("confidence") or 0), float(item.get("confidence") or 0)), 2)
+        raws = [str(current.get("raw") or "").strip(), str(item.get("raw") or "").strip()]
+        current["raw"] = " / ".join(x for i, x in enumerate(raws) if x and x not in raws[:i])[:120]
+    items = [merged[key] for key in order]
+    return {"ok": True, "items": items, "note": str(parsed.get("note") or "")[:240]}
+
+
+async def _food_scan_ensure_ocr_binary() -> Path | None:
+    """Build the tiny macOS Vision OCR helper once and cache it outside the replaceable gateway tree."""
+    if sys.platform != "darwin":
+        return None
+    source = BASE_DIR / "food_ocr.swift"
+    if not source.exists():
+        return None
+    HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    binary = HOMEAI_DATA_DIR / "food_ocr_macos"
+    try:
+        if binary.exists() and binary.stat().st_mtime >= source.stat().st_mtime and os.access(binary, os.X_OK):
+            return binary
+    except OSError:
+        pass
+    commands = [
+        ("/usr/bin/xcrun", "swiftc", "-O", str(source), "-o", str(binary)),
+        ("/usr/bin/swiftc", "-O", str(source), "-o", str(binary)),
+    ]
+    for command in commands:
+        if not Path(command[0]).exists():
+            continue
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=90)
+            if proc.returncode == 0 and binary.exists():
+                try:
+                    os.chmod(binary, 0o755)
+                except OSError:
+                    pass
+                print("[FOOD-OCR] macOS Vision helper ready")
+                return binary
+            msg = (err or out).decode("utf-8", "ignore").strip().replace("\n", " ")[:240]
+            print(f"[FOOD-OCR-WARN] helper build failed rc={proc.returncode} {msg}")
+        except Exception as exc:
+            print(f"[FOOD-OCR-WARN] helper build failed {type(exc).__name__}: {exc}")
+    return None
+
+
+async def _food_scan_macos_ocr(image: bytes) -> str:
+    binary = await _food_scan_ensure_ocr_binary()
+    if binary is None:
+        return ""
+    tmp = HOMEAI_DATA_DIR / f"food_scan_ocr_{uuid.uuid4().hex}.jpg"
+    try:
+        tmp.write_bytes(image)
+        proc = await asyncio.create_subprocess_exec(
+            str(binary),
+            str(tmp),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=45)
+        if proc.returncode != 0:
+            msg = err.decode("utf-8", "ignore").strip().replace("\n", " ")[:240]
+            print(f"[FOOD-OCR-WARN] OCR failed rc={proc.returncode} {msg}")
+            return ""
+        text = out.decode("utf-8", "ignore").strip()
+        # Order screenshots contain lots of UI chrome. A tiny result is not useful enough to parse.
+        if len(re.sub(r"\s+", "", text)) < 8:
+            return ""
+        print(f"[FOOD-OCR] extracted chars={len(text)} lines={len(text.splitlines())}")
+        return text[:24000]
+    except Exception as exc:
+        print(f"[FOOD-OCR-WARN] {type(exc).__name__}: {exc}")
+        return ""
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _food_scan_from_ocr_text(ocr_text: str, *, source: str) -> dict[str, Any]:
+    prompt = f"""你是 Home Food OS 的订单/小票食材入库解析器。家庭默认 3 人。来源：{source}。
+下面是 macOS Vision 从用户真实订单截图/小票中提取的 OCR 文字。请从中找出用户实际购买的食品与食材。
+
+必须遵守：
+1. 只识别实际购买的食品/食材。忽略店铺名、地址、配送费、运费、优惠券、红包、会员、价格合计、支付方式、按钮、推荐商品、广告和日用品。
+2. 必须完整扫描整个订单/小票商品区，尽量列出其中每一种实际购买的食品/食材，不要只返回第一项；最多返回 30 种。无法确认是不是已购买的商品时宁可不列。
+3. 同一商品被 OCR 拆成多行时要合并；“x2 / ×2 / 2件 / 数量2”等要反映到数量；相同商品重复出现时合并数量。
+4. 肉类、海鲜：转换为家庭“份”。约 300–700g 可视为 1份（3人烧一次），1kg 左右通常约 2份；如果只有包装数量没有重量，一包/一盒通常先按1份并降低 confidence。
+5. 蔬菜：优先转换成“份”；番茄、玉米、土豆等有明确自然数量时可用个/根/颗。鸡蛋必须按“个”。
+6. 奶制品和包装食品优先用盒/瓶/杯/包等自然单位。
+7. 酱油、醋、料酒、盐、糖、食用油、米、面等佐料/基础粮油：mode=status、unit=状态、status=充足。
+8. name 使用家庭里的简洁名称；OCR 原商品文字放 raw。不要因为促销词制造额外商品。
+9. confidence 为 0~1。数量/商品归属不确定时降低 confidence。
+10. 白米饭不是采购商品时不要凭空加入。
+
+只输出 JSON，不要 markdown，不要解释：
+{{"items":[{{"name":"牛腩","category":"肉类","mode":"quantity","amount":1,"unit":"份","status":"","raw":"澳洲谷饲牛腩块480g x1","confidence":0.96}}],"note":""}}
+
+OCR文字如下：
+---
+{ocr_text}
+---
+"""
+    parsed, content = await _food_scan_openclaw_json(
+        [{"role": "user", "content": prompt}],
+        category="food-scan-ocr",
+    )
+    result = _food_scan_rows_to_result(parsed, source)
+    if not result["items"]:
+        note = str(parsed.get("note") or "")[:160]
+        print(f"[FOOD-SCAN-WARN] OCR parse returned 0 items source={source} chars={len(content)} note={note!r}")
+    return result
+
+
+async def _food_scan_from_vision(image: bytes, mime: str, *, source: str) -> dict[str, Any]:
+    encoded = base64.b64encode(image).decode("ascii")
+    prompt = f"""你是 Home Food OS 的家庭食材视觉入库识别器。家庭默认 3 人。这张图片来源是：{source or '未知'}。
+请真正查看附带图片并识别其中的食品/食材。图片可能是买回来的食材照片，也可能是订单截图或超市小票。
+
+必须遵守：
+1. 这是“批量入库”识别。必须先完整查看整张图片，再按从左到右、从上到下的方式盘点所有能看到的食品/食材；不要识别到一个就停止。最多返回 20 种不同食品/食材。忽略配送费、购物袋、优惠券、日用品。
+2. 同一种食材出现多个时合并为一项，并尽量统计可见数量；不同食材必须分别返回。被部分遮挡但仍能可靠辨认的也可以列出并降低 confidence。不要凭空补商品；看不清宁可不列。
+3. 肉类、海鲜优先转换成“份”，蔬菜优先“份”；番茄、玉米、土豆等能数清时可以用个/根/颗；鸡蛋按“个”，包装食品按自然单位。
+4. 佐料/米面油使用 mode=status、unit=状态、status=充足。
+5. 商品名家庭化，原始文字放 raw。
+6. 如果你实际上无法访问/查看这张图片，请不要假装识别，返回 items=[] 且 note="VISION_UNAVAILABLE"。
+
+只输出 JSON，不要 markdown，不要解释：
+{{"items":[{{"name":"牛腩","category":"肉类","mode":"quantity","amount":1,"unit":"份","status":"","raw":"澳洲谷饲牛腩块480g","confidence":0.95}}],"note":""}}
+"""
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "high"}},
+        ],
+    }]
+    parsed, content = await _food_scan_openclaw_json(messages, category="food-scan-vision")
+    result = _food_scan_rows_to_result(parsed, source)
+    if not result["items"]:
+        note = str(parsed.get("note") or "")[:160]
+        print(f"[FOOD-SCAN-WARN] vision returned 0 items source={source} chars={len(content)} note={note!r}")
+    return result
+
+
+async def _food_scan_with_openclaw(raw: bytes, *, source: str) -> dict[str, Any]:
+    image, mime = _food_scan_image_payload(raw)
+    source = str(source or "菜市场")
+    ocr_image = _food_scan_ocr_image_payload(raw)
+
+    # Text-heavy sources should not pay the cost/reliability penalty of a pure vision pass.
+    if source in {"网上APP", "超市"}:
+        ocr_text = await _food_scan_macos_ocr(ocr_image)
+        if ocr_text:
+            try:
+                result = await _food_scan_from_ocr_text(ocr_text, source=source)
+                if result.get("items"):
+                    result["pipeline"] = "ocr"
+                    return result
+            except Exception as exc:
+                print(f"[FOOD-SCAN-WARN] OCR pipeline failed {type(exc).__name__}: {exc}; fallback=vision")
+        else:
+            print(f"[FOOD-SCAN-WARN] OCR unavailable/empty source={source}; fallback=vision")
+
+    result = await _food_scan_from_vision(image, mime, source=source)
+    if result.get("items"):
+        result["pipeline"] = "vision"
+        return result
+
+    # Labels/handwritten notes in a market photo can still be recovered with OCR as a last resort.
+    if source not in {"网上APP", "超市"}:
+        ocr_text = await _food_scan_macos_ocr(ocr_image)
+        if ocr_text:
+            try:
+                fallback = await _food_scan_from_ocr_text(ocr_text, source=source)
+                if fallback.get("items"):
+                    fallback["pipeline"] = "ocr-fallback"
+                    return fallback
+            except Exception as exc:
+                print(f"[FOOD-SCAN-WARN] OCR fallback failed {type(exc).__name__}: {exc}")
+
+    result["pipeline"] = "vision"
+    return result
+
+
+async def _food_scan_notify(session: KitchenSession, payload: dict[str, Any]) -> None:
+    try:
+        await send_json(session.ws, payload)
+    except Exception:
+        pass
+
+
+async def _process_food_scan(session: KitchenSession) -> None:
+    if session.food_scan_processing:
+        return
+    session.food_scan_processing = True
+    request_id = session.food_scan_request_id or ("fs-" + uuid.uuid4().hex[:12])
+    raw = bytes(session.food_scan_image)
+    source = session.food_scan_source or "菜市场"
+    started = time.perf_counter()
+    try:
+        if len(raw) < 128:
+            raise RuntimeError("图片数据太少，请重新拍一张")
+        result = await _food_scan_with_openclaw(raw, source=source)
+        result.update({"type": "kitchen.food.scan.result", "request_id": request_id, "source": source})
+        print(f"[FOOD-SCAN] done id={request_id} source={source} pipeline={result.get('pipeline','unknown')} items={len(result.get('items') or [])} ms={int((time.perf_counter()-started)*1000)}")
+        await _food_scan_notify(session, result)
+    except Exception as exc:
+        message = str(exc)[:240] or type(exc).__name__
+        print(f"[FOOD-SCAN-ERROR] id={request_id} {type(exc).__name__}: {message}")
+        _log_traceback()
+        await _food_scan_notify(session, {"type": "kitchen.food.scan.error", "request_id": request_id, "ok": False, "message": message})
+    finally:
+        session.food_scan_processing = False
+        session.food_scan_receiving = False
+        session.food_scan_image.clear()
 
 
 def _is_speaker_session(session: ClientSession) -> bool:
@@ -5143,6 +5840,101 @@ KitchenTerminal 指代规则：
 """
 
 
+
+def _new_followup_judge_session_key() -> str:
+    return (
+        f"agent:{OPENCLAW_INFO_AGENT_ID}:"
+        f"homeai-followup-judge-{uuid.uuid4().hex}"
+    )
+
+
+def _is_safe_followup_judge_session_key(session_key: str) -> bool:
+    prefix = f"agent:{OPENCLAW_INFO_AGENT_ID}:homeai-followup-judge-"
+    return bool(
+        session_key.startswith(prefix)
+        and len(session_key) >= len(prefix) + 32
+        and "openai-user:" not in session_key
+        and "home-ai-agent:main" not in session_key
+    )
+
+
+async def _cleanup_followup_judge_session(session_key: str) -> None:
+    if not FOLLOWUP_JUDGE_SESSION_CLEANUP:
+        return
+    if not _is_safe_followup_judge_session_key(session_key):
+        print(f"[FOLLOWUP-JUDGE-WARN] cleanup refused unsafe key={session_key!r}")
+        return
+    try:
+        await _openclaw_gateway_rpc(
+            "sessions.delete",
+            {"key": session_key, "deleteTranscript": True},
+            timeout=FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        # Judge cleanup failure must never mutate or block the primary voice
+        # session. The candidate remains fail-closed regardless.
+        print(
+            f"[FOLLOWUP-JUDGE-WARN] cleanup failed "
+            f"error={type(exc).__name__}: {exc}"
+        )
+
+
+async def _judge_followup_context(
+    session: ClientSession,
+    transcript: str,
+) -> tuple[str, str]:
+    turns = session.followup.context_payload()
+    if not turns:
+        return "ignore", "no_followup_context"
+
+    prompt = build_followup_judge_prompt(turns, transcript)
+    session_key = _new_followup_judge_session_key()
+    headers = {
+        "Content-Type": "application/json",
+        "x-openclaw-session-key": session_key,
+    }
+    if OPENCLAW_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+
+    payload = {
+        "model": OPENCLAW_MODEL,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    try:
+        async with _openclaw_http_client(FOLLOWUP_JUDGE_TIMEOUT_SEC) as client:
+            response = await _post_with_retry(
+                client,
+                f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                attempts=1,
+                headers=headers,
+                json=payload,
+            )
+            body = response.json()
+        choices = body.get("choices") or []
+        if not choices:
+            return "ignore", "judge_no_choices"
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+            )
+        return parse_followup_decision(content)
+    except Exception as exc:
+        # Fail closed. A Context Judge outage must never allow an unrelated
+        # no-wake utterance into the stable OpenClaw conversation.
+        print(
+            f"[FOLLOWUP-JUDGE-WARN] fail-closed "
+            f"error={type(exc).__name__}: {exc}"
+        )
+        return "ignore", f"judge_error:{type(exc).__name__}"
+    finally:
+        await _cleanup_followup_judge_session(session_key)
+
+
 async def openclaw_chat(
     transcript: str,
     context: dict[str, Any],
@@ -5911,8 +6703,16 @@ async def process_utterance(session: ClientSession) -> None:
     if session.processing:
         return
     session.processing = True
+    is_followup = session.ptt_trigger == "follow_up"
+    followup_validated = not is_followup
     pending_glass2_target: bool | None = None
     try:
+        if is_followup and not session.followup_candidate_authorized:
+            print("[FOLLOWUP] stale/unarmed candidate ignored before ASR")
+            session.processing = False
+            await send_state(session.ws, "idle")
+            return
+
         pcm = bytes(session.audio)
         if len(pcm) < 640:  # < 20 ms
             raise RuntimeError("recording too short")
@@ -5968,6 +6768,20 @@ async def process_utterance(session: ClientSession) -> None:
         _best_effort_write_text(HOMEAI_DEBUG_DIR / "latest_transcript.txt", transcript + "\n")
 
         await send_json(session.ws, {"type": "asr.result", "text": transcript})
+
+        if is_followup:
+            decision, reason = await _judge_followup_context(session, transcript)
+            print(
+                f"[FOLLOWUP-JUDGE] decision={decision} reason={reason!r} "
+                f"text={transcript!r}"
+            )
+            if decision != "continue":
+                session.followup.reset_chain("judge_ignore")
+                session.followup_candidate_authorized = False
+                session.processing = False
+                await send_state(session.ws, "idle")
+                return
+            followup_validated = True
 
         agent_started = time.perf_counter()
         answer = await _apply_audio_output_voice_command(session, transcript)
@@ -6051,16 +6865,60 @@ async def process_utterance(session: ClientSession) -> None:
                 "event_id": event_id, "text": answer, "kind": "assistant",
                 "created_at": now, "expires_at": now + KITCHEN_AUDIO_TTL_SEC, "provider": tts_used, "source_id": "",
             })
+            # Kitchen audio playback is owned by the iPad and has no device-side
+            # playback.done ACK on this companion socket, so do not guess when a
+            # no-wake window should begin.
+            session.followup.reset_chain("kitchen_audio_external_playback")
             print(f"[KITCHEN-AUDIO] routed reply to iPad id={event_id} source={session.device_id}")
         else:
             sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
             print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
+
+            # A5.0: only a successfully spoken, user-originated turn may arm the
+            # no-wake continuation window. Keep the short history in Gateway
+            # memory; the real OpenClaw conversation remains the existing stable
+            # per-device session.
+            session.followup.record_turn(transcript, answer)
+            if FOLLOWUP_AUDIO_FENCE_SEC > 0:
+                await asyncio.sleep(FOLLOWUP_AUDIO_FENCE_SEC)
+            session.followup.arm(FOLLOWUP_TIMEOUT_SEC)
+            if session.followup.is_active():
+                await send_json(session.ws, {
+                    "type": "followup.arm",
+                    "timeout_ms": int(FOLLOWUP_TIMEOUT_SEC * 1000),
+                })
+                print(
+                    f"[FOLLOWUP] armed device={session.device_id} "
+                    f"timeout={FOLLOWUP_TIMEOUT_SEC:.1f}s "
+                    f"turns={len(session.followup.turns)}"
+                )
+
+        session.followup_candidate_authorized = False
         session.processing = False
         await send_state(session.ws, "idle")
         if pending_glass2_target is not None:
             await _apply_glass2_target(session, pending_glass2_target)
 
     except Exception as exc:
+        # A no-wake candidate that fails before Context Judge approval is
+        # indistinguishable from noise/ASR trouble from the user's point of
+        # view. Fail closed and silently return to idle. Once the Judge has
+        # approved it, the utterance is a real user turn and normal error
+        # reporting applies.
+        if is_followup and not followup_validated:
+            print(
+                f"[FOLLOWUP-WARN] pre-judge candidate dropped "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            session.followup.reset_chain("candidate_error")
+            session.followup_candidate_authorized = False
+            session.processing = False
+            try:
+                await send_state(session.ws, "idle")
+            except Exception:
+                pass
+            return
+
         print(f"[ERROR] {type(exc).__name__}: {exc}")
         if HOMEAI_LOG_TRACEBACK:
             print("[TRACEBACK-BEGIN]")
@@ -6073,6 +6931,7 @@ async def process_utterance(session: ClientSession) -> None:
             await send_state(session.ws, "idle")
         except Exception:
             pass
+        session.followup_candidate_authorized = False
         session.processing = False
         if pending_glass2_target is not None:
             try:
@@ -6107,6 +6966,13 @@ def _kitchen_timer_remaining(timer: KitchenTimer, *, now: float | None = None) -
 
 
 def _kitchen_timer_public(timer: KitchenTimer) -> dict[str, Any]:
+    now = time.time()
+    if timer.status == "running":
+        remaining_precise = max(0.0, float(timer.ends_at or 0.0) - now)
+    elif timer.status == "paused":
+        remaining_precise = max(0.0, float(timer.paused_remaining_sec or 0.0))
+    else:
+        remaining_precise = 0.0
     return {
         "timer_id": timer.timer_id,
         "dish": timer.dish,
@@ -6115,7 +6981,8 @@ def _kitchen_timer_public(timer: KitchenTimer) -> dict[str, Any]:
         "kind": str(timer.kind or "recipe"),
         "label": "独立计时" if timer.kind == "standalone" else timer.dish,
         "status": timer.status,
-        "remaining_sec": _kitchen_timer_remaining(timer),
+        "remaining_sec": int(math.ceil(remaining_precise)),
+        "remaining_precise_sec": round(remaining_precise, 3),
         "ends_at": float(timer.ends_at or 0.0),
         "created_at": float(timer.created_at),
         "updated_at": float(timer.updated_at),
@@ -6203,14 +7070,321 @@ def _kitchen_progress_set(date_text: str, dish: str, step: int, total_steps: int
     return value
 
 
+def save_kitchen_prep_state() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"schema": 1, "checked": {k: sorted(v) for k, v in KITCHEN_PREP_CHECKED.items() if v}}
+        tmp = KITCHEN_PREP_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(KITCHEN_PREP_STATE_FILE)
+        return True
+    except Exception as exc:
+        print(f"[KITCHEN-PREP-WARN] save failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def load_kitchen_prep_state() -> None:
+    KITCHEN_PREP_CHECKED.clear()
+    if not KITCHEN_PREP_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(KITCHEN_PREP_STATE_FILE.read_text(encoding="utf-8"))
+        raw = data.get("checked") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for date_text, ids in raw.items():
+                if isinstance(ids, list):
+                    KITCHEN_PREP_CHECKED[str(date_text)] = {str(x) for x in ids if str(x)}
+        if len(KITCHEN_PREP_CHECKED) > 45:
+            for old in sorted(KITCHEN_PREP_CHECKED)[:-45]:
+                KITCHEN_PREP_CHECKED.pop(old, None)
+        print(f"[KITCHEN-PREP] loaded dates={len(KITCHEN_PREP_CHECKED)} file={KITCHEN_PREP_STATE_FILE}")
+    except Exception as exc:
+        print(f"[KITCHEN-PREP-WARN] load failed: {type(exc).__name__}: {exc}")
+
+
+def _kitchen_prep_task_id(date_text: str, dish: str, index: int, text: str) -> str:
+    raw = f"{date_text}\n{dish}\n{index}\n{text}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:18]
+
+
+def save_kitchen_shopping_state() -> bool:
+    try:
+        HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"schema": 1, "checked": {k: sorted(v) for k, v in KITCHEN_SHOPPING_CHECKED.items() if v}}
+        tmp = KITCHEN_SHOPPING_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(KITCHEN_SHOPPING_STATE_FILE)
+        return True
+    except Exception as exc:
+        print(f"[KITCHEN-SHOPPING-WARN] save failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def load_kitchen_shopping_state() -> None:
+    KITCHEN_SHOPPING_CHECKED.clear()
+    if not KITCHEN_SHOPPING_STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(KITCHEN_SHOPPING_STATE_FILE.read_text(encoding="utf-8"))
+        raw = data.get("checked") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            for date_text, ids in raw.items():
+                if isinstance(ids, list):
+                    KITCHEN_SHOPPING_CHECKED[str(date_text)] = {str(x) for x in ids if str(x)}
+        if len(KITCHEN_SHOPPING_CHECKED) > 45:
+            for old in sorted(KITCHEN_SHOPPING_CHECKED)[:-45]:
+                KITCHEN_SHOPPING_CHECKED.pop(old, None)
+        print(f"[KITCHEN-SHOPPING] loaded dates={len(KITCHEN_SHOPPING_CHECKED)} file={KITCHEN_SHOPPING_STATE_FILE}")
+    except Exception as exc:
+        print(f"[KITCHEN-SHOPPING-WARN] load failed: {type(exc).__name__}: {exc}")
+
+
+def _kitchen_shopping_item_id(date_text: str, group: str, text: str) -> str:
+    raw = f"{date_text}\n{group}\n{text}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:18]
+
+
+def _kitchen_shopping_match_key(value: str) -> str:
+    # Normalize presentation only. Ingredient identity is handled separately so
+    # “牛肉” does not become equal to a different form such as “牛肉片”.
+    return re.sub(r"[\s·•，,。；;：:（）()【】\[\]{}<>《》/\\_-]+", "", str(value or "").casefold())
+
+
+_KITCHEN_SHOPPING_IDENTITY_ALIASES = {
+    # True name synonyms / benign quality variants. Keep this deliberately small:
+    # preparation forms (片/丝/丁/块/卷/馅/排/腩...) must remain distinct.
+    "西红柿": "番茄",
+    "食盐": "盐",
+    "土鸡蛋": "鸡蛋",
+    "草鸡蛋": "鸡蛋",
+    "柴鸡蛋": "鸡蛋",
+    "笨鸡蛋": "鸡蛋",
+    "无菌蛋": "鸡蛋",
+    "无菌鸡蛋": "鸡蛋",
+    "可生食鸡蛋": "鸡蛋",
+}
+_KITCHEN_SHOPPING_QUALITY_PREFIXES = ("有机", "散养", "新鲜", "本地", "国产", "进口")
+
+
+def _kitchen_shopping_ingredient_name(text: str) -> str:
+    """Return the ingredient-name part of a shopping line.
+
+    Shopping lines commonly end in an amount/unit (e.g. “牛肉片 1份”).
+    Remove only that trailing presentation suffix; do not strip food-form words.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    amount = r"(?:\d+(?:\.\d+)?|[一二两三四五六七八九十百半]+)"
+    unit = r"(?:个|只|份|盒|瓶|杯|包|袋|根|颗|克|千克|公斤|斤|两|毫升|升|g|kg|ml|l)"
+    suffix = rf"\s*(?:约|大约|各)?\s*{amount}\s*{unit}?(?:\s*[（(][^）)]*[）)])?\s*$"
+    stripped = re.sub(suffix, "", raw, flags=re.IGNORECASE).strip()
+    return stripped or raw
+
+
+def _kitchen_shopping_identity(value: str) -> str:
+    """Canonical identity used only for safe shopping/inventory equivalence.
+
+    Exact identity is the default. We normalize a small set of true synonyms and
+    non-form quality prefixes, but intentionally preserve cut/preparation forms.
+    """
+    key = _kitchen_shopping_match_key(value)
+    if not key:
+        return ""
+    key = _KITCHEN_SHOPPING_IDENTITY_ALIASES.get(key, key)
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _KITCHEN_SHOPPING_QUALITY_PREFIXES:
+            if key.startswith(prefix) and len(key) > len(prefix) + 1:
+                key = key[len(prefix):]
+                key = _KITCHEN_SHOPPING_IDENTITY_ALIASES.get(key, key)
+                changed = True
+                break
+    return _KITCHEN_SHOPPING_IDENTITY_ALIASES.get(key, key)
+
+
+def _kitchen_shopping_inventory_badge(item: dict[str, Any]) -> dict[str, Any]:
+    unit = str(item.get("unit") or "").strip()
+    name = str(item.get("name") or "").strip()
+    if unit == "状态":
+        status = str(item.get("status") or "").strip() or "有库存"
+        return {"name": name, "unit": unit, "status": status, "label": f"库存 {status}"}
+    qty = float(item.get("quantity") or 0)
+    quantity: int | float = int(qty) if qty.is_integer() else round(qty, 2)
+    return {"name": name, "unit": unit, "quantity": quantity, "label": f"库存 {quantity}{unit}"}
+
+
+def _kitchen_shopping_inventory_match(text: str, inventory_items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    shopping_name = _kitchen_shopping_ingredient_name(text)
+    shopping_key = _kitchen_shopping_match_key(shopping_name)
+    wanted_identity = _kitchen_shopping_identity(shopping_name)
+    if not shopping_key or not wanted_identity:
+        return None
+
+    # R50.10: never use substring containment for inventory cross-check.
+    # It made “牛肉片” inherit stock from “牛肉”. Match canonical identities
+    # exactly, preferring an exact displayed-name match when several rows share
+    # the same benign alias (e.g. 鸡蛋 / 土鸡蛋).
+    best: tuple[int, int, dict[str, Any]] | None = None
+    for item in inventory_items:
+        name = str(item.get("name") or "").strip()
+        item_key = _kitchen_shopping_match_key(name)
+        item_identity = _kitchen_shopping_identity(name)
+        if not item_key or not item_identity or item_identity != wanted_identity:
+            continue
+        exact = 1 if item_key == shopping_key else 0
+        score = (exact, len(item_key))
+        if best is None or score > best[:2]:
+            best = (score[0], score[1], item)
+    return _kitchen_shopping_inventory_badge(best[2]) if best else None
+
+
+def _kitchen_shopping_groups_with_state(menu: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+    date_text = str(menu.get("date") or _kitchen_today())
+    checked = KITCHEN_SHOPPING_CHECKED.setdefault(date_text, set())
+    groups: list[dict[str, Any]] = []
+    valid_ids: set[str] = set()
+    try:
+        inventory_items = list(_food_snapshot().get("items") or [])
+    except Exception as exc:
+        inventory_items = []
+        print(f"[KITCHEN-SHOPPING-WARN] inventory cross-check unavailable: {type(exc).__name__}: {exc}")
+    for raw_group in menu.get("shopping") or []:
+        if not isinstance(raw_group, dict):
+            continue
+        group_name = str(raw_group.get("name") or "建议购买").strip() or "建议购买"
+        out_items: list[dict[str, Any]] = []
+        for raw_item in raw_group.get("items") or []:
+            text = str(raw_item.get("text") if isinstance(raw_item, dict) else raw_item).strip()
+            if not text:
+                continue
+            item_id = _kitchen_shopping_item_id(date_text, group_name, text)
+            valid_ids.add(item_id)
+            out_item = {"id": item_id, "text": text, "checked": item_id in checked}
+            inventory = _kitchen_shopping_inventory_match(text, inventory_items)
+            if inventory:
+                out_item["inventory"] = inventory
+            out_items.append(out_item)
+        if out_items:
+            groups.append({"name": group_name, "items": out_items})
+    stale = checked - valid_ids
+    if stale:
+        checked.intersection_update(valid_ids)
+        if not checked:
+            KITCHEN_SHOPPING_CHECKED.pop(date_text, None)
+        save_kitchen_shopping_state()
+    return groups, valid_ids
+
+
+def _kitchen_set_shopping_item(menu: dict[str, Any], item_id: str, done: bool) -> dict[str, Any]:
+    date_text = str(menu.get("date") or _kitchen_today())
+    _, valid_ids = _kitchen_shopping_groups_with_state(menu)
+    key = str(item_id or "").strip()
+    if not key or key not in valid_ids:
+        raise KitchenMenuError("shopping item not found")
+    checked = KITCHEN_SHOPPING_CHECKED.setdefault(date_text, set())
+    if done:
+        checked.add(key)
+    else:
+        checked.discard(key)
+    if not checked:
+        KITCHEN_SHOPPING_CHECKED.pop(date_text, None)
+    save_kitchen_shopping_state()
+    return _kitchen_shopping_payload(menu)
+
+
+def _kitchen_prep_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    date_text = str(menu.get("date") or _kitchen_today())
+    checked = KITCHEN_PREP_CHECKED.setdefault(date_text, set())
+    groups: list[dict[str, Any]] = []
+    valid_ids: set[str] = set()
+    total = 0
+    completed = 0
+    for raw in menu.get("recipes") or []:
+        recipe = ensure_recipe_prep_first(dict(raw))
+        dish = str(recipe.get("name") or "").strip()
+        if not dish:
+            continue
+        prep_items = [str(x).strip() for x in (recipe.get("prep_items") or []) if str(x).strip()]
+        if not prep_items:
+            prep_items = ["确认食材、调味和所需厨具已备齐"]
+        tasks: list[dict[str, Any]] = []
+        for idx, text in enumerate(prep_items):
+            task_id = _kitchen_prep_task_id(date_text, dish, idx, text)
+            valid_ids.add(task_id)
+            done = task_id in checked
+            total += 1
+            if done:
+                completed += 1
+            tasks.append({"id": task_id, "text": text, "done": done})
+        groups.append({
+            "dish": dish,
+            "ingredients": [str(x) for x in (recipe.get("ingredients") or [])],
+            "seasoning": [str(x) for x in (recipe.get("seasoning") or [])],
+            "tasks": tasks,
+            "done": bool(tasks) and all(x["done"] for x in tasks),
+        })
+    # Remove stale task ids if today's menu changed.
+    stale = {x for x in checked if x not in valid_ids}
+    if stale:
+        checked.difference_update(stale)
+        save_kitchen_prep_state()
+    all_done = total > 0 and completed == total
+    if all_done:
+        # Unified prep replaces each recipe's legacy step 0. Once all prep tasks
+        # are checked, advance untouched dishes to the first real cooking step.
+        for raw in menu.get("recipes") or []:
+            recipe = ensure_recipe_prep_first(dict(raw))
+            dish = str(recipe.get("name") or "").strip()
+            steps = recipe.get("steps") or []
+            if dish and len(steps) > 1:
+                step, has_progress = _kitchen_progress_get(date_text, dish, len(steps))
+                if not has_progress or step == 0:
+                    _kitchen_progress_set(date_text, dish, 1, len(steps))
+    return {
+        "type": "kitchen.show_prep",
+        "eyebrow": f"{menu.get('date','')} · 今日菜谱",
+        "title": "统一备菜",
+        "message": "先把所有菜的备菜一次做完，完成一项就勾一项。",
+        "groups": groups,
+        "completed": completed,
+        "total": total,
+        "all_done": all_done,
+        "footer": "全部备菜完成后，再分别进入每道菜的正式烹饪步骤",
+    }
+
+
+def _kitchen_set_prep_task(menu: dict[str, Any], task_id: str, done: bool) -> dict[str, Any]:
+    date_text = str(menu.get("date") or _kitchen_today())
+    # Build once to validate the incoming id against the current menu.
+    payload = _kitchen_prep_payload(menu)
+    valid = {str(task.get("id") or "") for group in payload.get("groups") or [] for task in group.get("tasks") or []}
+    if task_id not in valid:
+        raise KitchenMenuError("prep task not found")
+    checked = KITCHEN_PREP_CHECKED.setdefault(date_text, set())
+    if done:
+        checked.add(task_id)
+    else:
+        checked.discard(task_id)
+    save_kitchen_prep_state()
+    return _kitchen_prep_payload(menu)
+
+
 def _kitchen_idle_payload(message: str = "等待逐光发送菜单") -> dict[str, Any]:
+    menu = KITCHEN_CURRENT_MENU if KITCHEN_CURRENT_MENU and str(KITCHEN_CURRENT_MENU.get("date") or "") == _kitchen_today() else None
+    preview = _kitchen_menu_payload(menu) if menu else {}
     return {
         "type": "kitchen.show_idle",
-        "eyebrow": "HOME AI · 厨房",
-        "title": "厨房终端",
+        "eyebrow": "小K · 首页",
+        "title": "小K",
         "message": message,
         "can_pull_today": True,
-        "footer": "可以在 iPad 直接加载今日菜单，也可以对逐光说“显示今天的菜单”",
+        "items": preview.get("items") or [],
+        "servings": menu.get("servings") if menu else None,
+        "estimated_minutes": menu.get("estimated_minutes") if menu else None,
+        "date": str(menu.get("date") or "") if menu else "",
+        "footer": "今日菜谱是每天做饭的主入口",
     }
 
 
@@ -6714,7 +7888,7 @@ def _kitchen_finish_payload(menu: dict[str, Any]) -> dict[str, Any]:
         'eyebrow': f"{menu.get('date','')} · 收尾", 'title': '结束今日烹饪',
         'message': (f'还有 {len(active)} 个计时器正在运行，确认结束后会全部取消。' if active else '确认今天的烹饪已经完成？'),
         'active_timers': len(active),
-        'footer': '确认后可以选择要保存到 Obsidian 私房菜的菜谱',
+        'footer': '确认后进入今日食材结算，再选择是否保存私房菜',
     }
 
 
@@ -6735,7 +7909,7 @@ async def _kitchen_begin_finish(*, speak: bool = False) -> int:
     KITCHEN_CURRENT_STATE = {'screen': 'finish', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
     delivered = await kitchen_broadcast(_kitchen_finish_payload(menu))
     if speak:
-        await _kitchen_speak('确认结束今天的烹饪吗？确认后我会关闭今天的计时器，然后让你选择是否保存菜谱到私房菜。', kind='assistant')
+        await _kitchen_speak('确认结束今天的烹饪吗？确认后进入今日食材结算，核对实际消耗，再选择是否保存私房菜。', kind='assistant')
     return delivered
 
 
@@ -6743,10 +7917,10 @@ async def _kitchen_confirm_finish(*, speak: bool = False) -> int:
     global KITCHEN_CURRENT_STATE
     menu = KITCHEN_CURRENT_MENU or _kitchen_load()
     _kitchen_clear_all_timers()
-    KITCHEN_CURRENT_STATE = {'screen': 'save_private', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
-    delivered = await kitchen_broadcast(_kitchen_save_private_payload(menu))
+    KITCHEN_CURRENT_STATE = {'screen': 'day_consumption', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
+    delivered = await kitchen_broadcast(_kitchen_day_consumption_payload(menu))
     if speak:
-        await _kitchen_speak('今天有没有想保存到私房菜的菜谱？可以勾选菜名，也可以直接选择不保存。', kind='assistant')
+        await _kitchen_speak('进入今日食材结算。请核对今天实际用掉的食材和数量，确认后再选择要不要保存私房菜。', kind='assistant')
     return delivered
 
 
@@ -6764,17 +7938,12 @@ async def _kitchen_finalize_day(selected_names: list[str] | None = None, *, spea
     _kitchen_clear_audio()
     date_text = str(menu.get('date') or _kitchen_today())
     KITCHEN_CURRENT_MENU = None
-    KITCHEN_CURRENT_STATE = {'screen': 'done', 'date': date_text, 'dish': '', 'step': 0}
-    KITCHEN_RETURN_IDLE_AT = time.time() + KITCHEN_IDLE_RETURN_DELAY_SEC
-    msg = ('已保存到私房菜：' + '、'.join(saved)) if saved else '今天没有保存新的私房菜。'
-    delivered = await kitchen_broadcast({
-        'type': 'kitchen.show_done', 'eyebrow': f'{date_text} · 已收尾', 'title': '今天辛苦了',
-        'message': msg + ' 今日烹饪已经结束。',
-        'return_idle_at': KITCHEN_RETURN_IDLE_AT,
-        'footer': f'约 {max(1, round(KITCHEN_IDLE_RETURN_DELAY_SEC / 60))} 分钟后自动返回等待页面',
-    })
+    KITCHEN_RETURN_IDLE_AT = 0.0
+    KITCHEN_CURRENT_STATE = {'screen': 'idle', 'date': '', 'dish': '', 'step': 0}
+    msg = ('已保存到私房菜：' + '、'.join(saved) + '。') if saved else ''
+    delivered = await kitchen_broadcast(_kitchen_idle_payload(msg + '今日厨房已结束。'))
     if speak:
-        spoken = (('已经保存' + '、'.join(saved) + '到私房菜。') if saved else '') + '今天的烹饪已经结束，辛苦了。'
+        spoken = (('已经保存' + '、'.join(saved) + '到私房菜。') if saved else '') + '今天的厨房已经结束。'
         await _kitchen_speak(spoken, kind='assistant')
     return delivered, saved
 
@@ -6811,6 +7980,8 @@ def _kitchen_html() -> bytes:
     # KitchenTerminal: HTTP polling is authoritative; WebSocket is an optional
     # fast path. Timers and Q&A recovery state are Gateway-owned.
     html = r'''<!doctype html>
+<!-- Compatibility history: A3.0b FIX1 R49 · 小K COOKING COCKPIT | A3.0b FIX1 R49.1 · 小K COCKPIT LAYOUT POLISH | A3.0b FIX1 R49.2 · 小K COCKPIT FLOW POLISH | A3.0b FIX1 R50 · 小K FOOD BATCH INTAKE | A3.0b FIX1 R50.1 · 小K END-DAY FOOD SETTLEMENT | A3.0b FIX1 R50.2 · 小K INVENTORY EDIT FIX | A3.0b FIX1 R50.3 · 小K INVENTORY EDIT SAVE FIX | A3.0b FIX1 R50.4 · 小K INVENTORY EDIT PERSIST FIX | A3.0b FIX1 R50.5 · 小K SHOPPING INVENTORY CROSS-CHECK | A3.0b FIX1 R50.6 · 小K PREP-ONLY BOUNDARY | A3.0b FIX1 R50.7 · 小K PREP NO-HEAT BOUNDARY | A3.0b FIX1 R50.8 · 小K INVENTORY INTAKE DATE FILTER | A3.0b FIX1 R50.9 · 小K INTAKE IDENTITY FIX | __KITCHEN_UI_VERSION__ -->
+<!-- Compatibility baseline: __KITCHEN_UI_VERSION__ -->
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -6818,28 +7989,267 @@ def _kitchen_html() -> bytes:
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>KitchenTerminal __KITCHEN_UI_VERSION__</title>
 <style>
-:root{color-scheme:light;--bg:#f4f1e8;--card:#fffdf7;--ink:#171717;--muted:#777267;--line:#d9d3c7;--accent:#1d6b47;--danger:#9c2f2f;--soft:#eee9dd}
-*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;width:100%;height:100%;background:var(--bg);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;color:var(--ink);overflow:hidden}button,input{font:inherit;color:inherit}button{touch-action:manipulation}
-#app{height:100%;display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 18px) 14px 10px}header{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px}.brand{font-weight:760;font-size:21px}.version{font-size:12px;color:var(--muted);margin-left:7px}.status{font-size:13px;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--danger)}.dot.online{background:var(--accent)}.status-pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 10px;font-size:12px;font-weight:700;white-space:nowrap}.status-pill.ready{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}.status-pill.wait{color:var(--muted)}.status-pill.bad{border-color:#d3aaaa;color:var(--danger);background:#fff8f8}.help-btn{appearance:none;border:1px solid var(--line);background:#fff;border-radius:999px;min-height:32px;padding:6px 12px;font-size:13px;font-weight:750;color:var(--ink)}.audio-route-btn{cursor:pointer}.audio-route-btn.wireless{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}
-#timerStrip{display:none;gap:10px;overflow-x:auto;padding:7px 0 11px;white-space:nowrap}.timer-chip{border:1px solid var(--line);background:#fff;border-radius:999px;padding:10px 16px;font-size:28px;line-height:1.05;display:inline-flex;gap:10px;align-items:center;font-weight:720}.timer-chip.running{border-color:#9bbbaa}.timer-chip.paused{border-color:#d3b776}.timer-chip.finished{border-color:#c88f8f;color:var(--danger);font-weight:700}.timer-chip{cursor:pointer}.timer-chip .chip-x{border:0;background:transparent;color:var(--danger);font-size:28px;line-height:1;padding:0 0 1px 4px}.finish-btn{border-color:#c9a1a1!important;color:var(--danger)!important}.choice-list{display:grid;gap:10px;margin-top:12px}.choice-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);background:#fff;border-radius:14px;padding:14px 16px;font-size:20px;font-weight:650}.choice-row input{width:24px;height:24px}.finish-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.finish-actions button{min-height:54px;border-radius:13px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.finish-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}.finish-actions .danger{color:var(--danger);border-color:#c9a1a1}
-main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;max-width:1000px;height:100%;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px 24px;display:flex;flex-direction:column;min-height:0}.eyebrow{font-size:14px;color:var(--muted);margin-bottom:5px}.title{font-size:38px;font-weight:780;line-height:1.12;margin:0 0 10px}.message{font-size:21px;line-height:1.4;color:#3f3b34}.content{flex:1;min-height:0;overflow:auto;padding-bottom:4px}.menu{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:8px}.menu button,.action{appearance:none;border:1px solid var(--line);background:#fff;border-radius:15px;padding:16px 18px;text-align:left;font-size:23px;font-weight:680;min-height:66px}.menu button{display:flex;flex-direction:column;gap:5px}.menu-progress{font-size:13px;color:var(--accent);font-weight:700}.idle-actions{display:flex;justify-content:center;margin-top:34px}.idle-actions button{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:22px;min-height:108px;min-width:min(100%,420px);width:min(100%,420px);padding:18px 28px;font-size:32px;line-height:1.15;font-weight:820;letter-spacing:.5px;box-shadow:0 10px 24px rgba(29,107,71,.18)}.idle-timer{width:min(100%,520px);margin:22px auto 0;border:1px solid var(--line);background:#fff;border-radius:20px;padding:18px 20px}.idle-timer-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.idle-timer-title{font-size:21px;font-weight:780}.idle-timer-note{font-size:14px;color:var(--muted)}.idle-timer-time{font-size:50px;line-height:1;font-weight:820;font-variant-numeric:tabular-nums;letter-spacing:1px;margin:16px 0 14px;text-align:center}.idle-timer-time.finished{color:var(--danger)}.idle-timer-actions{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.idle-timer-actions button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:48px;padding:8px;font-size:16px;font-weight:700}.idle-timer-actions button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.idle-timer-actions button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}.idle-timer-presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}.idle-timer-presets button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:48px;font-size:16px;font-weight:700}.done-note{margin-top:18px;color:var(--muted);font-size:16px}.toolbar{display:flex;gap:10px;margin-top:14px}.toolbar .action{flex:1;text-align:center;font-size:17px;min-height:52px;padding:10px}.recipe-meta{font-size:16px;color:var(--muted);margin-bottom:10px}.step-card{border:1px solid var(--line);background:#fff;border-radius:18px;padding:20px;margin-top:5px}.step-label{font-size:15px;color:var(--accent);font-weight:700;margin-bottom:8px}.step-text{font-size:30px;line-height:1.4;font-weight:650;white-space:pre-line}.tips{margin-top:14px;border-top:1px solid var(--line);padding-top:12px}.tips h3{font-size:15px;margin:0 0 7px;color:var(--muted)}.tips ul{margin:0;padding-left:21px}.tips li{font-size:16px;line-height:1.4;margin:4px 0}
-.step-timer{margin-top:16px;border:1px solid #bfd2c7;background:#f7fbf8;border-radius:17px;padding:14px}.step-timer.finished{border-color:#d7aaaa;background:#fff7f7}.timer-title{font-size:15px;color:var(--muted);font-weight:700}.timer-time{font-size:42px;line-height:1;font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:1px;margin-top:3px}.timer-state{font-size:14px;color:var(--muted);margin-top:5px}.timer-controls{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:12px}.timer-controls button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:12px;min-height:46px;padding:8px;font-size:15px;font-weight:650}.timer-controls button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.timer-controls button.danger{color:var(--danger)}
-.nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding-top:13px}.nav button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:13px;padding:12px;font-size:17px;font-weight:650;min-height:50px}.nav button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.list-group{margin:0 0 16px}.list-group h3{font-size:19px;margin:0 0 7px}.list-group ul,.timeline{margin:0;padding-left:23px}.list-group li,.timeline li{font-size:19px;line-height:1.45;margin:6px 0}.timeline li{margin:9px 0}footer{padding-top:8px;text-align:center;font-size:12px;color:var(--muted)}
-.modal{position:fixed;inset:0;background:rgba(0,0,0,.32);display:none;align-items:center;justify-content:center;padding:18px;z-index:20}.modal.show{display:flex}.modal-card{width:min(430px,94vw);background:#fffdf7;border-radius:20px;border:1px solid var(--line);padding:20px}.modal-card h2{font-size:23px;margin:0 0 14px}.time-inputs{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}.time-inputs input{width:100%;font-size:34px;text-align:center;border:1px solid var(--line);border-radius:13px;padding:10px;background:#fff}.time-inputs span{font-size:28px;font-weight:700}.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.modal-actions button{min-height:48px;border-radius:12px;border:1px solid var(--line);background:#fff;font-size:17px;font-weight:700}.modal-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.qa-dock{width:100%;max-width:1000px;margin:9px auto 0;border:1px solid var(--line);background:#fffdf7;border-radius:19px;padding:10px 12px;display:flex;align-items:center;gap:14px;min-height:92px}.qa-btn{appearance:none;border:2px solid var(--accent);background:var(--accent);color:#fff;border-radius:17px;min-width:230px;min-height:72px;padding:12px 22px;font-size:24px;font-weight:820;box-shadow:0 4px 14px rgba(29,107,71,.18)}.qa-btn.recording{background:var(--danger);border-color:var(--danger);box-shadow:0 4px 14px rgba(156,47,47,.18)}.qa-btn.busy{background:#706c63;border-color:#706c63;box-shadow:none}.qa-copy{flex:1;min-width:0}.qa-status{font-size:15px;font-weight:760;color:var(--accent)}.qa-transcript{font-size:14px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}.qa-answer{font-size:16px;line-height:1.35;margin-top:4px;max-height:50px;overflow:auto}.qa-clear{appearance:none;border:0;background:transparent;color:var(--muted);font-size:25px;line-height:1;padding:6px}.help-list{margin:4px 0 0;padding-left:22px}.help-list li{font-size:16px;line-height:1.5;margin:8px 0}.help-note{font-size:14px;line-height:1.45;color:var(--muted);background:var(--soft);border-radius:12px;padding:10px 12px;margin-top:12px}
-@media(max-width:700px){#app{padding:calc(env(safe-area-inset-top,0px) + 18px) 10px 8px}header{align-items:flex-start}.brand{font-size:18px}.version{display:none}.status{gap:5px;max-width:68%;}.status-pill{padding:6px 8px;font-size:11px}.help-btn{padding:5px 10px;font-size:12px}.menu{grid-template-columns:1fr}.panel{padding:17px}.title{font-size:31px}.step-text{font-size:26px}.timer-time{font-size:37px}.toolbar{flex-direction:column}.nav{gap:7px}.nav button{font-size:15px;padding:9px}.timer-controls{grid-template-columns:1fr 1fr}.message{font-size:19px}.qa-dock{gap:9px;padding:8px;min-height:82px}.qa-btn{min-width:176px;min-height:64px;font-size:21px;padding:10px 14px}.qa-answer{font-size:15px}.idle-timer-actions,.idle-timer-presets{grid-template-columns:1fr 1fr}.idle-timer-time{font-size:44px}}
+:root{color-scheme:light;--bg:#f3f4ef;--card:rgba(255,255,252,.92);--card-solid:#fffefb;--ink:#1c211d;--muted:#747b74;--line:#dde2da;--line-strong:#cdd5cc;--accent:#256b4b;--accent-2:#e5f0e8;--danger:#a13b3b;--danger-soft:#f7e9e7;--warn:#8b6828;--warn-soft:#f6efde;--soft:#ecefe9;--shadow:0 12px 34px rgba(45,58,49,.08);--shadow-sm:0 5px 18px rgba(45,58,49,.06)}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{margin:0;width:100%;height:100%;background:radial-gradient(circle at 20% 0,#fafbf7 0,#f3f4ef 48%,#eef0eb 100%);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;color:var(--ink);overflow:hidden}button,input,select{font:inherit;color:inherit}button{touch-action:manipulation;cursor:pointer}button:disabled{cursor:not-allowed;opacity:.45}
+#app{height:100%;display:flex;flex-direction:column;padding:calc(env(safe-area-inset-top,0px) + 16px) 18px 12px;gap:10px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:50px}.brand-wrap{min-width:0}.brand-kicker{font-size:12px;letter-spacing:.08em;color:var(--muted);font-weight:700;text-transform:uppercase}.brand{display:block;font-weight:820;font-size:25px;letter-spacing:-.02em;margin-top:1px}.version{font-size:10px;color:var(--muted);margin-left:7px;font-weight:600}.status{font-size:12px;color:var(--muted);display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap}.dot{width:8px;height:8px;border-radius:50%;background:var(--danger);box-shadow:0 0 0 4px rgba(161,59,59,.08)}.dot.online{background:var(--accent);box-shadow:0 0 0 4px rgba(37,107,75,.08)}.status-pill{border:1px solid var(--line);background:rgba(255,255,252,.8);border-radius:999px;padding:7px 10px;font-size:11px;font-weight:720;white-space:nowrap}.status-pill.ready{border-color:#b7d1c1;color:var(--accent);background:#f5faf6}.status-pill.wait{color:var(--muted)}.status-pill.bad{border-color:#dab5b2;color:var(--danger);background:#fff8f7}.help-btn,.top-food-btn{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:999px;min-height:34px;padding:7px 12px;font-size:12px;font-weight:760;color:var(--ink);box-shadow:var(--shadow-sm)}.top-food-btn{border-color:#c4d8cb;background:#f2f8f4;color:var(--accent)}.audio-route-btn.wireless{border-color:#9bbbaa;color:var(--accent);background:#f8fbf9}
+#timerStrip{display:none;gap:9px;overflow-x:auto;padding:2px 0 2px;white-space:nowrap;scrollbar-width:none}#timerStrip::-webkit-scrollbar{display:none}.timer-chip{border:1px solid var(--line);background:var(--card-solid);border-radius:18px;padding:9px 14px;font-size:28px;line-height:1.05;display:inline-flex;gap:9px;align-items:center;font-weight:760;box-shadow:var(--shadow-sm)}.timer-chip.running{border-color:#abd0bb;background:#f7fbf8}.timer-chip.paused{border-color:#d9c590;background:#fffaf0}.timer-chip.finished{border-color:#d6a5a0;color:var(--danger);font-weight:760;background:#fff8f7}.timer-chip .chip-x{border:0;background:transparent;color:var(--danger);font-size:26px;line-height:1;padding:0 0 1px 4px}.finish-btn{border-color:#d3b3b0!important;color:var(--danger)!important;background:#fff9f8!important}.choice-list{display:grid;gap:10px;margin-top:12px}.choice-row{display:flex;align-items:center;gap:12px;border:1px solid var(--line);background:var(--card-solid);border-radius:18px;padding:15px 16px;font-size:19px;font-weight:680}.choice-row input{width:24px;height:24px}.finish-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.finish-actions button{min-height:54px;border-radius:16px;border:1px solid var(--line);background:var(--card-solid);font-size:17px;font-weight:720}.finish-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}.finish-actions .danger{color:var(--danger);border-color:#d3b3b0;background:#fff9f8}
+main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;max-width:1080px;height:100%;background:var(--card);border:1px solid rgba(215,221,213,.86);border-radius:28px;padding:24px 28px;display:flex;flex-direction:column;min-height:0;box-shadow:var(--shadow);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px)}.eyebrow{font-size:13px;color:var(--muted);margin-bottom:7px;font-weight:720;letter-spacing:.04em}.title{font-size:40px;font-weight:830;line-height:1.08;letter-spacing:-.035em;margin:0 0 10px}.message{font-size:20px;line-height:1.45;color:#4a504a}.content{flex:1;min-height:0;overflow:auto;padding:2px 2px 6px;scrollbar-width:thin}.menu{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}.menu button,.action{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:20px;padding:18px 20px;text-align:left;font-size:22px;font-weight:720;min-height:78px;box-shadow:var(--shadow-sm);transition:transform .12s ease,border-color .12s ease}.menu button:active,.action:active,.nav button:active{transform:scale(.985)}.menu button{display:flex;flex-direction:column;gap:6px}.menu-progress{font-size:13px;color:var(--accent);font-weight:760}.idle-actions{display:flex;justify-content:center;margin-top:38px}.idle-actions button{appearance:none;border:0;background:var(--accent);color:#fff;border-radius:24px;min-height:104px;min-width:min(100%,440px);width:min(100%,440px);padding:18px 28px;font-size:30px;line-height:1.15;font-weight:830;letter-spacing:.2px;box-shadow:0 14px 28px rgba(37,107,75,.18)}.idle-timer{width:min(100%,560px);margin:24px auto 0;border:1px solid var(--line);background:rgba(255,255,252,.9);border-radius:22px;padding:20px 22px;box-shadow:var(--shadow-sm)}.idle-timer-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.idle-timer-title{font-size:20px;font-weight:780}.idle-timer-note{font-size:13px;color:var(--muted)}.idle-timer-time{font-size:50px;line-height:1;font-weight:830;font-variant-numeric:tabular-nums;letter-spacing:1px;margin:17px 0 16px;text-align:center}.idle-timer-time.finished{color:var(--danger)}.idle-timer-actions,.idle-timer-presets{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}.idle-timer-actions button,.idle-timer-presets button{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:14px;min-height:48px;padding:8px;font-size:15px;font-weight:720}.idle-timer-actions button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.idle-timer-actions button.danger{color:#fff;background:var(--danger);border-color:var(--danger)}.done-note{margin-top:18px;color:var(--muted);font-size:16px}.toolbar{display:flex;gap:10px;margin-top:16px}.toolbar .action{flex:1;text-align:center;font-size:16px;min-height:54px;padding:11px}.recipe-meta{font-size:15px;color:var(--muted);margin-bottom:11px;font-weight:650}.step-card{border:1px solid var(--line);background:var(--card-solid);border-radius:24px;padding:23px;margin-top:4px;box-shadow:var(--shadow-sm)}.step-label{font-size:14px;color:var(--accent);font-weight:780;margin-bottom:9px}.step-text{font-size:29px;line-height:1.43;font-weight:680;white-space:pre-line;letter-spacing:-.01em}.tips{margin-top:16px;border-top:1px solid var(--line);padding-top:13px}.tips h3{font-size:14px;margin:0 0 7px;color:var(--muted)}.tips ul{margin:0;padding-left:21px}.tips li{font-size:16px;line-height:1.45;margin:4px 0}.step-timer{margin-top:17px;border:1px solid #bfd2c7;background:#f5faf6;border-radius:19px;padding:15px}.step-timer.finished{border-color:#d7aaaa;background:#fff7f7}.timer-title{font-size:14px;color:var(--muted);font-weight:720}.timer-time{font-size:42px;line-height:1;font-variant-numeric:tabular-nums;font-weight:830;letter-spacing:1px;margin-top:4px}.timer-state{font-size:13px;color:var(--muted);margin-top:5px}.timer-controls{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:13px}.timer-controls button{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:14px;min-height:46px;padding:8px;font-size:14px;font-weight:700}.timer-controls button.primary{background:var(--accent);border-color:var(--accent);color:#fff}.timer-controls button.danger{color:var(--danger)}.nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;padding-top:14px}.nav button{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:16px;padding:12px;font-size:16px;font-weight:700;min-height:52px}.nav button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}.list-group{margin:0 0 18px;background:var(--card-solid);border:1px solid var(--line);border-radius:20px;padding:17px 19px}.list-group h3{font-size:18px;margin:0 0 8px}.list-group ul,.timeline{margin:0;padding-left:23px}.list-group li,.timeline li{font-size:18px;line-height:1.48;margin:6px 0}.timeline li{margin:9px 0}footer{padding-top:1px;text-align:center;font-size:10px;color:#9aa099}
+.modal{position:fixed;inset:0;background:rgba(28,33,29,.32);display:none;align-items:center;justify-content:center;padding:18px;z-index:30;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}.modal.show{display:flex}.modal-card{width:min(450px,94vw);background:var(--card-solid);border-radius:24px;border:1px solid var(--line);padding:22px;box-shadow:0 24px 70px rgba(30,40,33,.2)}.modal-card h2{font-size:23px;margin:0 0 14px}.time-inputs{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}.time-inputs input{width:100%;font-size:34px;text-align:center;border:1px solid var(--line);border-radius:15px;padding:10px;background:#fff}.time-inputs span{font-size:28px;font-weight:700}.modal-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.modal-actions button{min-height:48px;border-radius:14px;border:1px solid var(--line);background:#fff;font-size:16px;font-weight:720}.modal-actions .primary{background:var(--accent);border-color:var(--accent);color:#fff}.qa-dock{width:100%;max-width:1080px;margin:0 auto;border:1px solid rgba(215,221,213,.9);background:rgba(255,255,252,.94);border-radius:22px;padding:9px 11px;display:flex;align-items:center;gap:13px;min-height:82px;box-shadow:var(--shadow-sm);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}.qa-btn{appearance:none;border:0;background:var(--accent);color:#fff;border-radius:16px;min-width:210px;min-height:62px;padding:11px 20px;font-size:21px;font-weight:820;box-shadow:0 7px 18px rgba(37,107,75,.16)}.qa-btn.recording{background:var(--danger);box-shadow:0 7px 18px rgba(161,59,59,.16)}.qa-btn.busy{background:#737970;box-shadow:none}.qa-copy{flex:1;min-width:0}.qa-status{font-size:14px;font-weight:760;color:var(--accent)}.qa-transcript{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}.qa-answer{font-size:15px;line-height:1.35;margin-top:4px;max-height:44px;overflow:auto}.qa-clear{appearance:none;border:0;background:transparent;color:var(--muted);font-size:24px;line-height:1;padding:6px}.help-list{margin:4px 0 0;padding-left:22px}.help-list li{margin:9px 0;line-height:1.45}.help-note{margin-top:13px;padding:11px 12px;border-radius:13px;background:var(--soft);color:var(--muted);font-size:13px;line-height:1.45}
+/* Food A0.1 */
+.food-modal{position:fixed;inset:0;display:none;z-index:40;background:rgba(238,241,235,.97);padding:calc(env(safe-area-inset-top,0px) + 16px) 18px calc(env(safe-area-inset-bottom,0px) + 16px);overflow:auto}.food-modal.show{display:block}.food-shell{width:min(100%,1080px);margin:0 auto}.food-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:16px}.food-title{font-size:30px;font-weight:830;letter-spacing:-.03em}.food-sub{font-size:13px;color:var(--muted);margin-top:3px}.food-close{border:1px solid var(--line);background:var(--card-solid);border-radius:999px;min-height:44px;padding:9px 16px;font-weight:760}.food-tabs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;background:rgba(255,255,252,.72);border:1px solid var(--line);padding:6px;border-radius:20px;margin-bottom:15px}.food-tab{border:0;background:transparent;border-radius:15px;min-height:50px;font-weight:720;color:var(--muted)}.food-tab.active{background:var(--card-solid);color:var(--ink);box-shadow:var(--shadow-sm)}.food-view{display:none}.food-view.active{display:block}.food-grid{display:grid;grid-template-columns:1.1fr .9fr;gap:14px}.food-card{background:var(--card-solid);border:1px solid var(--line);border-radius:24px;padding:19px;box-shadow:var(--shadow-sm)}.food-card h3{margin:0;font-size:18px}.food-card-note{font-size:13px;color:var(--muted);margin-top:4px}.food-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}.food-stat{background:var(--soft);border-radius:17px;padding:13px}.food-stat span{display:block;font-size:12px;color:var(--muted)}.food-stat strong{display:block;margin-top:4px;font-size:20px}.food-list{display:grid;gap:9px;margin-top:13px}.food-row{display:flex;align-items:center;justify-content:space-between;gap:12px;background:var(--soft);border-radius:16px;padding:12px 13px}.food-row-main{min-width:0}.food-row-name{font-weight:740}.food-row-meta{font-size:12px;color:var(--muted);margin-top:2px}.food-row-value{font-weight:780;white-space:nowrap}.food-empty{padding:22px 10px;color:var(--muted);font-size:14px;text-align:center}.food-form{display:grid;gap:13px}.food-label{display:grid;gap:6px;font-size:13px;font-weight:700;color:var(--muted)}.food-input,.food-select{width:100%;min-height:50px;border:1px solid var(--line);background:#fff;border-radius:14px;padding:10px 12px;font-size:16px;outline:none}.food-input:focus,.food-select:focus{border-color:#9bbbaa;box-shadow:0 0 0 3px rgba(37,107,75,.08)}.food-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.food-primary{border:0;background:var(--accent);color:#fff;border-radius:16px;min-height:54px;padding:12px 18px;font-weight:800}.food-secondary{border:1px solid var(--line);background:var(--card-solid);border-radius:16px;min-height:50px;padding:10px 14px;font-weight:740}.food-channel-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.food-channel{border:1px solid var(--line);background:#fff;border-radius:16px;min-height:68px;padding:10px;font-weight:720}.food-channel.active{border-color:#aac9b7;background:#f2f8f4;color:var(--accent)}.food-note{border-radius:16px;background:var(--soft);padding:12px 13px;font-size:13px;color:var(--muted);line-height:1.45}.food-event-add{color:var(--accent)}.food-event-consume{color:var(--warn)}.food-event-status{color:#6b5a88}.food-toast{position:fixed;left:50%;bottom:calc(env(safe-area-inset-bottom,0px) + 22px);transform:translateX(-50%);z-index:60;background:#1f2822;color:#fff;border-radius:999px;padding:11px 16px;font-size:14px;font-weight:680;box-shadow:0 10px 30px rgba(0,0,0,.18);display:none}.food-toast.show{display:block}
+
+/* 小K Today Menu Flow R20 */
+html,body{background:#f5f4ef}
+#app{padding:calc(env(safe-area-inset-top,0px) + 18px) 24px 12px;gap:12px}
+.modern-header{width:100%;max-width:1080px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;min-height:76px}.modern-header .brand-wrap{display:flex;flex-direction:column}.modern-header .brand{font-size:42px;font-weight:900;line-height:.95;letter-spacing:-.055em;color:#14221b}.brand-sub{font-size:17px;color:#8a8d87;margin-top:8px;font-weight:600}.modern-head-actions{display:flex;align-items:center;gap:10px}.header-voice{appearance:none;border:1px solid #dce3dc;background:#fffefb;border-radius:25px;min-height:58px;padding:7px 17px 7px 8px;display:flex;align-items:center;gap:11px;box-shadow:0 8px 24px rgba(39,55,45,.06);text-align:left}.header-voice-icon{width:44px;height:44px;border-radius:50%;background:#dfeade;display:flex;align-items:center;justify-content:center;font-size:21px}.header-voice strong{display:block;font-size:16px}.header-voice small{display:block;font-size:11px;color:var(--muted);margin-top:2px}.more-btn{appearance:none;border:1px solid var(--line);background:#fffefb;width:48px;height:48px;border-radius:50%;font-size:19px;letter-spacing:2px;color:#596159}.modern-head-actions>.dot{margin-left:1px}
+.utility-card{width:min(460px,94vw)}.utility-head{display:flex;justify-content:space-between;align-items:flex-start;gap:15px}.utility-head h2{margin:0}.utility-sub{font-size:13px;color:var(--muted);margin-top:4px}.utility-close{border:0;background:var(--soft);width:38px;height:38px;border-radius:50%;font-size:23px}.utility-status{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 14px}.utility-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.utility-actions .help-btn{border-radius:14px;min-height:48px;box-shadow:none}.utility-version{font-size:10px;color:#a3a7a2;text-align:center;margin-top:17px}
+.panel.home-mode{background:transparent;border:0;border-radius:0;box-shadow:none;padding:0;backdrop-filter:none;-webkit-backdrop-filter:none}.panel.home-mode>.eyebrow,.panel.home-mode>.title,.panel.home-mode>.message,.panel.home-mode>#nav{display:none!important}.panel.home-mode>.content{padding:0;overflow:auto}.home-dashboard{display:grid;gap:14px;padding:1px 2px 5px}.home-hero{position:relative;min-height:250px;border-radius:30px;overflow:hidden;background:#eee9df url('/kitchen/assets/home_hero.jpg') right center/57% 100% no-repeat;border:1px solid rgba(219,216,207,.78);box-shadow:0 12px 32px rgba(54,57,50,.07)}.home-hero:before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,#fffdf8 0%,#fffdf8 38%,rgba(255,253,248,.84) 49%,rgba(255,253,248,.12) 69%,rgba(255,253,248,0) 100%)}.home-hero-copy{position:relative;z-index:1;width:55%;padding:27px 30px}.home-section-kicker{font-size:14px;font-weight:800;color:#506057;letter-spacing:.02em}.home-hero h2{font-size:44px;line-height:1.08;letter-spacing:-.04em;margin:10px 0 10px;max-width:620px}.home-hero-meta{font-size:17px;color:#737a74;line-height:1.55;min-height:26px;font-weight:620}.home-hero-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:20px}.home-primary,.home-secondary{appearance:none;border-radius:17px;min-height:48px;padding:11px 18px;font-size:15px;font-weight:800}.home-primary{border:0;background:#2c704e;color:white}.home-secondary{border:1px solid #d8ded8;background:rgba(255,255,252,.86)}.home-dish-pills{display:flex;gap:7px;flex-wrap:wrap;margin-top:14px}.home-dish-pill{appearance:none;border:1px solid rgba(220,224,218,.9);background:rgba(255,255,252,.9);border-radius:999px;padding:7px 11px;font-size:12px;font-weight:700}
+.home-food-card{position:relative;min-height:220px;border-radius:30px;overflow:hidden;background:linear-gradient(100deg,#e8f0e3 0%,#e2eedc 58%,#d7e6ce 100%);border:1px solid #d6e0d2}.home-food-card:after{content:"";position:absolute;right:-6px;bottom:-8px;width:43%;height:100%;background:url('/kitchen/assets/home_food.jpg') center/cover no-repeat;opacity:.96;mask-image:linear-gradient(90deg,transparent,#000 28%);-webkit-mask-image:linear-gradient(90deg,transparent,#000 28%)}.home-food-copy{position:relative;z-index:1;padding:24px 28px;width:68%}.home-food-title-row{display:flex;align-items:center;gap:14px}.home-food-icon{width:62px;height:62px;border-radius:18px;background:#5f9169;color:white;display:flex;align-items:center;justify-content:center;font-size:29px}.home-food-card h3{font-size:31px;letter-spacing:-.035em;margin:0}.home-food-desc{font-size:14px;color:#6c766c;margin:8px 0 15px}.home-food-stats{font-size:13px;color:#536257;font-weight:700;min-height:20px}.home-food-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:17px}.home-food-actions button{appearance:none;border:1px solid rgba(255,255,255,.78);background:rgba(255,255,252,.78);border-radius:999px;min-height:44px;padding:9px 16px;font-weight:770;font-size:14px;backdrop-filter:blur(6px)}
+.home-small-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.home-small-card{appearance:none;border:1px solid #e1e0da;background:#fffefb;border-radius:25px;min-height:123px;padding:20px 22px;text-align:left;display:flex;align-items:center;gap:16px;box-shadow:0 7px 23px rgba(49,54,48,.05)}.home-small-icon{width:52px;height:52px;border-radius:17px;background:#fff2e5;display:flex;align-items:center;justify-content:center;font-size:26px}.home-small-card:nth-child(2) .home-small-icon{background:#eef2e7}.home-small-copy{flex:1;min-width:0}.home-small-title{font-size:24px;font-weight:830}.home-small-sub{font-size:15px;color:var(--muted);margin-top:5px}.home-small-value{font-size:12px;color:var(--accent);font-weight:760;margin-top:10px}.home-small-arrow{font-size:25px;color:#a1a59f}
+.home-priority{border:1px solid #e2e1db;background:#fffefb;border-radius:25px;padding:18px 21px;box-shadow:0 7px 23px rgba(49,54,48,.04)}.home-priority-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.home-priority-title{font-size:22px;font-weight:830}.home-priority-note{font-size:14px;color:var(--muted);margin-left:8px;font-weight:500}.home-priority-more{appearance:none;border:0;background:transparent;color:#818681;font-size:13px;font-weight:700}.home-priority-list{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:13px}.home-priority-item{appearance:none;border:0;background:#f6f5f1;border-radius:17px;padding:13px 15px;display:flex;align-items:center;justify-content:space-between;text-align:left;min-height:66px}.home-priority-name{font-size:18px;font-weight:800}.home-priority-meta{font-size:14px;color:var(--muted);margin-top:4px}.home-priority-tag{border-radius:999px;background:#e7efe4;color:#547058;padding:6px 9px;font-size:11px;font-weight:760}.home-priority-tag.week{background:#f7eddb;color:#946b2c}.home-priority-empty{grid-column:1/-1;color:var(--muted);font-size:13px;padding:8px 2px}
+.home-bottom-nav{position:sticky;bottom:0;display:grid;grid-template-columns:repeat(4,1fr);gap:5px;background:rgba(250,249,246,.93);border:1px solid rgba(222,222,215,.9);border-radius:24px;padding:6px;backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);box-shadow:0 8px 28px rgba(50,54,49,.08);margin-top:1px}.home-bottom-nav button{appearance:none;border:0;background:transparent;border-radius:18px;min-height:58px;font-size:12px;font-weight:740;color:#7c817c}.home-bottom-nav button.active{background:#edf3eb;color:#2c704e}.home-bottom-nav .nav-icon{display:block;font-size:20px;margin-bottom:3px}
+.home-bottom-nav{display:none!important}.global-bottom-nav{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 10px);z-index:65;width:min(calc(100% - 36px),1080px);display:grid;grid-template-columns:repeat(4,1fr);gap:5px;background:rgba(250,249,246,.96);border:1px solid rgba(222,222,215,.94);border-radius:24px;padding:6px;backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);box-shadow:0 10px 30px rgba(50,54,49,.12)}.global-bottom-nav button{appearance:none;border:0;background:transparent;border-radius:18px;min-height:58px;font-size:12px;font-weight:760;color:#7c817c}.global-bottom-nav button.active{background:#edf3eb;color:#2c704e}.global-bottom-nav .nav-icon{display:block;font-size:20px;margin-bottom:3px}main{padding-bottom:76px}.qa-dock{margin-bottom:76px}.food-modal{padding-bottom:calc(env(safe-area-inset-bottom,0px) + 98px)}.modal{z-index:80}.standalone-timer-card{width:min(560px,94vw)}.standalone-timer-card .idle-timer{width:100%;margin:0;border:0;box-shadow:none;padding:0;background:transparent}.standalone-timer-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:14px}.standalone-timer-head h2{margin:0;font-size:24px}.standalone-timer-close{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:999px;width:40px;height:40px;font-size:22px}.timer-editor-modal{z-index:90}.utility-page{display:grid;gap:15px;padding:2px 2px 5px}.utility-page-card{border:1px solid var(--line);background:var(--card-solid);border-radius:24px;padding:19px 20px}.utility-page-card h3{margin:0 0 9px;font-size:20px}.utility-page-card ul,.utility-page-card ol{margin:0;padding-left:23px}.utility-page-card li{font-size:17px;line-height:1.52;margin:6px 0}.utility-empty{border:1px dashed var(--line-strong);background:#fafbf7;border-radius:22px;padding:24px;text-align:center;color:var(--muted)}
+body.home-active .qa-dock:not(.qa-active){display:none}body.home-active footer{display:none}body.home-active #timerStrip:empty{display:none!important}.qa-dock.qa-active{animation:qaPop .16s ease-out}@keyframes qaPop{from{transform:translateY(8px);opacity:.2}to{transform:none;opacity:1}}
+
+@media(max-width:760px){#app{padding:calc(env(safe-area-inset-top,0px) + 14px) 10px 8px;gap:8px}header{align-items:flex-start}.brand{font-size:21px}.version{display:none}.brand-kicker{font-size:10px}.status{gap:5px;max-width:72%}.status-pill{padding:6px 8px;font-size:10px}.help-btn,.top-food-btn{padding:6px 9px;font-size:11px}.panel{padding:19px;border-radius:24px}.title{font-size:33px}.step-text{font-size:25px}.timer-time{font-size:37px}.toolbar{flex-direction:column}.nav{gap:7px}.nav button{font-size:14px;padding:9px}.timer-controls{grid-template-columns:1fr 1fr}.message{font-size:18px}.qa-dock{gap:8px;padding:8px;min-height:74px;border-radius:19px}.qa-btn{min-width:164px;min-height:58px;font-size:19px;padding:9px 12px}.qa-answer{font-size:14px}.idle-timer-actions,.idle-timer-presets{grid-template-columns:1fr 1fr}.idle-timer-time{font-size:44px}.food-modal{padding:calc(env(safe-area-inset-top,0px) + 14px) 10px calc(env(safe-area-inset-bottom,0px) + 94px)}.global-bottom-nav{width:calc(100% - 20px);bottom:calc(env(safe-area-inset-bottom,0px) + 6px)}main{padding-bottom:72px}.qa-dock{margin-bottom:72px}.food-title{font-size:25px}.food-tabs{gap:5px}.food-tab{min-height:46px;font-size:13px}.food-grid{grid-template-columns:1fr}.food-summary{grid-template-columns:1fr 1fr}.food-channel-grid{grid-template-columns:1fr 1fr 1fr}.food-card{padding:16px;border-radius:21px}.food-form-grid{grid-template-columns:1fr 1fr}}
+
+
+/* R20: today's menu is the operational center. Pure text, large hierarchy. */
+.home-hero{background:linear-gradient(135deg,#f5f7ee 0%,#fbf8f1 100%);min-height:278px}.home-hero:before{display:none}.home-hero-copy{width:100%;padding:30px 32px}.home-hero h2{font-size:46px;max-width:none}.home-today-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:17px}.home-today-list span{display:flex;align-items:center;min-height:52px;padding:10px 14px;border-radius:16px;background:rgba(255,255,252,.84);border:1px solid rgba(218,223,216,.88);font-size:20px;font-weight:800;line-height:1.25}.home-channel-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.home-channel-card{appearance:none;text-align:left;border:1px solid var(--line);background:rgba(255,255,252,.93);border-radius:25px;min-height:132px;padding:22px;box-shadow:var(--shadow-sm)}.home-channel-card strong{display:block;font-size:24px;margin-top:8px}.home-channel-card small{display:block;margin-top:7px;color:var(--muted);font-size:15px;line-height:1.45}.home-channel-icon{font-size:27px}
+.today-page,.picker-page,.cook-page{display:grid;gap:15px;padding:2px 2px 5px}.page-heading{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;padding:4px 2px}.page-heading h2{font-size:38px;line-height:1;margin:0;letter-spacing:-.035em}.page-heading p{margin:8px 0 0;color:var(--muted);font-size:15px}.page-back{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:999px;padding:9px 14px;font-weight:760}.today-summary{border:1px solid var(--line);background:linear-gradient(135deg,#f1f6ec,#fbf8f1);border-radius:28px;padding:22px}.today-summary strong{font-size:30px;letter-spacing:-.03em}.today-summary-meta{font-size:14px;color:var(--muted);margin-top:6px}.today-list{border:1px solid var(--line);background:var(--card-solid);border-radius:26px;overflow:hidden}.today-row{display:grid;grid-template-columns:46px minmax(0,1fr) auto;align-items:center;gap:13px;padding:19px 20px;border-bottom:1px solid #eceee9}.today-row:last-child{border-bottom:0}.today-number{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:#edf3e9;color:var(--accent);font-weight:850;font-size:17px}.today-name{font-size:22px;font-weight:800}.today-meta{font-size:13px;color:var(--muted);margin-top:4px}.today-start{appearance:none;border:0;background:#2c704e;color:#fff;border-radius:15px;min-height:44px;padding:9px 15px;font-weight:800}.today-add{appearance:none;border:1px dashed #c8d2c9;background:#fafbf7;border-radius:22px;min-height:66px;font-size:17px;font-weight:780}.today-bottom{display:grid;grid-template-columns:1fr 1.6fr;gap:10px}.today-secondary,.today-primary{appearance:none;border-radius:20px;min-height:58px;padding:12px 18px;font-weight:820;font-size:17px}.today-secondary{border:1px solid var(--line);background:var(--card-solid)}.today-primary{border:0;background:#2c704e;color:#fff}.today-finish{appearance:none;width:100%;border:1px solid var(--line);background:var(--card-solid);color:#5f665f;border-radius:18px;min-height:52px;padding:11px 16px;font-size:16px;font-weight:780}.finish-page{display:grid;gap:15px;padding:2px 2px 5px}.finish-summary{border:1px solid var(--line);background:linear-gradient(135deg,#f1f6ec,#fbf8f1);border-radius:26px;padding:22px 23px}.finish-summary-icon{width:44px;height:44px;border-radius:16px;display:grid;place-items:center;background:#e7f0e5;color:#2c704e;font-size:22px;margin-bottom:15px}.finish-summary h3{font-size:28px;line-height:1.15;margin:0;letter-spacing:-.025em}.finish-summary p{font-size:16px;line-height:1.6;color:var(--muted);margin:9px 0 0}.finish-note{border:1px solid var(--line);background:var(--card-solid);border-radius:22px;padding:17px 19px;display:flex;gap:12px;align-items:flex-start}.finish-note-icon{font-size:20px;line-height:1.2}.finish-note strong{display:block;font-size:16px}.finish-note span{display:block;color:var(--muted);font-size:13px;line-height:1.5;margin-top:4px}.private-list{display:grid;gap:10px}.private-row{display:grid;grid-template-columns:30px minmax(0,1fr);align-items:center;gap:12px;border:1px solid var(--line);background:var(--card-solid);border-radius:19px;padding:15px 16px;font-size:18px;font-weight:780;cursor:pointer}.private-row input{appearance:none;-webkit-appearance:none;width:26px;height:26px;border-radius:9px;border:1.5px solid #aab7aa;background:#fff;margin:0;display:grid;place-items:center}.private-row input:checked{background:#2c704e;border-color:#2c704e}.private-row input:checked:after{content:'✓';color:#fff;font-size:17px;font-weight:900;line-height:1}.private-row small{display:block;color:var(--muted);font-size:12px;font-weight:600;margin-top:4px}.finish-modern-actions{position:sticky;bottom:72px;z-index:17;display:grid;grid-template-columns:1fr 1.35fr;gap:10px;padding:10px;border:1px solid rgba(215,221,213,.92);border-radius:21px;background:rgba(250,249,246,.96);box-shadow:0 10px 28px rgba(45,52,47,.10);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}.finish-modern-actions button{appearance:none;min-height:56px;border-radius:17px;padding:12px 16px;font-size:16px;font-weight:820}.finish-modern-secondary{border:1px solid var(--line);background:var(--card-solid)}.finish-modern-primary{border:0;background:#2c704e;color:#fff}.finish-modern-danger{border:0;background:#2c704e;color:#fff}
+.picker-sources{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}.picker-source{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:22px;padding:16px;text-align:left;min-height:94px}.picker-source.active{border-color:#8caf98;background:#eef5ec}.picker-source strong{display:block;font-size:16px;margin-top:6px}.picker-source small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.picker-search{width:100%;border:1px solid var(--line);background:var(--card-solid);border-radius:18px;min-height:50px;padding:0 16px;font-size:16px}.picker-list{border:1px solid var(--line);background:var(--card-solid);border-radius:24px;overflow:hidden}.picker-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:12px;align-items:center;padding:15px 18px;border-bottom:1px solid #eceee9}.picker-row:last-child{border-bottom:0}.picker-name{font-size:18px;font-weight:790}.picker-meta{font-size:12px;color:var(--muted);margin-top:4px}.picker-add{appearance:none;border:1px solid #9db9a7;background:#f4f8f3;color:#255f45;border-radius:14px;min-height:40px;padding:8px 13px;font-weight:780}.picker-add:disabled{border-color:var(--line);color:var(--muted);background:#f3f4f1}.picker-empty{padding:30px;text-align:center;color:var(--muted)}.inventory-pick-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.inventory-pick{display:grid;grid-template-columns:28px minmax(0,1fr);align-items:center;gap:11px;border:1px solid var(--line);background:var(--card-solid);border-radius:18px;padding:14px 15px;cursor:pointer}.inventory-pick input{appearance:none;-webkit-appearance:none;width:24px;height:24px;border-radius:8px;border:1.5px solid #aab7aa;background:#fff;margin:0;display:grid;place-items:center}.inventory-pick input:checked{background:#2c704e;border-color:#2c704e}.inventory-pick input:checked:after{content:'✓';color:#fff;font-size:16px;font-weight:900;line-height:1}.inventory-pick strong{display:block;font-size:16px}.inventory-pick small{display:block;color:var(--muted);font-size:12px;margin-top:3px}.inventory-pick-actions{position:sticky;bottom:76px;z-index:16;padding:10px;border:1px solid rgba(215,221,213,.92);border-radius:20px;background:rgba(250,249,246,.96);box-shadow:0 10px 28px rgba(45,52,47,.10);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}.inventory-pick-actions button{appearance:none;width:100%;min-height:54px;border:0;border-radius:16px;background:#2c704e;color:#fff;font-size:16px;font-weight:820}.inventory-picked-note{border:1px solid #dce7dc;background:#f3f7f1;border-radius:18px;padding:13px 15px;color:#44604c;font-size:14px}.inventory-back{appearance:none;border:1px solid var(--line);background:var(--card-solid);border-radius:14px;min-height:42px;padding:8px 13px;font-weight:760}.picker-loading{padding:28px;text-align:center;color:var(--muted)}@media(max-width:700px){.inventory-pick-list{grid-template-columns:1fr}}
+.cook-top{display:flex;align-items:center;justify-content:space-between;gap:12px}.cook-title-group h2{font-size:34px;margin:0;letter-spacing:-.03em}.cook-dish{font-size:22px;font-weight:820;margin-top:9px}.cook-stage{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.cook-stage span{border-radius:999px;background:#eef0eb;color:#858b84;padding:10px;text-align:center;font-size:14px;font-weight:760}.cook-stage span.active{background:#2c704e;color:#fff}.cook-card{border:1px solid var(--line);background:var(--card-solid);border-radius:26px;padding:23px;box-shadow:var(--shadow-sm)}.cook-step-kicker{font-size:13px;color:var(--accent);font-weight:800}.cook-step-title{font-size:18px;color:var(--muted);margin-top:4px}.cook-step-text{font-size:28px;line-height:1.47;font-weight:700;margin-top:18px;white-space:pre-line}.cook-actions{position:sticky;bottom:72px;z-index:18;display:grid;grid-template-columns:1fr 1.35fr 1fr;gap:9px;margin-top:4px;padding:10px;border:1px solid rgba(215,221,213,.92);border-radius:21px;background:rgba(250,249,246,.96);box-shadow:0 10px 28px rgba(45,52,47,.12);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px)}.cook-actions button{appearance:none;min-height:56px;border-radius:17px;border:1px solid var(--line);background:var(--card-solid);font-weight:800;font-size:16px}.cook-actions .primary{background:#2c704e;color:#fff;border-color:#2c704e}.cook-standalone-timer{appearance:none;margin-top:14px;border:1px solid #bfd2c7;background:#f7fbf8;color:var(--accent);border-radius:14px;min-height:46px;padding:8px 14px;font-size:14px;font-weight:760}
+.prep-page{display:grid;gap:15px;padding:2px 2px 5px}.prep-progress{border:1px solid var(--line);background:linear-gradient(135deg,#f1f6ec,#fbf8f1);border-radius:24px;padding:18px 20px}.prep-progress-top{display:flex;align-items:center;justify-content:space-between;gap:14px}.prep-progress strong{font-size:23px}.prep-progress-count{font-size:16px;font-weight:820;color:var(--accent)}.prep-bar{height:9px;background:#e9ede7;border-radius:999px;overflow:hidden;margin-top:12px}.prep-bar span{display:block;height:100%;background:#2c704e;border-radius:999px}.prep-groups{display:grid;gap:12px}.prep-dish{border:1px solid var(--line);background:var(--card-solid);border-radius:24px;padding:19px 20px}.prep-dish.done{background:#f4f8f2;border-color:#cbd9ca}.prep-dish-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:13px}.prep-dish-name{font-size:21px;font-weight:820}.prep-dish-state{font-size:12px;font-weight:800;color:var(--muted)}.prep-dish.done .prep-dish-state{color:#2c704e}.prep-ref{font-size:12px;color:var(--muted);line-height:1.5;margin:-3px 0 12px}.prep-tasks{display:grid;gap:8px}.prep-check{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;align-items:start;padding:11px 12px;border-radius:15px;background:#fafaf7;cursor:pointer}.prep-check input{appearance:none;-webkit-appearance:none;width:24px;height:24px;border-radius:8px;border:1.5px solid #aab7aa;background:#fff;margin:0;display:grid;place-items:center}.prep-check input:checked{background:#2c704e;border-color:#2c704e}.prep-check input:checked:after{content:'✓';color:#fff;font-size:16px;font-weight:900;line-height:1}.prep-check span{font-size:16px;line-height:1.45}.prep-check.checked span{text-decoration:line-through;color:#868d86}.prep-complete{border-radius:22px;background:#edf5eb;padding:18px 20px;color:#255f45;font-weight:780;text-align:center}.prep-actions{display:grid;grid-template-columns:1fr 1.5fr;gap:10px}.prep-actions button{appearance:none;border-radius:19px;min-height:56px;font-weight:820;font-size:16px}.prep-back{border:1px solid var(--line);background:var(--card-solid)}.prep-primary{border:0;background:#2c704e;color:#fff}.prep-primary:disabled{background:#b7c3b9;color:#f7f8f5}
+
+@media(max-width:760px){.modern-header .brand{font-size:38px}.brand-sub{font-size:16px}.header-voice{min-height:54px;padding-right:12px}.header-voice-icon{width:40px;height:40px}.header-voice small{display:none}.home-hero{min-height:270px}.home-hero-copy{width:100%;padding:24px}.home-hero h2{font-size:40px}.home-hero-meta{font-size:16px}.home-today-list{grid-template-columns:1fr 1fr}.home-today-list span{font-size:18px;min-height:50px}.home-channel-card{min-height:124px;padding:19px}.home-channel-card strong{font-size:22px}.home-channel-card small{font-size:14px}.home-food-copy{width:72%;padding:21px}.home-food-card h3{font-size:29px}.home-food-card:after{width:46%}.home-food-actions button{padding:8px 12px;font-size:13px}.home-small-card{padding:18px;min-height:112px}.home-small-title{font-size:22px}.home-small-sub{font-size:14px}.home-priority-title{font-size:20px}.home-priority-list{grid-template-columns:1fr}.home-bottom-nav{border-radius:20px}.more-btn{width:44px;height:44px}}
+
+.food-scan-box{margin-top:14px;border:1px solid #d7e3d9;background:linear-gradient(135deg,#f5faf6,#fbfcf8);border-radius:20px;padding:16px}.food-scan-title{font-size:17px;font-weight:820}.food-scan-copy{font-size:13px;color:var(--muted);line-height:1.5;margin-top:5px}.food-scan-actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:13px}.food-scan-button{border:0;background:var(--accent);color:#fff;border-radius:15px;min-height:50px;padding:11px 17px;font-weight:800;font-size:15px}.food-scan-button.secondary{background:#fff;color:var(--ink);border:1px solid var(--line)}.food-scan-status{margin-top:12px;font-size:13px;color:var(--muted);min-height:20px}.food-scan-status.busy{color:var(--accent);font-weight:720}.food-scan-results{display:grid;gap:10px;margin-top:14px}.food-scan-row{border:1px solid var(--line);background:#fff;border-radius:17px;padding:12px}.food-scan-row-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.food-scan-name{flex:1;min-width:0;border:0;background:transparent;font-size:16px;font-weight:780;outline:none;padding:3px 0}.food-scan-remove{border:0;background:#f4f1eb;border-radius:999px;width:34px;height:34px;font-size:18px}.food-scan-fields{display:grid;grid-template-columns:1.2fr .65fr .65fr;gap:8px;margin-top:9px}.food-scan-fields .food-select,.food-scan-fields .food-input{min-height:42px;font-size:14px;padding:7px 9px}.food-scan-raw{font-size:11px;color:var(--muted);margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.food-scan-commit{margin-top:12px;width:100%}.food-scan-file{display:none}@media(max-width:720px){.food-scan-fields{grid-template-columns:1fr 1fr}.food-scan-fields .food-scan-category{grid-column:1/-1}}
+
+
+/* R34 · 小K VISUAL REFRESH V2
+   Strong visible refresh, page structure and business logic unchanged. */
+:root{
+  --bg:#f4f6f2;--card:#ffffff;--card-solid:#ffffff;--ink:#173126;--muted:#748078;
+  --line:#e4e9e3;--line-strong:#d4ddd5;--accent:#2e7654;--accent-hover:#286949;
+  --accent-2:#edf5ef;--soft:#f1f4ef;--shadow:0 10px 30px rgba(30,55,41,.07);--shadow-sm:0 5px 16px rgba(30,55,41,.055)
+}
+html,body{background:#f4f6f2!important;color:#173126}
+body{background-image:linear-gradient(180deg,#fbfcfa 0,#f4f6f2 34%,#eef2ed 100%)!important}
+#app{padding:calc(env(safe-area-inset-top,0px) + 22px) 28px 14px!important;gap:16px!important}
+main{padding-bottom:92px!important}
+.panel{max-width:1180px!important;border-radius:32px!important;padding:30px 34px!important;border-color:#e5eae4!important;background:rgba(255,255,255,.94)!important;box-shadow:0 16px 44px rgba(26,47,35,.065)!important}
+.panel.home-mode{background:transparent!important;box-shadow:none!important;border:0!important;padding:0!important}
+.content{padding:2px 1px 10px!important}
+
+/* Header */
+.modern-header{max-width:1180px!important;min-height:98px!important;padding:0 6px!important}
+.modern-header .brand{font-size:58px!important;line-height:.88!important;letter-spacing:-.075em!important;color:#123626!important}
+.brand-sub{font-size:19px!important;margin-top:11px!important;color:#718078!important;font-weight:650!important}
+.modern-head-actions{gap:12px!important}.header-voice{min-height:68px!important;border-radius:24px!important;padding:9px 21px 9px 10px!important;border-color:#dce5de!important;background:#fff!important;box-shadow:0 8px 24px rgba(29,55,40,.07)!important}.header-voice-icon{width:50px!important;height:50px!important;background:#e4f0e7!important;font-size:23px!important}.header-voice strong{font-size:18px!important;color:#173126}.header-voice small{font-size:12px!important}.more-btn{width:52px!important;height:52px!important;background:#fff!important;border-color:#e0e6e0!important;box-shadow:0 6px 18px rgba(30,55,41,.05)}
+
+/* Home */
+.home-dashboard{gap:20px!important;padding:2px 2px 14px!important}.home-hero{min-height:320px!important;border-radius:34px!important;background:linear-gradient(125deg,#eaf4eb 0%,#f4f8f0 56%,#fbf7ef 100%)!important;border:1px solid #dfe8df!important;box-shadow:0 14px 38px rgba(41,73,54,.07)!important}.home-hero:before{display:block!important;content:"";position:absolute;right:-90px;top:-120px;width:330px;height:330px;border-radius:50%;background:rgba(255,255,255,.46)!important;left:auto!important;bottom:auto!important}.home-hero-copy{width:100%!important;padding:40px 42px!important}.home-section-kicker{font-size:16px!important;color:#5a7867!important}.home-hero h2{font-size:58px!important;line-height:1!important;color:#153728!important;margin:14px 0 15px!important}.home-hero-meta{font-size:20px!important;line-height:1.6!important;max-width:850px;color:#68776f!important}.home-today-list{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:12px!important;margin-top:20px!important}.home-today-list span{min-height:60px!important;border-radius:18px!important;background:#fff!important;border:1px solid #e2e9e2!important;font-size:22px!important;padding:13px 17px!important;box-shadow:0 4px 14px rgba(32,56,42,.035)!important}.home-hero-actions{margin-top:28px!important;gap:12px!important}.home-primary,.home-secondary{min-height:60px!important;border-radius:18px!important;padding:13px 26px!important;font-size:18px!important}.home-primary{background:#2e7654!important;box-shadow:0 9px 22px rgba(46,118,84,.18)!important}.home-secondary{background:#fff!important;border-color:#dde5de!important}
+.home-channel-grid{gap:14px!important}.home-channel-card{min-height:154px!important;border-radius:26px!important;padding:26px!important;background:#fff!important;border:1px solid #e4e9e4!important;box-shadow:0 8px 24px rgba(33,55,43,.055)!important;position:relative;overflow:hidden}.home-channel-card:after{content:"";position:absolute;left:0;top:0;bottom:0;width:5px;background:#dbeadf}.home-channel-card:nth-child(1):after{background:#6fa582}.home-channel-card:nth-child(2):after{background:#8db89b}.home-channel-card:nth-child(3):after{background:#d1a960}.home-channel-card:nth-child(4):after{background:#7fa1a0}.home-channel-icon{font-size:31px!important}.home-channel-card strong{font-size:27px!important;line-height:1.1!important;margin-top:13px!important;color:#173426}.home-channel-card small{font-size:16px!important;line-height:1.5!important;margin-top:9px!important;color:#7b867f!important}.home-priority{border-radius:27px!important;background:#fff!important;border:1px solid #e4e9e4!important;padding:23px 25px!important;box-shadow:0 7px 22px rgba(31,52,39,.045)!important}.home-priority-title{font-size:23px!important}.home-priority-note{font-size:14px!important}.home-priority-more{font-size:15px!important}.home-priority-item{min-height:72px!important;border-radius:18px!important;background:#f7f9f6!important;border:1px solid #edf0ec!important;padding:14px 16px!important}.home-priority-name{font-size:18px!important}
+
+/* Page headings */
+.today-page,.picker-page,.prep-page,.cook-page,.finish-page,.utility-page{gap:18px!important}.page-heading{padding:7px 4px 12px!important;align-items:flex-start!important}.page-heading h2{font-size:46px!important;line-height:1.02!important;color:#153728!important}.page-heading p{font-size:17px!important;line-height:1.5!important;margin-top:10px!important}.page-back{min-height:48px!important;border-radius:16px!important;background:#fff!important;border-color:#e0e6e0!important}
+
+/* Today menu */
+.today-list{background:transparent!important;border:0!important;border-radius:0!important;overflow:visible!important;display:grid!important;gap:11px!important}.today-row{grid-template-columns:52px minmax(0,1fr) auto!important;padding:20px 22px!important;border:1px solid #e4e9e4!important;border-radius:22px!important;background:#fff!important;box-shadow:0 6px 18px rgba(30,53,40,.045)!important}.today-row:last-child{border-bottom:1px solid #e4e9e4!important}.today-number{width:40px!important;height:40px!important;background:#e7f1e8!important;font-size:18px!important}.today-name{font-size:24px!important;color:#173426}.today-meta{font-size:14px!important;margin-top:6px!important}.today-start{min-height:48px!important;border-radius:15px!important;font-size:15px!important;background:#2e7654!important}.today-add{min-height:72px!important;border-radius:20px!important;background:#f7faf7!important;border-color:#cddbcf!important;font-size:18px!important}.today-bottom{gap:12px!important}.today-secondary,.today-primary{min-height:64px!important;border-radius:19px!important;font-size:18px!important}.today-primary{background:#2e7654!important}.today-finish{min-height:56px!important;border-radius:18px!important;font-size:16px!important;background:#fff!important}
+
+/* Picker */
+.picker-sources{gap:14px!important}.picker-source{min-height:124px!important;border-radius:24px!important;padding:22px!important;background:#fff!important;border-color:#e3e8e3!important;box-shadow:0 5px 18px rgba(29,54,40,.04)!important}.picker-source.active{background:#eaf4ec!important;border-color:#a9c8b2!important;box-shadow:0 0 0 3px rgba(46,118,84,.055)!important}.picker-source>span{font-size:26px!important}.picker-source strong{font-size:20px!important;margin-top:10px!important}.picker-source small{font-size:14px!important;line-height:1.5!important}.picker-search{min-height:58px!important;border-radius:17px!important;font-size:17px!important;background:#fff!important}.picker-list{background:transparent!important;border:0!important;border-radius:0!important;display:grid!important;gap:9px!important;overflow:visible!important}.picker-row{border:1px solid #e5e9e4!important;border-radius:18px!important;background:#fff!important;padding:17px 19px!important;box-shadow:0 4px 14px rgba(29,50,38,.035)!important}.picker-row:last-child{border-bottom:1px solid #e5e9e4!important}.picker-name{font-size:20px!important}.picker-meta{font-size:13px!important;line-height:1.45!important}.picker-add{min-height:44px!important;border-radius:14px!important;background:#edf6ef!important;border-color:#b8d0bf!important;color:#286b4b!important}.inventory-picked-note{padding:16px 18px!important;border-radius:18px!important}.inventory-pick-list{gap:12px!important}.inventory-pick{padding:17px!important;border-radius:19px!important;background:#fff!important;box-shadow:0 4px 14px rgba(31,52,40,.035)!important}.inventory-pick strong{font-size:18px!important}.inventory-pick small{font-size:13px!important}.inventory-pick input{width:26px!important;height:26px!important}.inventory-pick-actions{bottom:96px!important;border-radius:20px!important;background:rgba(255,255,255,.98)!important}
+
+/* Food management */
+.food-modal{background:#f4f6f2!important;padding-top:calc(env(safe-area-inset-top,0px) + 24px)!important}.food-shell{max-width:1180px!important}.food-head{margin-bottom:20px!important}.food-title{font-size:46px!important;color:#153728!important}.food-sub{font-size:16px!important}.food-close{min-height:48px!important;border-radius:16px!important}.food-tabs{padding:6px!important;border-radius:18px!important;background:#eaf0ea!important}.food-tab{min-height:52px!important;font-size:15px!important}.food-tab.active{background:#fff!important;color:#286b4b!important;box-shadow:0 3px 10px rgba(28,50,37,.04)!important}.food-grid{gap:18px!important}.food-card{border-radius:25px!important;padding:24px!important;border-color:#e4e9e4!important;background:#fff!important;box-shadow:0 7px 21px rgba(31,54,41,.04)!important}.food-card h3{font-size:23px!important}.food-card-note{font-size:15px!important}.food-stat{padding:16px!important;border-radius:17px!important}.food-stat strong{font-size:25px!important}.food-row{padding:15px 16px!important;border-radius:17px!important}.food-row-name{font-size:17px!important}.food-input,.food-select{min-height:48px!important;font-size:16px!important}.food-primary{min-height:54px!important;background:#2e7654!important}.food-channel{min-height:66px!important;border-radius:17px!important}.food-scan-box{padding:20px!important;border-radius:20px!important}
+
+/* Prep */
+.prep-progress{padding:22px 24px!important;border-radius:24px!important;background:#edf6ef!important;border-color:#dbe8dd!important}.prep-progress strong{font-size:26px!important}.prep-progress-count{font-size:18px!important}.prep-bar{height:11px!important;margin-top:15px!important}.prep-dish{padding:22px 23px!important;border-radius:24px!important;background:#fff!important;border-color:#e4e9e4!important;box-shadow:0 6px 18px rgba(31,52,40,.04)!important}.prep-dish-name{font-size:24px!important}.prep-dish-state{font-size:13px!important}.prep-ref{font-size:14px!important;line-height:1.55!important}.prep-tasks{gap:10px!important}.prep-check{grid-template-columns:31px minmax(0,1fr)!important;padding:14px 15px!important;border-radius:16px!important;background:#f7f9f6!important;border:1px solid #ecf0eb!important}.prep-check input{width:27px!important;height:27px!important}.prep-check span{font-size:18px!important;line-height:1.5!important}.prep-complete{font-size:17px!important;padding:20px!important}
+
+/* Cooking */
+.cook-title-group h2{font-size:46px!important;color:#153728!important}.cook-dish{font-size:26px!important}.cook-stage{gap:10px!important}.cook-stage span{padding:12px!important;font-size:15px!important}.cook-stage span.active{background:#2e7654!important}.cook-card{padding:30px!important;border-radius:26px!important;background:#fff!important;border-color:#e4e9e4!important;box-shadow:0 8px 24px rgba(31,52,40,.045)!important}.cook-step-kicker{font-size:15px!important}.cook-step-title{font-size:20px!important}.cook-step-text{font-size:34px!important;line-height:1.56!important;margin-top:22px!important;color:#1b3024!important}.tips h3{font-size:16px!important}.tips li{font-size:17px!important}.step-timer,.cook-standalone-timer{border-radius:18px!important;background:#f1f7f2!important;border-color:#d9e6dc!important}.timer-time{font-size:48px!important}.cook-actions{bottom:96px!important;border-radius:22px!important;background:rgba(255,255,255,.98)!important;border-color:#e2e7e2!important;box-shadow:0 12px 30px rgba(29,49,37,.10)!important}.cook-actions button{min-height:60px!important;border-radius:17px!important;font-size:17px!important}.cook-actions .primary{background:#2e7654!important}
+
+/* Finish + shopping/timeline */
+.finish-summary{padding:25px!important;border-radius:25px!important;background:#edf6ef!important}.finish-summary h3{font-size:33px!important}.finish-summary p{font-size:17px!important}.finish-note,.private-row,.utility-page-card{border-radius:22px!important;background:#fff!important;border-color:#e4e9e4!important;box-shadow:0 5px 17px rgba(31,52,40,.04)!important}.private-row{padding:18px!important;font-size:19px!important}.utility-page-card{padding:24px!important}.utility-page-card h3{font-size:24px!important}.utility-page-card li{font-size:18px!important;line-height:1.55!important}.finish-modern-actions{bottom:96px!important;background:rgba(255,255,255,.98)!important}
+
+/* Global nav */
+.global-bottom-nav{max-width:760px!important;width:calc(100% - 44px)!important;bottom:calc(env(safe-area-inset-bottom,0px) + 12px)!important;border-radius:24px!important;padding:7px!important;background:rgba(255,255,255,.97)!important;border:1px solid #dfe6df!important;box-shadow:0 14px 40px rgba(25,48,34,.13)!important;backdrop-filter:blur(20px)!important;-webkit-backdrop-filter:blur(20px)!important}.global-bottom-nav button{min-height:58px!important;border-radius:18px!important;font-size:13px!important;color:#748078!important;gap:4px!important}.global-bottom-nav .nav-icon{font-size:20px!important}.global-bottom-nav button.active{background:#e8f3ea!important;color:#286b4b!important;font-weight:850!important}
+
+/* Timer / modal */
+.modal{background:rgba(18,34,25,.31)!important;backdrop-filter:blur(14px)!important;-webkit-backdrop-filter:blur(14px)!important}.modal-card{border-radius:30px!important;padding:28px!important;background:#fff!important;border-color:#e2e7e2!important;box-shadow:0 30px 88px rgba(20,39,29,.22)!important}.modal-card h2{font-size:28px!important;color:#153728!important}.standalone-timer-card{width:min(520px,94vw)!important}.idle-timer{border:0!important;background:transparent!important;box-shadow:none!important;padding:10px 0 0!important}.idle-timer-title{font-size:20px!important}.idle-timer-time{font-size:68px!important;color:#173426!important;margin:26px 0!important}.idle-timer-actions button,.idle-timer-presets button{min-height:54px!important;border-radius:16px!important;background:#f5f8f5!important;border-color:#e2e7e2!important;font-size:16px!important}.idle-timer-actions button.primary{background:#2e7654!important}.time-inputs input{background:#f5f8f5!important}.modal-actions button{min-height:54px!important;border-radius:16px!important}.modal-actions .primary{background:#2e7654!important}
+
+/* Q&A */
+.qa-dock{max-width:1180px!important;border-radius:24px!important;background:rgba(255,255,255,.97)!important;border-color:#e3e8e3!important;box-shadow:0 9px 28px rgba(30,52,40,.06)!important}.qa-btn{background:#2e7654!important;border-radius:17px!important}.qa-status{color:#2e7654!important}
+footer{opacity:.42!important}
+
+@media(max-width:760px){
+  #app{padding:calc(env(safe-area-inset-top,0px) + 18px) 16px 10px!important;gap:13px!important}
+  .modern-header{min-height:88px!important}.modern-header .brand{font-size:49px!important}.brand-sub{font-size:17px!important}.header-voice{min-height:58px!important}.header-voice-icon{width:43px!important;height:43px!important}.header-voice small{display:none!important}.more-btn{width:46px!important;height:46px!important}
+  .home-hero{min-height:305px!important}.home-hero-copy{padding:31px 28px!important}.home-hero h2{font-size:49px!important}.home-hero-meta{font-size:18px!important}.home-today-list span{font-size:20px!important;min-height:56px!important}.home-channel-card{min-height:145px!important;padding:22px!important}.home-channel-card strong{font-size:25px!important}.home-channel-card small{font-size:15px!important}
+  .page-heading h2{font-size:40px!important}.page-heading p{font-size:16px!important}.today-name{font-size:22px!important}.today-row{padding:18px!important}.food-title{font-size:39px!important}.cook-title-group h2{font-size:39px!important}.cook-step-text{font-size:30px!important}.prep-check span{font-size:17px!important}
+  .global-bottom-nav{width:calc(100% - 24px)!important;bottom:calc(env(safe-area-inset-bottom,0px) + 8px)!important}.global-bottom-nav button{min-height:56px!important}
+}
+
+
+/* R35 · Approved mockup UI: structural visual parity with approved review board */
+:root{--mock-green:#2f8b5b;--mock-green-dark:#17613d;--mock-green-soft:#edf7f0;--mock-ink:#10261a;--mock-muted:#6e7971;--mock-line:#e6ebe7;--mock-bg:#f7faf8}
+html,body{background:var(--mock-bg)!important;color:var(--mock-ink)!important}
+#app{padding:calc(env(safe-area-inset-top,0px) + 10px) 18px 8px!important;gap:8px!important}
+.modern-header{max-width:980px!important;min-height:72px!important;padding:0 4px!important}.modern-header .brand{font-size:42px!important;color:#123b26!important}.brand-sub{font-size:15px!important;color:#6c766f!important;margin-top:4px!important}.header-voice{min-height:48px!important;border:0!important;background:#fff4ea!important;box-shadow:none!important;padding:6px 14px 6px 7px!important}.header-voice-icon{width:36px!important;height:36px!important;background:#f4e1cf!important}.header-voice small{display:none!important}.more-btn{width:42px!important;height:42px!important;border:0!important;box-shadow:none!important;background:#fff!important}.modern-head-actions>.dot{display:none!important}
+body:not([data-k-page="home"]) .modern-header{display:none!important}body:not([data-k-page="home"]) #app{padding-top:calc(env(safe-area-inset-top,0px) + 20px)!important}
+main{padding-bottom:80px!important}.panel.home-mode>.content{overflow:auto!important}.home-dashboard,.mock-page{width:min(100%,980px)!important;margin:0 auto!important;padding:0 2px 16px!important;display:grid!important;gap:14px!important}
+.mock-welcome{min-height:238px;border-radius:26px;background:linear-gradient(135deg,#fffdf8 0,#f5f0e6 100%);border:1px solid #ece9e1;padding:30px 32px;display:grid;grid-template-columns:minmax(0,1fr) 220px;align-items:center;box-shadow:0 10px 30px rgba(34,55,43,.05)}.mock-greeting{font-size:38px;font-weight:900;letter-spacing:-.04em}.mock-greeting-sub{font-size:19px;color:#687269;margin-top:8px}.mock-big-primary{border:0;background:linear-gradient(135deg,#31975f,#25794e);color:#fff;border-radius:16px;min-height:62px;padding:14px 26px;font-size:20px;font-weight:850;margin-top:28px;box-shadow:0 10px 22px rgba(47,139,91,.18)}.mock-primary-note{font-size:13px;color:#7d867f;margin:8px 6px 0}.mock-welcome-deco{justify-self:end;text-align:right;color:#6b746d;font-family:"Kaiti SC","STKaiti",serif;font-size:18px;line-height:1.5;transform:rotate(-4deg);padding-right:16px}.mock-welcome-deco span{display:block}.mock-welcome-deco b{display:block;font-family:sans-serif;font-size:31px;margin-top:9px;color:#8c958e}
+.mock-home-today,.mock-tip,.mock-menu-list,.mock-shopping-card,.mock-prep-progress,.mock-prep-card,.mock-cook-card,.mock-source-card,.mock-recipe-section{background:#fff;border:1px solid var(--mock-line);border-radius:22px;box-shadow:0 6px 22px rgba(30,54,40,.045)}.mock-home-today{padding:20px}.mock-section-head{display:flex;justify-content:space-between;align-items:center}.mock-section-head strong{font-size:24px}.mock-section-head small{font-size:14px;color:var(--mock-muted);margin-left:10px}.mock-text-link,.mock-text-action{border:0;background:transparent;color:var(--mock-green-dark);font-weight:760;min-height:42px}.mock-home-dishes{display:grid;gap:6px;margin-top:12px}.mock-home-dish{border:0;background:#fafcfb;border-radius:15px;display:grid;grid-template-columns:34px 1fr auto;align-items:center;text-align:left;min-height:56px;padding:8px 13px}.mock-home-dish-num{width:27px;height:27px;border-radius:50%;background:#e8f5ec;color:#2b754d;display:flex;align-items:center;justify-content:center;font-weight:850}.mock-home-dish strong{font-size:17px}.mock-home-dish-arrow{font-size:24px;color:#9aa49d}
+.mock-feature-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.mock-feature-card{border:1px solid var(--mock-line);background:#fff;border-radius:20px;min-height:138px;padding:20px 15px;text-align:center;box-shadow:0 5px 18px rgba(28,52,38,.04)}.mock-feature-icon{width:48px;height:48px;margin:0 auto 12px;border-radius:15px;background:#edf7f0;color:#2f8b5b;display:flex;align-items:center;justify-content:center;font-size:25px;font-weight:900}.mock-feature-card strong{display:block;font-size:18px}.mock-feature-card small{display:block;font-size:13px;line-height:1.4;color:var(--mock-muted);margin-top:7px}.mock-tip{padding:18px 22px;display:flex;align-items:center;gap:14px;background:linear-gradient(90deg,#f6faf6,#fff)}.mock-tip-icon{font-size:28px}.mock-tip strong{font-size:17px;display:block}.mock-tip small{font-size:14px;color:var(--mock-muted);display:block;margin-top:3px}
+.mock-page-head{padding:2px 5px 10px}.mock-page-head h2{font-size:41px;line-height:1.05;margin:0;color:#123924;letter-spacing:-.045em}.mock-page-head p{font-size:16px;color:var(--mock-muted);margin:9px 0 0}.mock-menu-list{padding:8px;display:grid;gap:5px}.mock-menu-row{border:0;background:#fff;border-radius:16px;min-height:82px;padding:12px 14px;display:grid;grid-template-columns:44px minmax(0,1fr) 30px;gap:11px;align-items:center;text-align:left}.mock-menu-row:not(:last-child){border-bottom:1px solid #eef1ee}.mock-menu-index{width:36px;height:36px;border-radius:50%;background:#e9f4eb;color:#2b754d;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:850}.mock-menu-copy strong{font-size:20px;display:block}.mock-menu-copy small{font-size:13px;color:var(--mock-muted);display:block;margin-top:6px}.mock-menu-arrow{font-size:27px;color:#9ba49e}.mock-soft-action{min-height:58px;border:0;border-radius:17px;background:#eaf4ed;color:#256d48;font-size:17px;font-weight:800}.mock-bottom-primary{min-height:66px;border:0;border-radius:18px;background:linear-gradient(135deg,#32925d,#28784e);color:#fff;font-size:19px;font-weight:850;box-shadow:0 10px 24px rgba(46,134,86,.15)}.mock-inline-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}.mock-inline-actions button{min-height:48px;border:1px solid var(--mock-line);background:#fff;border-radius:15px;font-weight:730}.mock-empty{padding:35px;text-align:center;background:#fff;border:1px dashed #dfe6e0;border-radius:22px}.mock-empty strong,.mock-empty span{display:block}.mock-empty strong{font-size:22px}.mock-empty span{color:var(--mock-muted);margin-top:8px}
+.mock-source-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.mock-source-card{min-height:180px;padding:24px;display:grid;grid-template-columns:58px 1fr 34px;align-items:center;text-align:left}.mock-source-card.active{border-color:#a8cfb5;background:linear-gradient(135deg,#f3faf5,#fff)}.mock-source-icon{width:54px;height:54px;border-radius:16px;background:#e8f5ec;color:#2e8155;display:flex;align-items:center;justify-content:center;font-size:28px}.mock-source-copy strong{font-size:24px;display:block}.mock-source-copy small{font-size:14px;color:var(--mock-muted);display:block;margin-top:8px;line-height:1.45}.mock-source-arrow{font-size:30px;color:#2e8155}.mock-picker-body{display:grid;gap:13px}.mock-recipe-section{padding:14px}.mock-search{width:100%;min-height:52px;border:0;background:#f4f6f4;border-radius:15px;padding:11px 16px;font-size:16px;outline:none}.mock-recipe-list{display:grid;gap:2px;margin-top:9px}.mock-recipe-row{display:flex;align-items:center;gap:15px;padding:13px 8px;border-bottom:1px solid #edf1ee}.mock-recipe-copy{flex:1;min-width:0}.mock-recipe-copy strong{font-size:18px}.mock-recipe-copy small{display:block;color:var(--mock-muted);font-size:13px;margin-top:5px}.mock-add-recipe{border:0;background:#e9f6ed;color:#247249;border-radius:999px;min-height:38px;padding:7px 14px;font-weight:800}.mock-add-recipe:disabled{background:#f1f3f1;color:#9ca29e}.mock-section-title strong{font-size:23px;display:block}.mock-section-title small{font-size:14px;color:var(--mock-muted);display:block;margin-top:5px}.mock-inventory-list{background:#fff;border:1px solid var(--mock-line);border-radius:20px;overflow:hidden}.mock-inventory-row{display:grid;grid-template-columns:30px 1fr auto;align-items:center;gap:12px;min-height:64px;padding:10px 16px;border-bottom:1px solid #edf1ee}.mock-inventory-row:last-child{border-bottom:0}.mock-inventory-row input{width:22px;height:22px;accent-color:var(--mock-green)}.mock-inventory-name strong{font-size:18px;display:block}.mock-inventory-name small{font-size:12px;color:var(--mock-muted);display:block;margin-top:4px}.mock-category-pill{border-radius:999px;background:#eaf5ed;color:#327b52;padding:6px 10px;font-size:12px;font-weight:760}.mock-selected-note{background:#edf7f0;border-radius:15px;padding:13px 16px;color:#356048;font-size:14px}
+.mock-prep-progress{padding:20px 22px}.mock-prep-progress>div:first-child{display:flex;justify-content:space-between;align-items:center}.mock-prep-progress strong{font-size:22px}.mock-prep-progress span{font-size:17px;color:#2c7950;font-weight:800}.mock-progress-bar{height:9px;background:#edf1ed;border-radius:99px;overflow:hidden;margin-top:15px}.mock-progress-bar i{display:block;height:100%;background:#369463;border-radius:99px}.mock-prep-groups{display:grid;gap:12px}.mock-prep-card{padding:20px}.mock-prep-head{display:flex;justify-content:space-between;align-items:center}.mock-prep-head strong{font-size:22px}.mock-prep-head span{font-size:13px;color:#2b7a50;background:#eaf6ee;border-radius:999px;padding:6px 10px}.mock-prep-ref{font-size:13px;color:var(--mock-muted);white-space:pre-line;margin-top:8px}.mock-prep-tasks{display:grid;gap:7px;margin-top:13px}.mock-check-row{display:grid;grid-template-columns:28px 1fr;gap:11px;align-items:flex-start;background:#f8faf8;border-radius:14px;padding:12px}.mock-check-row input{width:23px;height:23px;accent-color:var(--mock-green)}.mock-check-row span{font-size:16px;line-height:1.45}.mock-check-row.checked span{text-decoration:line-through;color:#8a928c}.mock-success{padding:17px;border-radius:17px;background:#eaf6ee;color:#266e47;font-weight:800;text-align:center}
+.mock-cook-head h2{font-size:38px;margin:0;color:#123924}.mock-cook-head p{color:var(--mock-muted);margin:7px 0 0}.mock-stage{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.mock-stage span{background:#eff2ef;border-radius:999px;padding:10px;text-align:center;color:#7b847e;font-size:14px;font-weight:750}.mock-stage span.active{background:#2e8959;color:#fff}.mock-cook-card{padding:28px}.mock-step-kicker{font-size:14px;color:#2e7c51;font-weight:850}.mock-step-text{font-size:29px;line-height:1.55;font-weight:700;margin-top:15px;white-space:pre-line}.mock-k-tip{margin-top:18px;background:#eff7f1;border-radius:15px;padding:14px;color:#496653}.mock-k-tip strong{display:block;color:#2c7950;margin-bottom:5px}.mock-k-tip span{font-size:14px;line-height:1.45}.mock-cook-actions{position:sticky;bottom:82px;display:grid;grid-template-columns:1fr 1fr;gap:10px;background:rgba(247,250,248,.96);padding:8px;border-radius:19px;z-index:5}.mock-cook-actions button{min-height:57px;border:1px solid var(--mock-line);background:#fff;border-radius:15px;font-size:17px;font-weight:800}.mock-cook-actions .primary{background:#2e8959;color:#fff;border-color:#2e8959}.mock-cook-timer-button{appearance:none;width:100%;margin-top:18px;min-height:62px;border:1px solid #d7e5db;background:#f3f8f4;color:#246e49;border-radius:17px;font-size:18px;font-weight:820}.mock-cook-timer-button:active{transform:scale(.99)}.step-timer-manual{padding:17px 18px!important}.timer-controls-single{grid-template-columns:1fr!important}.timer-controls button{min-height:60px!important;font-size:16px!important;padding:11px 12px!important}.timer-controls .timer-touch-main{min-height:66px!important;font-size:18px!important}.step-timer-manual .timer-touch-main{width:100%;font-size:19px!important}.timer-time{cursor:pointer;padding:5px 0}.modal-actions button{min-height:60px!important;font-size:18px!important}.time-inputs input{min-height:66px}.kitchen-timer-main{min-height:66px!important;font-size:20px!important}.kitchen-timer-presets button,.kitchen-timer-secondary button{min-height:58px!important;font-size:16px!important}
+.mock-shopping-card{padding:20px}.mock-shopping-card>strong{font-size:22px}.mock-shopping-list{display:grid;margin-top:10px}.mock-shopping-row{display:grid;grid-template-columns:28px minmax(0,1fr) auto;align-items:center;gap:11px;min-height:55px;padding:8px;border-bottom:1px solid #edf1ee}.mock-shopping-row input{width:22px;height:22px;accent-color:var(--mock-green)}.shopping-item-copy{min-width:0;display:block}.shopping-item-text{display:block;font-size:17px;white-space:normal;overflow-wrap:anywhere}.shopping-stock-badge{display:inline-flex!important;align-items:center;justify-content:center;min-height:31px;padding:5px 10px;border-radius:999px;background:#eaf4ed;color:#2d7650;border:1px solid #cfe2d5;font-size:13px!important;font-weight:820;white-space:nowrap}.mock-shopping-row.checked .shopping-stock-badge{opacity:.58}.shopping-modal-body .shopping-stock-badge{font-size:12px!important;padding:4px 9px;min-height:29px}
+.shopping-modal-card{width:min(760px,94vw);max-height:min(82vh,720px);display:flex;flex-direction:column;padding:0;overflow:hidden}.shopping-modal-head{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:21px 24px 15px;border-bottom:1px solid #e7ece8}.shopping-modal-head h2{margin:0;font-size:27px}.shopping-modal-head p{margin:5px 0 0;color:var(--mock-muted);font-size:13px}.shopping-modal-close{appearance:none;border:0;background:#eef2ef;border-radius:50%;width:42px;height:42px;font-size:25px;line-height:1}.shopping-modal-body{padding:14px 18px 20px;overflow:auto;display:grid;gap:10px}.shopping-modal-body .mock-shopping-card{padding:15px 17px;border-radius:18px;box-shadow:none}.shopping-modal-body .mock-shopping-card>strong{font-size:18px}.shopping-modal-body .mock-shopping-row{min-height:49px}.shopping-modal-empty{padding:36px 18px;text-align:center;color:#6f7b73;font-size:16px}
+/* Food screen mirrors approved list-style review */
+.food-modal{background:var(--mock-bg)!important}.food-shell{max-width:980px!important}.food-title{font-size:40px!important;color:#123924!important}.food-sub{font-size:15px!important}.food-tabs{background:transparent!important;border:0!important;padding:0!important;display:flex!important;gap:7px!important;overflow:auto!important}.food-tab{min-height:40px!important;padding:8px 14px!important;border-radius:999px!important;background:#eef2ef!important;white-space:nowrap!important}.food-tab.active{background:#2f8b5b!important;color:#fff!important;box-shadow:none!important}.food-grid{grid-template-columns:1fr 1fr!important}.food-card{border-radius:20px!important;box-shadow:0 6px 22px rgba(30,54,40,.04)!important}.food-row{background:#fff!important;border-bottom:1px solid #edf1ee!important;border-radius:0!important;padding:12px 5px!important}.food-row:last-child{border-bottom:0!important}.food-list{gap:0!important}.food-stat{background:#f4f7f4!important}
+/* Exact-like global bottom bar from review board */
+.global-bottom-nav{width:100%!important;max-width:none!important;left:0!important;transform:none!important;bottom:0!important;border-radius:0!important;border:0!important;border-top:1px solid #e4e9e5!important;background:rgba(255,255,255,.97)!important;box-shadow:0 -4px 18px rgba(29,50,38,.04)!important;padding:5px max(18px,calc((100% - 900px)/2)) calc(env(safe-area-inset-bottom,0px) + 5px)!important}.global-bottom-nav button{min-height:57px!important;border-radius:12px!important;font-size:12px!important}.global-bottom-nav button.active{background:transparent!important;color:#23804f!important}.global-bottom-nav .nav-icon{font-size:19px!important}
+/* Review-board timer modal */
+.modal{background:rgba(22,31,26,.38)!important}.standalone-timer-card{width:min(470px,92vw)!important;border-radius:25px!important;padding:25px!important}.standalone-timer-head{justify-content:center!important;position:relative!important}.standalone-timer-head h2{font-size:25px!important}.standalone-timer-close{position:absolute!important;right:0!important;top:-3px!important;border:0!important;background:transparent!important}.idle-timer-time{font-size:62px!important}.idle-timer-presets button,.idle-timer-actions button{border:0!important;background:#f2f5f2!important}.idle-timer-presets button:first-child{background:#2f8b5b!important;color:#fff!important}.idle-timer-actions button.primary{background:#2f8b5b!important;color:#fff!important}
+@media(max-width:760px){.mock-welcome{grid-template-columns:1fr!important;min-height:220px!important;padding:24px!important}.mock-welcome-deco{display:none!important}.mock-feature-grid{grid-template-columns:repeat(2,1fr)!important}.mock-source-grid{grid-template-columns:1fr!important}.mock-page-head h2{font-size:34px!important}.mock-greeting{font-size:32px!important}.mock-step-text{font-size:25px!important}.food-grid{grid-template-columns:1fr!important}}
+
+/* R49.2 · landscape one-screen cooking cockpit */
+body[data-k-page="dashboard"] #timerStrip{display:none!important}
+body[data-k-page="dashboard"] #app{padding-top:calc(env(safe-area-inset-top,0px) + 8px)!important;gap:5px!important}
+body[data-k-page="dashboard"] header{min-height:38px!important}
+body[data-k-page="dashboard"] .panel{padding:10px 12px 8px!important;border-radius:22px!important;overflow:hidden!important}
+body[data-k-page="dashboard"] .content{overflow:hidden!important;padding:0!important}
+.r49-dashboard{height:100%;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr) auto;gap:9px;overflow:hidden;padding-bottom:2px}
+.r49-dash-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:44px;padding:0 3px}.r49-dash-head h2{margin:0;font-size:30px;letter-spacing:-.035em;color:#153728}.r49-dash-head p{margin:3px 0 0;font-size:12px;color:var(--muted)}.r49-dash-status{display:inline-flex;align-items:center;gap:7px;border-radius:999px;background:#edf7f0;color:#28734d;padding:8px 12px;font-size:12px;font-weight:820;white-space:nowrap}.r49-dash-status:before{content:'';width:8px;height:8px;border-radius:50%;background:#27a265}.r50-dash-actions{display:flex;align-items:center;gap:9px}.r50-finish-day{appearance:none;border:1px solid #dfb9b2;background:#fff8f6;color:#94483f;border-radius:15px;min-height:42px;padding:8px 14px;font-size:13px;font-weight:880;white-space:nowrap;box-shadow:0 4px 12px rgba(148,72,63,.06)}.r50-finish-day:active{transform:scale(.98)}
+.r49-dash-body{min-height:0;display:grid;grid-template-columns:minmax(0,1.32fr) minmax(300px,.88fr);gap:10px;overflow:hidden}.r49-card{border:1px solid #e1e7e1;background:#fff;border-radius:20px;box-shadow:0 5px 18px rgba(31,55,40,.045)}
+.r49-current{min-height:0;padding:18px 20px;display:grid;grid-template-rows:auto auto minmax(0,1fr) auto;gap:9px;overflow:hidden}.r49-label{display:flex;align-items:center;gap:8px;font-size:13px;color:#397554;font-weight:850}.r49-current-title{display:flex;align-items:flex-end;justify-content:space-between;gap:14px}.r49-current-title h3{font-size:30px;line-height:1;margin:0;color:#163b29;letter-spacing:-.03em}.r49-step-count{font-size:14px;color:#657269;font-weight:760;white-space:nowrap}.r49-progress{height:7px;border-radius:99px;background:#edf1ed;overflow:hidden;margin-top:7px}.r49-progress i{display:block;height:100%;border-radius:99px;background:#2f8b5b}.r49-step-copy{align-self:center;font-size:25px;line-height:1.42;font-weight:720;color:#1e3126;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.r49-current-bottom{display:grid;grid-template-columns:minmax(0,1fr) minmax(180px,.76fr);gap:10px;align-items:stretch}.r49-main-timer{border-radius:16px;background:#f3f8f4;border:1px solid #dbe8de;padding:11px 13px;min-height:78px;display:flex;align-items:center;justify-content:space-between;gap:10px}.r49-main-timer-copy small{display:block;color:#6f7c73;font-size:11px;font-weight:720}.r49-main-timer-copy strong{display:block;font-size:29px;line-height:1.05;margin-top:3px;font-variant-numeric:tabular-nums;color:#183e2b}.r49-main-timer-copy strong.done{color:#a24c43}.r49-main-timer button,.r49-continue{appearance:none;border:0;border-radius:14px;min-height:54px;padding:10px 15px;font-size:15px;font-weight:850}.r49-main-timer button{background:#e5f1e8;color:#246e49;min-width:92px}.r49-continue{width:100%;background:#2f8b5b;color:#fff}
+.r49-side{min-height:0;display:grid;grid-template-rows:1.2fr 1fr .72fr;gap:9px;overflow:hidden}.r49-side-card{padding:13px 14px;min-height:0;overflow:hidden}.r49-side-card h4{margin:0;font-size:14px;color:#456653}.r49-other-list{display:grid;gap:5px;margin-top:7px}.r49-other-row{appearance:none;width:100%;border:0;background:#f6f9f6;border-radius:11px;min-height:38px;padding:7px 9px;display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;color:#183b29}.r49-other-row strong{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.r49-other-row span{flex:0 0 auto;font-size:10px;font-weight:820;color:#6e7b73;background:#fff;border:1px solid #e1e8e2;border-radius:999px;padding:4px 7px}.r49-other-row.started span{color:#2c7951;background:#edf7f0;border-color:#dceade}.r49-other-empty{font-size:12px;color:#6f7d73;padding-top:10px}.r49-timer-mini-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:8px}.r49-timer-mini{appearance:none;text-align:left;border:0;background:#f5f8f5;border-radius:13px;padding:8px 9px;min-height:63px;overflow:hidden}.r49-timer-mini .dish{display:block;font-size:10px;color:#68776e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.r49-timer-mini strong{display:block;font-size:19px;line-height:1;margin-top:5px;font-variant-numeric:tabular-nums;color:#173d2a}.r49-timer-mini.finished strong{color:#a14b43}.r49-timer-center-link{appearance:none;border:0;background:transparent;color:#2b7b51;font-weight:820;font-size:12px;padding:6px 0 0}.r49-prep-entry{height:calc(100% - 21px);display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}.r49-prep-copy{min-width:0}.r49-prep-copy strong{display:block;font-size:16px;color:#173b29}.r49-prep-copy small{display:block;margin-top:4px;font-size:11px;color:#6f7d73}.r49-prep-progress{height:6px;border-radius:99px;background:#edf1ed;overflow:hidden;margin-top:7px}.r49-prep-progress i{display:block;height:100%;border-radius:99px;background:#2f8b5b}.r49-prep-button{appearance:none;border:0;background:#2f8b5b;color:#fff;border-radius:13px;min-height:48px;min-width:118px;padding:9px 13px;font-size:14px;font-weight:850;box-shadow:0 6px 16px rgba(47,139,91,.16)}.r49-pending-empty{font-size:12px;color:#6f7d73;padding-top:9px}
+.r49-quickbar{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.r49-quickbar button{appearance:none;border:1px solid #dce6df;background:#fff;border-radius:17px;min-height:62px;padding:9px 14px;display:flex;align-items:center;justify-content:center;gap:10px;font-size:16px;font-weight:850;color:#214332;box-shadow:0 5px 14px rgba(31,68,47,.04)}.r49-quickbar .ico{width:32px;height:32px;border-radius:10px;background:#eaf4ed;color:#2b7d52;display:grid;place-items:center;font-size:17px}
+.timer-center-modal{z-index:92!important}.timer-center-card{width:min(1040px,96vw)!important;height:min(650px,88vh);padding:18px 20px!important;border-radius:25px!important;display:grid;grid-template-rows:auto minmax(0,1fr);overflow:hidden}.timer-center-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;position:relative}.timer-center-head h2{margin:0!important;font-size:28px!important}.timer-center-head p{margin:5px 0 0;color:var(--muted);font-size:13px}.timer-center-head .standalone-timer-close{position:static!important}.timer-center-body{min-height:0;display:grid;grid-template-rows:minmax(0,1fr) auto;gap:13px;margin-top:13px}.timer-center-grid{min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:10px}.timer-center-item{border:1px solid #e0e7e1;background:#f9fbf9;border-radius:17px;padding:12px 13px;display:grid;grid-template-rows:auto 1fr auto;min-height:0}.timer-center-tag{display:flex;align-items:center;justify-content:space-between;gap:8px}.timer-center-tag span{font-size:11px;color:#2e7950;background:#eaf5ed;border-radius:999px;padding:5px 8px;max-width:72%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timer-center-tag small{font-size:10px;color:#7d887f}.timer-center-time{align-self:center;font-size:34px;line-height:1;text-align:center;font-weight:880;font-variant-numeric:tabular-nums;color:#173d2a}.timer-center-item.finished .timer-center-time{color:#a24c43}.timer-center-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}.timer-center-actions button{appearance:none;border:0;background:#edf3ee;border-radius:11px;min-height:38px;font-size:12px;font-weight:820;color:#315d43}.timer-center-actions button.primary{background:#2f8b5b;color:#fff}.timer-center-actions button.danger{background:#f7ece9;color:#9b4c43}.timer-center-empty{grid-column:1/-1;grid-row:1/-1;display:grid;place-items:center;text-align:center;border:1px dashed #d6dfd7;border-radius:18px;color:#738078;font-size:15px}.timer-center-quick{border-top:1px solid #e5eae6;padding-top:11px;display:grid;grid-template-columns:auto repeat(6,minmax(70px,1fr));gap:8px;align-items:center}.timer-center-quick strong{font-size:13px;color:#314f3d;white-space:nowrap}.timer-center-quick button{appearance:none;border:0;background:#f1f5f2;border-radius:12px;min-height:46px;font-size:13px;font-weight:820;color:#315c43}.timer-center-quick button.primary{background:#2f8b5b;color:#fff}
+@media(max-height:700px) and (orientation:landscape){.r49-dash-head h2{font-size:26px}.r49-current{padding:14px 16px}.r49-current-title h3{font-size:26px}.r49-step-copy{font-size:21px;-webkit-line-clamp:2}.r49-main-timer-copy strong{font-size:25px}.r49-side-card{padding:10px 12px}.r49-next-copy strong{font-size:19px}.r49-quickbar button{min-height:52px}.timer-center-card{height:92vh}.timer-center-time{font-size:29px}}
+.mock-menu-open{appearance:none;border:0;background:transparent;text-align:left;padding:0;min-width:0;color:inherit}.mock-menu-actions{display:flex;align-items:center;gap:6px}.mock-menu-remove{appearance:none;border:1px solid #ead8d3;background:#fffafa;color:#9b5548;border-radius:12px;min-height:36px;padding:7px 10px;font-size:12px;font-weight:800}
+
+/* R40 · homepage primary CTA copy: 开工烧饭 */
+.today-remove-confirm-card{width:min(430px,92vw)!important;padding:26px!important}
+.today-remove-confirm-card h2{margin:0!important;font-size:25px!important;color:#173a28!important}
+.today-remove-confirm-card p{margin:10px 0 0!important;color:#6d7870!important;font-size:15px!important;line-height:1.55!important}
+.today-remove-name{margin-top:18px!important;padding:15px 16px!important;border-radius:16px!important;background:#f5f8f5!important;font-size:19px!important;font-weight:850!important;color:#183d2a!important}
+.today-remove-status{min-height:20px;margin-top:9px;color:#a14b42;font-size:13px}
+.today-remove-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}
+.today-remove-actions button{appearance:none;min-height:52px;border-radius:15px;font-size:16px;font-weight:800}
+.today-remove-cancel{border:1px solid #e0e6e1;background:#fff;color:#526057}
+.today-remove-confirm{border:0;background:#b84e45;color:#fff}.today-remove-confirm:disabled{opacity:.55}
+.mock-menu-remove{position:relative;z-index:2}
+
+.standalone-timer-card{width:min(500px,92vw)!important;padding:27px 28px 25px!important}
+.standalone-timer-head{justify-content:center!important;position:relative!important;margin-bottom:18px!important}
+.standalone-timer-head h2{font-size:27px!important;text-align:center!important}
+.standalone-timer-close{position:absolute!important;right:-4px!important;top:-5px!important;width:38px!important;height:38px!important;border:0!important;background:transparent!important;color:#68746c!important}
+.kitchen-timer-ui{display:grid;gap:17px}.kitchen-timer-mode{display:grid;grid-template-columns:1fr 1fr;background:#f0f3f1;border-radius:13px;padding:4px}
+.kitchen-timer-mode button{appearance:none;border:0;background:transparent;border-radius:10px;min-height:42px;font-size:15px;font-weight:780;color:#69756d}.kitchen-timer-mode button.active{background:#fff;color:#246f4b;box-shadow:0 2px 10px rgba(30,58,41,.07)}
+.kitchen-timer-presets{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.kitchen-timer-preset{appearance:none;border:0;background:#f3f5f3;border-radius:13px;min-height:48px;font-size:15px;font-weight:780;color:#3f4d44}.kitchen-timer-preset.active{background:#2f8b5b;color:#fff}
+.kitchen-timer-big{font-size:64px;line-height:1;text-align:center;font-weight:880;letter-spacing:.02em;font-variant-numeric:tabular-nums;color:#193b29;padding:9px 0 2px}.kitchen-timer-sub{text-align:center;color:#7a857e;font-size:13px;margin-top:-7px}
+.kitchen-timer-main{appearance:none;border:0;background:#2f8b5b;color:#fff;border-radius:15px;min-height:58px;font-size:18px;font-weight:850}.kitchen-timer-secondary{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}.kitchen-timer-secondary button{appearance:none;border:1px solid #e0e6e1;background:#fff;border-radius:13px;min-height:46px;font-size:14px;font-weight:760;color:#48564d}.kitchen-timer-secondary button.danger{color:#a34b43}.kitchen-timer-main.danger{background:#b84e45}
+
+.mock-cook-layout{display:grid;grid-template-columns:48px minmax(0,1fr) 48px;gap:10px;align-items:stretch}.mock-cook-center{min-width:0;display:grid;gap:14px;grid-column:2}.mock-side-nav{position:sticky;top:34%;align-self:start;appearance:none;width:44px;height:clamp(118px,19vh,168px);border:1px solid #dde6df;background:rgba(255,255,255,.97);border-radius:18px;color:#2d7650;font-size:34px;line-height:1;font-weight:650;box-shadow:0 8px 20px rgba(28,52,38,.07);z-index:8;display:flex;align-items:center;justify-content:center;padding:0}.mock-side-nav:active{transform:scale(.97)}.mock-side-nav:disabled{opacity:.24}.mock-side-nav.prev{grid-column:1}.mock-side-nav.next{grid-column:3}.mock-cook-actions{display:none!important}
+@media(max-width:760px){.mock-cook-layout{grid-template-columns:43px minmax(0,1fr) 43px;gap:6px}.mock-side-nav{width:40px;height:clamp(108px,18vh,148px);border-radius:15px;font-size:30px}.kitchen-timer-big{font-size:58px}.standalone-timer-card{padding:24px 20px!important}}
+
+
+/* R46: food manager hierarchy + stronger touch navigation */
+.mock-welcome{grid-template-columns:1fr!important}.mock-feature-icon svg{width:27px;height:27px;fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}.mock-feature-icon{font-size:0!important}.mock-tip{display:none!important}
+.mock-cook-layout{grid-template-columns:50px minmax(0,1fr) 50px!important;gap:10px!important}.mock-side-nav{width:46px!important;height:clamp(300px,48vh,420px)!important;border-radius:18px!important}.mock-head-home{appearance:none;border:1px solid #dfe7e1;background:#fff;color:#2d7650;border-radius:15px;min-height:46px;padding:10px 16px;font-size:15px;font-weight:800;white-space:nowrap}.mock-head-home:active{transform:scale(.98)}
+.food-tabs{display:grid!important;grid-template-columns:repeat(4,1fr)!important;gap:10px!important;background:transparent!important;border:0!important;padding:0!important;margin-bottom:18px!important;overflow:visible!important}.food-tab{min-height:58px!important;border:1px solid #dfe7e1!important;border-radius:17px!important;background:#fff!important;color:#56655b!important;font-size:15px!important;font-weight:800!important;box-shadow:0 4px 14px rgba(30,54,40,.035)!important}.food-tab-primary{color:#256f4b!important;background:#f1f8f3!important;border-color:#cfe2d5!important}.food-tab.active{background:#2f8058!important;border-color:#2f8058!important;color:#fff!important;box-shadow:0 7px 18px rgba(47,128,88,.16)!important}.food-overview-card,.food-recommend-card,.food-log-card{padding:24px!important}.food-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.food-inline-action{appearance:none;border:1px solid #cfe1d4;background:#f3f8f4;color:#2a7650;border-radius:14px;min-height:42px;padding:8px 14px;font-size:14px;font-weight:800;white-space:nowrap}.food-ranked-list{margin-top:16px!important}.food-ranked-row{display:grid!important;grid-template-columns:36px minmax(0,1fr) auto!important}.food-rank{width:30px;height:30px;border-radius:50%;background:#e8f4eb;color:#2c7850;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:900}.food-recommend-tag{font-size:13px;color:#68756c!important}.food-log-entry{appearance:none;width:100%;margin-top:14px;border:1px solid #dfe7e1;background:#fff;border-radius:22px;min-height:82px;padding:16px 18px;display:grid;grid-template-columns:44px minmax(0,1fr) auto;align-items:center;gap:13px;text-align:left;box-shadow:0 6px 22px rgba(30,54,40,.04)}.food-log-entry-icon{width:40px;height:40px;border-radius:13px;background:#eef6f0;color:#2d7650;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:900}.food-log-entry strong{display:block;font-size:17px}.food-log-entry small{display:block;margin-top:4px;color:#748078;font-size:13px}.food-log-entry b{font-size:28px;color:#94a097}.food-log-filters{display:grid;grid-template-columns:180px minmax(0,1fr) auto;gap:10px;align-items:end;margin-top:18px}.food-log-count{font-size:13px;color:#78827b;margin-top:16px}.food-close{background:#2f8058!important;color:#fff!important;border-color:#2f8058!important;min-height:48px!important;padding:10px 19px!important;font-size:15px!important}
+@media(max-width:760px){.mock-cook-layout{grid-template-columns:46px minmax(0,1fr) 46px!important;gap:7px!important}.mock-side-nav{width:43px!important;height:clamp(260px,45vh,360px)!important;border-radius:16px!important}.food-tabs{grid-template-columns:repeat(2,1fr)!important}.food-tab{min-height:56px!important}.food-log-filters{grid-template-columns:1fr!important}.mock-head-home{min-height:44px;padding:8px 12px}.food-section-head{align-items:center}}
+
+/* R45: unified daily inventory consumption at finish */
+/* R46: food manager information hierarchy, log search, icon/nav polish */
+.mock-cook-head{display:flex;align-items:center;justify-content:space-between;gap:14px}.mock-cook-menu-back{appearance:none;border:0;background:#2f8b5b;color:#fff;border-radius:17px;min-height:54px;min-width:156px;padding:12px 20px;font-size:17px;font-weight:880;white-space:nowrap;box-shadow:0 9px 22px rgba(47,139,91,.22);letter-spacing:.01em}.mock-cook-menu-back:before{content:'←';display:inline-block;margin-right:8px;font-size:20px;vertical-align:-1px}.mock-cook-menu-back:active{transform:scale(.98)}.mock-recipe-consume-button{appearance:none;width:100%;margin-top:16px;border:0;border-radius:18px;min-height:62px;padding:14px 18px;background:var(--accent);color:#fff;font-size:18px;font-weight:820;box-shadow:0 10px 22px rgba(37,107,75,.14)}.mock-inline-actions-single{grid-template-columns:1fr!important}.consumption-page{max-width:900px;margin:0 auto}.consumption-list{display:grid;gap:12px}.consumption-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:18px;border:1px solid var(--line);background:var(--card-solid);border-radius:20px;padding:18px 20px}.consumption-copy{display:grid;gap:5px;min-width:0}.consumption-copy strong{font-size:20px}.consumption-copy small{font-size:14px;color:var(--muted);line-height:1.35}.consumption-control{display:grid;grid-template-columns:48px 82px auto 48px;align-items:center;gap:8px}.consumption-control button{appearance:none;border:1px solid var(--line);background:#fff;border-radius:14px;min-height:48px;font-size:24px;font-weight:760}.consumption-control input{width:82px;min-height:48px;border:1px solid var(--line);border-radius:14px;text-align:center;font-size:19px;font-weight:760;background:#fff}.consumption-unit{font-size:15px;color:var(--muted);min-width:22px}.consumption-actions{display:grid;grid-template-columns:minmax(160px,.45fr) minmax(280px,1fr);gap:12px;margin-top:18px}@media(max-width:720px){.consumption-row{grid-template-columns:1fr}.consumption-control{grid-template-columns:48px 82px auto 48px;justify-content:start}.consumption-actions{grid-template-columns:1fr}.mock-cook-menu-back{min-height:44px;padding:8px 12px;font-size:15px}}
+
+/* R48: food log filter layout hard fix + R47 inventory browser */
+.mock-cook-layout{grid-template-columns:58px minmax(0,1fr) 58px!important;gap:12px!important}
+.mock-side-nav{position:fixed!important;top:50%!important;transform:translateY(-50%)!important;width:52px!important;height:clamp(300px,46vh,420px)!important;z-index:64!important;align-self:auto!important;margin:0!important}
+.mock-side-nav.prev{left:max(10px,calc((100vw - 1120px)/2 + 18px))!important}.mock-side-nav.next{right:max(10px,calc((100vw - 1120px)/2 + 18px))!important}.mock-side-nav:active{transform:translateY(-50%) scale(.98)!important}
+.food-inventory-browser{padding:24px!important}.food-inventory-count{font-size:14px;color:#6f7c73;font-weight:750;white-space:nowrap}.food-inventory-toolbar{display:grid;gap:10px;margin-top:18px}.food-inventory-toolbar>*{min-width:0}.food-inventory-filter-row{display:grid;grid-template-columns:minmax(260px,2fr) minmax(150px,.8fr) minmax(180px,.9fr);gap:10px;align-items:end}.food-inventory-filter-row>*{min-width:0}.food-inventory-sort-row{display:grid;grid-template-columns:minmax(220px,1fr) minmax(130px,.55fr);gap:10px;align-items:end;width:min(100%,520px)}.food-inventory-sort-row>*{min-width:0}.food-inventory-table-head{display:grid;grid-template-columns:minmax(260px,2fr) 120px 160px 110px;gap:14px;padding:12px 14px 9px;margin-top:16px;border-bottom:1px solid #e6ebe7;color:#859088;font-size:12px;font-weight:800;letter-spacing:.02em}.food-inventory-list{display:grid}.food-inventory-row{display:grid;grid-template-columns:minmax(260px,2fr) 120px 160px 110px;gap:14px;align-items:center;min-height:72px;padding:12px 14px;border-bottom:1px solid #edf1ee}.food-inventory-row:last-child{border-bottom:0}.food-inventory-main{min-width:0;display:grid;gap:5px}.food-inventory-main strong{font-size:17px;color:#213b2b}.food-inventory-main small{font-size:12px;color:#758078;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.food-inventory-name-line{display:flex;align-items:center;gap:10px;min-width:0}.food-inventory-name-line strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.food-inventory-rename{appearance:none;border:1px solid #d9e5dc;background:#f6faf7;color:#2c7650;border-radius:11px;min-width:60px;min-height:40px;padding:7px 11px;font-size:13px;font-weight:820;flex:0 0 auto}.food-edit-modal{z-index:120!important}.food-edit-card{width:min(520px,94vw)!important}.food-edit-sub{margin:-4px 0 18px;color:var(--muted);font-size:14px;line-height:1.5}.food-edit-fields{display:grid;gap:14px}.food-edit-quantity-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:end}.food-edit-unit{min-width:66px;min-height:50px;border-radius:14px;background:#f0f4f0;display:flex;align-items:center;justify-content:center;font-weight:820;color:#41604c}.food-edit-note{margin-top:12px;padding:11px 13px;border-radius:14px;background:#f4f7f4;color:#647067;font-size:13px;line-height:1.45}.finish-page.private-save-page{padding-bottom:190px!important}.finish-page.private-save-page .private-list{padding-bottom:18px}.finish-page.private-save-page .finish-modern-actions{position:fixed!important;left:50%!important;transform:translateX(-50%)!important;bottom:calc(env(safe-area-inset-bottom,0px) + 88px)!important;width:min(calc(100% - 44px),1060px)!important;z-index:76!important}.food-inventory-qty{font-size:17px;font-weight:850;color:#203c2b}.food-inventory-state{min-width:0}.food-inventory-priority{min-height:40px!important;padding:6px 9px!important;font-size:13px!important;border-radius:12px!important}.food-inventory-badge{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:6px 11px;border-radius:999px;font-size:13px;font-weight:820}.food-inventory-badge.status-ok{background:#e9f5ec;color:#2c7850}.food-inventory-badge.status-mid{background:#f7f1df;color:#876b21}.food-inventory-badge.status-low{background:#fbeae7;color:#a45045}.food-inventory-updated{font-size:13px;color:#748078;white-space:nowrap}.food-pagination{display:grid;grid-template-columns:120px 1fr 120px;gap:12px;align-items:center;margin-top:14px;padding-top:14px;border-top:1px solid #e6ebe7}.food-pagination span{text-align:center;color:#6e7a72;font-size:14px;font-weight:750}.food-pagination button{appearance:none;border:1px solid #dce5de;background:#fff;color:#2d7650;border-radius:13px;min-height:44px;font-size:14px;font-weight:800}.food-pagination button:disabled{opacity:.35}.food-status-compact{padding:20px 24px!important}.food-status-inline{display:grid;grid-template-columns:minmax(220px,1fr) 180px 170px;gap:10px;align-items:end;margin-top:14px}.food-status-inline>*{min-width:0}.food-log-filter-stack{display:flex;flex-direction:column;gap:14px;margin-top:18px;width:100%;min-width:0;overflow:hidden}.food-log-filter-row{display:block;width:100%;min-width:0;max-width:100%;overflow:hidden}.food-log-filter-row .food-label{display:flex;flex-direction:column;gap:7px;width:100%;min-width:0;max-width:100%;box-sizing:border-box}.food-log-filter-row .food-input{display:block;width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important;margin:0!important;overflow:hidden;text-overflow:ellipsis}#foodLogDate{width:100%!important;min-width:0!important;max-width:100%!important;box-sizing:border-box!important}.food-log-filter-actions{display:flex;justify-content:flex-start;margin-top:14px;width:100%}.food-log-filter-actions .food-secondary{min-width:140px;max-width:220px}.food-log-card{overflow:hidden}.mock-cook-head{padding:2px 5px 10px}.mock-cook-head>div{min-width:0}
+@media(max-width:900px){.food-inventory-filter-row{grid-template-columns:1fr 1fr}.food-inventory-search{grid-column:1/-1}.food-inventory-sort-row{grid-template-columns:1fr 1fr;width:100%}.food-inventory-table-head{display:none}.food-inventory-row{grid-template-columns:minmax(0,1fr) auto;gap:8px 14px;border:1px solid #e6ebe7;border-radius:16px;margin-top:9px;padding:14px}.food-inventory-qty{grid-column:2;grid-row:1}.food-inventory-state{grid-column:1;grid-row:2}.food-inventory-updated{grid-column:2;grid-row:2;align-self:center}.food-status-inline{grid-template-columns:1fr 1fr}.food-status-inline .food-primary{grid-column:1/-1}.mock-side-nav.prev{left:7px!important}.mock-side-nav.next{right:7px!important}.mock-side-nav{width:46px!important;height:clamp(260px,43vh,360px)!important}.mock-cook-layout{grid-template-columns:48px minmax(0,1fr) 48px!important;gap:6px!important}}
+@media(max-width:640px){.food-inventory-filter-row,.food-inventory-sort-row{grid-template-columns:1fr}.food-inventory-search{grid-column:auto}.food-pagination{grid-template-columns:96px 1fr 96px}.food-status-inline{grid-template-columns:1fr}.food-status-inline .food-primary{grid-column:auto}.food-inventory-updated{font-size:12px}.mock-side-nav{width:42px!important}.mock-cook-layout{grid-template-columns:44px minmax(0,1fr) 44px!important}}
 </style>
 </head>
 <body>
 <div id="app">
-<header><div><span class="brand">KitchenTerminal</span><span class="version">__KITCHEN_UI_VERSION__</span></div><div class="status"><span id="micState" class="status-pill wait">🎙 麦克风 检测中</span><span id="audioState" class="status-pill wait">🔊 语音 待激活</span><button id="audioRouteBtn" type="button" class="help-btn audio-route-btn">🔊 播放设备</button><button id="helpBtn" class="help-btn">？ 帮助</button><span id="dot" class="dot"></span><span id="statusText">连接中</span></div></header>
+<header class="modern-header"><div class="brand-wrap"><span class="brand">小K</span><span class="brand-sub">今天想做点什么？</span></div><div class="modern-head-actions"><button id="qaHeaderBtn" type="button" class="header-voice"><span class="header-voice-icon">🎙</span><span><strong>问小K</strong><small>你说，我来帮你</small></span></button><button id="moreBtn" type="button" class="more-btn" aria-label="更多设置">•••</button><span id="dot" class="dot"></span></div></header>
+<button id="foodOpenBtn" type="button" style="display:none" aria-hidden="true"></button>
 <div id="timerStrip"></div>
-<main><section class="panel"><div id="eyebrow" class="eyebrow">HOME AI · 厨房</div><h1 id="title" class="title">厨房终端</h1><div id="message" class="message">正在读取 Gateway…</div><div id="content" class="content"></div><div id="nav" class="nav" style="display:none"></div></section></main>
-<div id="qaDock" class="qa-dock"><button id="qaBtn" type="button" class="qa-btn">🎙 问逐光</button><div class="qa-copy"><div id="qaStatus" class="qa-status">可以问做法、替代食材、火候和补救办法</div><div id="qaTranscript" class="qa-transcript"></div><div id="qaAnswer" class="qa-answer"></div></div><button id="qaClear" class="qa-clear" aria-label="清除回答">×</button></div>
+<main><section id="mainPanel" class="panel"><div id="eyebrow" class="eyebrow">HOME AI · 厨房</div><h1 id="title" class="title">小K</h1><div id="message" class="message">正在读取 Gateway…</div><div id="content" class="content"></div><div id="nav" class="nav" style="display:none"></div></section></main>
+<nav id="globalBottomNav" class="global-bottom-nav" aria-label="主导航"><button type="button" data-global-nav="home"><span class="nav-icon">⌂</span>首页</button><button type="button" data-global-nav="today"><span class="nav-icon">▣</span>今日菜谱</button><button type="button" data-global-nav="shopping"><span class="nav-icon">🛒</span>采购清单</button><button type="button" data-global-nav="food"><span class="nav-icon">🥬</span>食材管理</button></nav>
+<div id="qaDock" class="qa-dock"><button id="qaBtn" type="button" class="qa-btn">🎙 问小K</button><div class="qa-copy"><div id="qaStatus" class="qa-status">可以问做法、替代食材、火候和补救办法</div><div id="qaTranscript" class="qa-transcript"></div><div id="qaAnswer" class="qa-answer"></div></div><button id="qaClear" class="qa-clear" aria-label="清除回答">×</button></div>
 <footer id="footer">KitchenTerminal __KITCHEN_UI_VERSION__ · 等待 Gateway</footer>
 </div>
-<div id="timerModal" class="modal"><div class="modal-card"><h2>设置计时</h2><div class="time-inputs"><input id="minInput" inputmode="numeric" pattern="[0-9]*" value="0"><span>:</span><input id="secInput" inputmode="numeric" pattern="[0-9]*" value="30"></div><div class="modal-actions"><button id="modalCancel">取消</button><button id="modalOK" class="primary">确定</button></div></div></div>
-<div id="helpModal" class="modal"><div class="modal-card"><h2>厨房终端操作指南</h2><ol class="help-list"><li><strong>开始做饭：</strong>在等待页点“加载今日菜单”，选择菜品进入步骤。</li><li><strong>按步骤操作：</strong>用“上一步 / 下一步”切换；需要返回总菜单时点“返回菜单”。</li><li><strong>计时：</strong>步骤里可以按建议时间计时；等待首页另有独立计时器，不加载菜单也能直接使用。独立计时结束后会持续响铃，直到你主动结束提醒。</li><li><strong>问逐光：</strong>点底部的大按钮开始说话，再点一次结束。可以问火候、替代食材、做法原因和翻车补救。</li><li><strong>语音播报：</strong>厨房 TTS 走 iPad 的系统媒体播放链。点顶部“播放设备”可选择 HomePod / AirPlay；未选择无线设备时由 iPad 当前系统输出播放。</li><li><strong>结束烹饪：</strong>回到今日菜单后点“结束今日烹饪”，可选择把喜欢的菜保存到私房菜。</li></ol><div class="help-note">顶部状态用于快速确认麦克风、厨房语音、AirPlay 播放目标和 Gateway 连接状态。麦克风录制仍使用独立采集链，不受语音输出设备切换影响。</div><div class="modal-actions" style="grid-template-columns:1fr"><button id="helpClose" class="primary">知道了</button></div></div></div>
+<div id="moreModal" class="modal"><div class="modal-card utility-card"><div class="utility-head"><div><h2>小K 设置</h2><div class="utility-sub">连接、声音与帮助</div></div><button id="moreClose" type="button" class="utility-close">×</button></div><div class="utility-status"><span id="micState" class="status-pill wait">🎙 麦克风 检测中</span><span id="audioState" class="status-pill wait">🔊 语音 待激活</span><span class="status-pill"><span id="statusText">连接中</span></span></div><div class="utility-actions"><button id="audioRouteBtn" type="button" class="help-btn audio-route-btn">🔊 播放设备</button><button id="helpBtn" class="help-btn">操作指南</button></div><div class="utility-version">__KITCHEN_UI_VERSION__</div></div></div>
+<div id="timerCenterModal" class="modal timer-center-modal"><div class="modal-card timer-center-card"><div class="timer-center-head"><div><h2>多计时器中心</h2><p>菜谱计时自动关联菜品和步骤</p></div><button id="timerCenterClose" type="button" class="standalone-timer-close" aria-label="关闭">×</button></div><div id="timerCenterHost"></div></div></div>
+<div id="standaloneTimerModal" class="modal"><div class="modal-card standalone-timer-card"><div class="standalone-timer-head"><h2>厨房计时</h2><button id="standaloneTimerClose" type="button" class="standalone-timer-close" aria-label="关闭">×</button></div><div id="idleTimerHost"></div></div></div>
+<div id="shoppingModal" class="modal"><div class="modal-card shopping-modal-card"><div class="shopping-modal-head"><div><h2>今日采购</h2><p>勾选后自动保存，关掉弹窗也不会丢。</p></div><button id="shoppingModalClose" type="button" class="shopping-modal-close" aria-label="关闭">×</button></div><div id="shoppingModalHost" class="shopping-modal-body"></div></div></div>
+<div id="timerModal" class="modal timer-editor-modal"><div class="modal-card"><h2>设置计时</h2><div class="time-inputs"><input id="minInput" inputmode="numeric" pattern="[0-9]*" value="0"><span>:</span><input id="secInput" inputmode="numeric" pattern="[0-9]*" value="30"></div><div class="modal-actions"><button id="modalCancel">取消</button><button id="modalOK" class="primary">确定</button></div></div></div>
+<div id="todayRemoveModal" class="modal"><div class="modal-card today-remove-confirm-card"><h2>从今日菜谱移除？</h2><p>只会从今天的 Obsidian 菜谱中移除，不会删除“私房菜”里的原始菜谱。</p><div id="todayRemoveName" class="today-remove-name"></div><div id="todayRemoveStatus" class="today-remove-status"></div><div class="today-remove-actions"><button id="todayRemoveCancel" type="button" class="today-remove-cancel">取消</button><button id="todayRemoveConfirm" type="button" class="today-remove-confirm">确认移除</button></div></div></div>
+<div id="helpModal" class="modal"><div class="modal-card"><h2>小K 操作指南</h2><ol class="help-list"><li><strong>开始备菜：</strong>先进入“今日菜谱”，点击“开始备菜”，把当天所有菜的备菜项目一次完成并逐项勾选。</li><li><strong>正式烹饪：</strong>统一备菜全部完成后，从“今日菜谱”进入具体菜品，系统会直接从正式烹饪第1步开始。</li><li><strong>计时：</strong>步骤里可以按建议时间计时；等待首页另有独立计时器，不加载菜单也能直接使用。独立计时结束后会持续响铃，直到你主动结束提醒。</li><li><strong>问小K：</strong>点底部的大按钮开始说话，再点一次结束。可以问火候、替代食材、做法原因和翻车补救。</li><li><strong>语音播报：</strong>厨房 TTS 走 iPad 的系统媒体播放链。点顶部“播放设备”可选择 HomePod / AirPlay；未选择无线设备时由 iPad 当前系统输出播放。</li><li><strong>结束烹饪：</strong>在厨房中台点“结束今日厨房”，先进入“今日食材结算”核对实际消耗，再选择是否把喜欢的菜保存到私房菜。</li></ol><div class="help-note">顶部状态用于快速确认麦克风、厨房语音、AirPlay 播放目标和 Gateway 连接状态。麦克风录制仍使用独立采集链，不受语音输出设备切换影响。</div><div class="modal-actions" style="grid-template-columns:1fr"><button id="helpClose" class="primary">知道了</button></div></div></div>
+<div id="foodModal" class="food-modal" aria-hidden="true"><div class="food-shell">
+  <div class="food-head"><div><div class="food-title">食材管理</div><div class="food-sub">默认 3 人 · 份 / 个 / 自然单位 / 状态管理</div></div><button id="foodCloseBtn" type="button" class="food-close">完成</button></div>
+  <div class="food-tabs"><button type="button" class="food-tab active" data-food-tab="home">概览</button><button type="button" class="food-tab food-tab-primary" data-food-tab="buy">＋ 买入食材</button><button type="button" class="food-tab food-tab-primary" data-food-tab="consume">− 记录消耗</button><button type="button" class="food-tab" data-food-tab="inventory">全部食材</button></div>
+
+  <section id="foodViewHome" class="food-view active">
+    <div class="food-card food-overview-card"><div class="food-section-head"><div><h3>当前状态</h3><div class="food-card-note">先看家里整体还有什么，再决定今天优先吃什么</div></div></div><div id="foodSummary" class="food-summary"></div></div>
+    <div class="food-card food-recommend-card" style="margin-top:14px"><div class="food-section-head"><div><h3>推荐食用顺序</h3><div class="food-card-note">按当前建议窗口和入库时间排序，先显示前 10 项</div></div><button id="foodShowAllBtn" type="button" class="food-inline-action">显示全部</button></div><div id="foodRecommendedList" class="food-list food-ranked-list"></div></div>
+    <button id="foodLogBtn" type="button" class="food-log-entry"><span class="food-log-entry-icon">≡</span><span><strong>食材日志</strong><small>按日期或具体食材查询买入、消耗和状态调整</small></span><b>›</b></button>
+  </section>
+
+  <section id="foodViewBuy" class="food-view">
+    <div class="food-grid">
+      <div class="food-card"><h3>这次在哪里买的？</h3><div class="food-card-note">先选来源，再直接拍订单 / 小票 / 食材。识别后确认一次即可入库。</div><div id="foodChannelGrid" class="food-channel-grid" style="margin-top:14px"><button type="button" class="food-channel active" data-source="菜市场">🥬<br>菜市场</button><button type="button" class="food-channel" data-source="网上APP">📱<br>网上APP</button><button type="button" class="food-channel" data-source="超市">🧾<br>超市</button></div><div id="foodChannelHint" class="food-note" style="margin-top:12px">菜市场：可以拍食材；网上APP：优先订单截图；超市：优先拍小票。</div><div class="food-scan-box"><div class="food-scan-title">📷 拍一下，自动入库</div><div class="food-scan-copy">支持订单截图、小票和一张照片里的多种食材。小K会尽量一次盘点全部项目，数量不准可直接修改后统一入库。</div><div class="food-scan-actions"><button id="foodScanBtn" type="button" class="food-scan-button">拍照 / 选择图片</button><button id="foodScanAddMissing" type="button" class="food-scan-button secondary">＋ 补一项</button><button id="foodScanClear" type="button" class="food-scan-button secondary" style="display:none">清空结果</button></div><input id="foodScanFile" class="food-scan-file" type="file" accept="image/*"><div id="foodScanStatus" class="food-scan-status">还没有选择图片</div><div id="foodScanResults" class="food-scan-results"></div><button id="foodScanCommit" type="button" class="food-primary food-scan-commit" style="display:none">全部确认入库</button></div></div>
+      <div class="food-card"><h3>加入食材</h3><form id="foodAddForm" class="food-form" style="margin-top:14px"><label class="food-label">食材名称<input id="foodAddName" class="food-input" autocomplete="off" placeholder="例如：排骨"></label><div class="food-form-grid"><label class="food-label">分类<select id="foodAddCategory" class="food-select"><option>肉类</option><option>海鲜</option><option>蔬菜</option><option>蛋类</option><option>奶制品</option><option>包装食品</option><option>主食</option><option>其他</option></select></label><label class="food-label">单位<select id="foodAddUnit" class="food-select"><option>份</option><option>个</option><option>盒</option><option>瓶</option><option>包</option><option>杯</option><option>块</option><option>根</option><option>颗</option></select></label></div><label class="food-label">数量<input id="foodAddAmount" class="food-input" inputmode="decimal" value="1"></label><button type="submit" class="food-primary">加入食材</button></form></div>
+    </div>
+  </section>
+
+  <section id="foodViewConsume" class="food-view">
+    <div class="food-grid">
+      <div class="food-card"><h3>记录消耗</h3><div class="food-card-note">以后菜单会自动预估扣减，这里保留最直接的人工入口</div><form id="foodConsumeForm" class="food-form" style="margin-top:14px"><label class="food-label">食材<select id="foodConsumeName" class="food-select"></select></label><label class="food-label">用了多少<input id="foodConsumeAmount" class="food-input" inputmode="decimal" value="1"></label><button type="submit" class="food-primary">记录这次消耗</button></form></div>
+      <div class="food-card"><h3>我们要观察什么？</h3><div class="food-note" style="margin-top:14px">先观察你做完饭后，愿不愿意顺手点一次。真正舒服后，再让“今日菜单 → 完成烹饪”自动生成消耗建议。</div></div>
+    </div>
+  </section>
+
+  <section id="foodViewInventory" class="food-view">
+    <div class="food-card food-inventory-browser">
+      <div class="food-section-head"><div><h3>全部食材</h3><div class="food-card-note">查询、筛选和分页查看家里当前所有剩余食材</div></div><div id="foodInventoryCount" class="food-inventory-count"></div></div>
+      <div class="food-inventory-toolbar">
+        <div class="food-inventory-filter-row">
+          <label class="food-label food-inventory-search">查询食材<input id="foodInventorySearch" class="food-input" autocomplete="off" placeholder="输入食材名称、来源或存放位置"></label>
+          <label class="food-label">分类<select id="foodInventoryCategory" class="food-select"><option value="">全部分类</option><option>肉类</option><option>海鲜</option><option>蔬菜</option><option>蛋类</option><option>奶制品</option><option>包装食品</option><option>主食</option><option>佐料/粮油</option><option>其他</option></select></label>
+          <label class="food-label food-inventory-date">入库日期<input id="foodInventoryIntakeDate" class="food-input" type="date" aria-label="按最近入库日期筛选"></label>
+        </div>
+        <div class="food-inventory-sort-row">
+          <label class="food-label">排序<select id="foodInventorySort" class="food-select"><option value="priority">推荐食用顺序</option><option value="intake">最近入库</option><option value="updated">最近更新</option><option value="category">按分类</option><option value="name">按名称</option></select></label>
+          <label class="food-label">每页<select id="foodInventoryPageSize" class="food-select"><option value="10">10 项</option><option value="20">20 项</option><option value="30">30 项</option></select></label>
+        </div>
+      </div>
+      <div class="food-inventory-table-head"><span>食材</span><span>剩余</span><span>建议 / 状态</span><span>最近更新</span></div>
+      <div id="foodInventoryList" class="food-inventory-list"></div>
+      <div class="food-pagination"><button id="foodInventoryPrev" type="button">上一页</button><span id="foodInventoryPageInfo">第 1 / 1 页</span><button id="foodInventoryNext" type="button">下一页</button></div>
+    </div>
+    <div class="food-card food-status-compact" style="margin-top:14px"><div class="food-section-head"><div><h3>佐料 / 粮油状态</h3><div class="food-card-note">这类食材只维护“充足 / 一般 / 快没了”</div></div></div><form id="foodStatusForm" class="food-status-inline"><label class="food-label">名称<input id="foodStatusName" class="food-input" autocomplete="off" placeholder="例如：料酒"></label><label class="food-label">状态<select id="foodStatusValue" class="food-select"><option>充足</option><option>一般</option><option>快没了</option></select></label><button type="submit" class="food-primary">更新状态</button></form></div>
+  </section>
+
+  <section id="foodViewLog" class="food-view">
+    <div class="food-card food-log-card">
+      <div class="food-section-head"><div><h3>食材日志</h3><div class="food-card-note">可以按日期和具体食材筛选买入、消耗和状态变化</div></div><button id="foodLogBack" type="button" class="food-inline-action">返回概览</button></div>
+      <div class="food-log-filter-stack"><div class="food-log-filter-row"><label class="food-label">日期<input id="foodLogDate" class="food-input" type="date"></label></div><div class="food-log-filter-row"><label class="food-label">食材查询<input id="foodLogName" class="food-input" autocomplete="off" placeholder="例如：鸡蛋 / 排骨"></label></div></div>
+      <div class="food-log-filter-actions"><button id="foodLogClear" type="button" class="food-secondary">清除筛选</button></div>
+      <div id="foodLogCount" class="food-log-count"></div>
+      <div id="foodLogList" class="food-list"></div>
+    </div>
+  </section>
+</div></div>
+<div id="foodEditModal" class="modal food-edit-modal"><div class="modal-card food-edit-card"><h2>编辑食材</h2><div class="food-edit-sub">可以修正识别错误的名称，也可以直接盘点当前实际库存。</div><div class="food-edit-fields"><label class="food-label">食材名称<input id="foodEditName" class="food-input" autocomplete="off"></label><div id="foodEditQuantityRow" class="food-edit-quantity-row"><label class="food-label">当前库存数量<input id="foodEditQuantity" class="food-input" type="number" inputmode="decimal" min="0"></label><div id="foodEditUnit" class="food-edit-unit"></div></div></div><div id="foodEditNote" class="food-edit-note">数量修改属于库存盘点，不会记成烹饪消耗。坏掉、丢弃或之前登记错了，都可以直接改成实际剩余数量。</div><div class="modal-actions"><button id="foodEditCancel" type="button">取消</button><button id="foodEditSave" type="button" class="primary">保存修改</button></div></div></div>
+<div id="foodToast" class="food-toast" aria-live="polite"></div>
 <audio id="kitchenPlayer" preload="auto" playsinline x-webkit-airplay="allow" aria-hidden="true" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none;left:-9999px;top:-9999px"></audio>
 <script>
 (function(){
@@ -6853,7 +8263,7 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
   function setStatus(){var ok=httpOK||wsOK;$('dot').className='dot'+(ok?' online':'');$('statusText').textContent=wsOK?'实时连接':(httpOK?'已连接':'正在重连');}
   function clearView(){$('content').innerHTML='';$('nav').innerHTML='';$('nav').style.display='none';$('nav').style.gridTemplateColumns='1fr 1fr 1fr';}
   function el(tag,cls,text){var x=document.createElement(tag);if(cls)x.className=cls;if(text!==undefined&&text!==null)x.textContent=String(text);return x;}
-  function xhrGet(url,cb){var x=new XMLHttpRequest();x.open('GET',url+(url.indexOf('?')>=0?'&':'?')+'_='+Date.now(),true);x.onreadystatechange=function(){if(x.readyState!==4)return;if(x.status>=200&&x.status<300){httpOK=true;setStatus();cb(null,x.responseText);}else{httpOK=false;setStatus();cb(new Error('HTTP '+x.status),'');}};x.onerror=function(){httpOK=false;setStatus();cb(new Error('network'),'');};x.send(null);}
+  function xhrGet(url,cb){var x=new XMLHttpRequest();x.open('GET',url+(url.indexOf('?')>=0?'&':'?')+'_='+Date.now(),true);x.onreadystatechange=function(){if(x.readyState!==4)return;if(x.status>=200&&x.status<300){httpOK=true;setStatus();cb(null,x.responseText);}else{httpOK=false;setStatus();cb(new Error('HTTP '+x.status),x.responseText||'');}};x.onerror=function(){httpOK=false;setStatus();cb(new Error('network'),'');};x.send(null);}
   function showError(text){$('message').textContent=text;$('footer').textContent='KitchenTerminal __KITCHEN_UI_VERSION__ · 页面错误';}
   function micStatusState(){var b=$('micState');if(!b)return;var secure=!!window.isSecureContext,gum=!!(navigator.mediaDevices&&navigator.mediaDevices.getUserMedia);if(secure&&gum){b.textContent='🎙 麦克风 已就绪';b.className='status-pill ready';}else{b.textContent='🎙 麦克风 不可用';b.className='status-pill bad';}}
   var audioPrimeSrc='data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
@@ -6868,55 +8278,302 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
   $('audioRouteBtn').addEventListener('click',pickAudioOutput,false);
   function openHelp(){$('helpModal').className='modal show';}
   function closeHelp(){$('helpModal').className='modal';}
-  $('helpBtn').onclick=openHelp;$('helpClose').onclick=closeHelp;
-  function qaStateLabel(st){var m={idle:'可以提问',listening:'正在听…',uploading:'正在发送…',recognizing:'正在识别…',thinking:'正在回答…',speaking:'正在生成语音…',done:'回答完成',error:'出现问题'};return m[st]||'问逐光';}
-  function qaRender(q){if(!q)return;var st=String(q.status||'idle'),updated=Number(q.updated_at||0),age=updated?((Date.now()/1000)-updated):0;var serverBusy=(st==='uploading'||st==='recognizing'||st==='thinking'||st==='speaking');if(serverBusy&&age>180){serverBusy=false;st='error';q.error='上一条问答状态已超时，已经自动解锁，可以重新提问。';qaBusy=false;}else{qaBusy=serverBusy;}if(!qaRecording){$('qaBtn').disabled=false;$('qaBtn').className='qa-btn'+(qaBusy?' busy':'');$('qaBtn').textContent=qaBusy?'处理中…':'🎙 问逐光';}$('qaStatus').textContent=qaRecording?'正在听…再次点击结束':qaStateLabel(st);$('qaTranscript').textContent=q.transcript?('你：'+q.transcript):'';$('qaAnswer').textContent=q.answer?('逐光：'+q.answer):(st==='error'?(q.error||'语音问答失败'):'');}
+  function openMore(){$('moreModal').className='modal show';}
+  function closeMore(){$('moreModal').className='modal';}
+  $('helpBtn').onclick=function(){closeMore();openHelp();};$('helpClose').onclick=closeHelp;$('moreBtn').onclick=openMore;$('moreClose').onclick=closeMore;
+
+  /* Home Food A0.1: Gateway-owned SQLite data, deliberately simple iPad flow. */
+  var foodState={items:[],priority:[],needs_attention:[],events:[],default_people:3},foodSource='菜市场',foodToastTimer=null,foodScanSocket=null,foodScanItems=[],foodScanBusy=false;var foodInventoryPage=1,foodInventoryPageSize=10;
+  function foodToast(text){var n=$('foodToast');if(!n)return;n.textContent=String(text||'');n.className='food-toast show';if(foodToastTimer)clearTimeout(foodToastTimer);foodToastTimer=setTimeout(function(){n.className='food-toast';},2200);}
+  function foodXHR(url,cb){var x=new XMLHttpRequest(),settled=false;function finish(err,data){if(settled)return;settled=true;cb(err,data);}x.open('GET',url+(url.indexOf('?')>=0?'&':'?')+'_='+Date.now(),true);x.timeout=12000;x.onreadystatechange=function(){if(x.readyState!==4)return;var data=null;try{data=JSON.parse(x.responseText||'{}');}catch(e){}if(x.status>=200&&x.status<300&&data&&data.ok!==false){finish(null,data);}else{finish(new Error((data&&data.error)||('HTTP '+x.status)),data);}};x.onerror=function(){finish(new Error('network'));};x.ontimeout=function(){finish(new Error('保存超时，请重试'));};x.send(null);}
+  function foodAction(name,params,done){var u='/kitchen/food/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!=='')u+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}foodXHR(u,function(err,data){if(err){foodToast('没有保存：'+err.message);if(done)done(err);return;}foodState=data;if(done)done(null,data);try{renderFood();}catch(e){try{console.error('[FOOD-RENDER]',e);}catch(_e){}setTimeout(loadFood,80);}});}
+  function loadFood(){foodXHR('/kitchen/food/view',function(err,data){if(err){foodToast('食材数据读取失败');return;}foodState=data;renderFood();});}
+  function openFood(tab){$('foodModal').className='food-modal show';$('foodModal').setAttribute('aria-hidden','false');updateGlobalNav('food');foodSwitch(tab||'home');loadFood();}
+  function closeFood(){$('foodModal').className='food-modal';$('foodModal').setAttribute('aria-hidden','true');updateGlobalNav(navActiveForView(currentView));}
+  function foodSwitch(tab){var tabs=document.querySelectorAll('.food-tab'),views=document.querySelectorAll('.food-view'),i;for(i=0;i<tabs.length;i++)tabs[i].className='food-tab'+(tabs[i].getAttribute('data-food-tab')===tab?' active':'')+(tabs[i].classList.contains('food-tab-primary')?' food-tab-primary':'');for(i=0;i<views.length;i++)views[i].className='food-view'+(views[i].id==='foodView'+tab.charAt(0).toUpperCase()+tab.slice(1)?' active':'');if(tab==='consume')renderFoodConsume();if(tab==='inventory'){foodInventoryPage=1;renderFoodInventory();}if(tab==='log')renderFoodLog();}
+  $('foodOpenBtn').onclick=function(){openFood('home');};$('foodCloseBtn').onclick=closeFood;
+  (function(){var tabs=document.querySelectorAll('.food-tab'),i;for(i=0;i<tabs.length;i++)tabs[i].onclick=function(){foodSwitch(this.getAttribute('data-food-tab'));};})();
+  function foodUnitText(item){if(item.unit==='状态')return item.status||'一般';return String(item.quantity)+' '+item.unit;}
+  function foodEmpty(host,text){host.innerHTML='';host.appendChild(el('div','food-empty',text));}
+  function foodRow(item,extra){var row=el('div','food-row'),main=el('div','food-row-main');main.appendChild(el('div','food-row-name',item.name));var meta=[item.category];if(item.source)meta.push(item.source);if(extra)meta.push(extra);main.appendChild(el('div','food-row-meta',meta.join(' · ')));row.appendChild(main);row.appendChild(el('div','food-row-value',foodUnitText(item)));return row;}
+  function foodScanSetStatus(text,busy){var n=$('foodScanStatus');if(!n)return;n.textContent=text||'';n.className='food-scan-status'+(busy?' busy':'');}
+  function foodScanReset(){foodScanItems=[];var h=$('foodScanResults');if(h)h.innerHTML='';if($('foodScanCommit'))$('foodScanCommit').style.display='none';if($('foodScanClear'))$('foodScanClear').style.display='none';foodScanSetStatus('还没有选择图片',false);}
+  function foodScanAddMissing(){foodScanItems.push({name:'',category:'其他',mode:'quantity',amount:1,unit:'份',status:'',raw:'手动补充',confidence:1});renderFoodScanResults();foodScanSetStatus('已补一项，请填写名称和数量',false);var inputs=document.querySelectorAll('.food-scan-name');if(inputs.length){var n=inputs[inputs.length-1];try{n.focus();}catch(e){}}}
+  function foodScanCategorySelect(value){var sel=document.createElement('select');sel.className='food-select food-scan-category';var opts=['肉类','海鲜','蔬菜','蛋类','奶制品','包装食品','主食','佐料/粮油','其他'];for(var i=0;i<opts.length;i++){var o=document.createElement('option');o.value=opts[i];o.textContent=opts[i];if(opts[i]===value)o.selected=true;sel.appendChild(o);}return sel;}
+  function foodScanUnitSelect(value,statusMode){var sel=document.createElement('select');sel.className='food-select food-scan-unit';var opts=statusMode?['状态']:['份','个','盒','瓶','包','杯','块','根','颗','袋'];for(var i=0;i<opts.length;i++){var o=document.createElement('option');o.value=opts[i];o.textContent=opts[i];if(opts[i]===value)o.selected=true;sel.appendChild(o);}return sel;}
+  function renderFoodScanResults(){var host=$('foodScanResults');if(!host)return;host.innerHTML='';for(var i=0;i<foodScanItems.length;i++){(function(idx,item){var row=el('div','food-scan-row'),head=el('div','food-scan-row-head'),name=document.createElement('input');name.className='food-scan-name';name.value=item.name||'';name.setAttribute('aria-label','食材名称');name.oninput=function(){item.name=this.value;};head.appendChild(name);var rm=el('button','food-scan-remove','×');rm.type='button';rm.onclick=function(){foodScanItems.splice(idx,1);renderFoodScanResults();};head.appendChild(rm);row.appendChild(head);var fields=el('div','food-scan-fields'),cat=foodScanCategorySelect(item.category||'其他');cat.onchange=function(){item.category=this.value;if(this.value==='佐料/粮油'){item.mode='status';item.unit='状态';item.status='充足';}renderFoodScanResults();};fields.appendChild(cat);if(item.mode==='status'||item.unit==='状态'){var st=document.createElement('select');st.className='food-select';['充足','一般','快没了'].forEach(function(v){var o=document.createElement('option');o.value=v;o.textContent=v;if(v===(item.status||'充足'))o.selected=true;st.appendChild(o);});st.onchange=function(){item.status=this.value;};fields.appendChild(st);fields.appendChild(foodScanUnitSelect('状态',true));}else{var amount=document.createElement('input');amount.className='food-input';amount.type='number';amount.min='0.25';amount.step='0.25';amount.value=String(item.amount||1);amount.oninput=function(){item.amount=parseFloat(this.value)||1;};fields.appendChild(amount);var unit=foodScanUnitSelect(item.unit||'份',false);unit.onchange=function(){item.unit=this.value;};fields.appendChild(unit);}row.appendChild(fields);if(item.raw)row.appendChild(el('div','food-scan-raw','识别自：'+item.raw));host.appendChild(row);})(i,foodScanItems[i]);}var has=foodScanItems.length>0;$('foodScanCommit').style.display=has?'block':'none';$('foodScanClear').style.display=has?'inline-block':'none';if(!has&&!foodScanBusy)foodScanSetStatus('没有待确认项目',false);}
+  function foodScanReadBlob(blob,ok,fail){var r=new FileReader();r.onerror=function(){if(fail)fail();};r.onload=function(){ok(r.result);};r.readAsArrayBuffer(blob);}
+  function foodScanPrepare(file,ok,fail){var passthrough=function(){foodScanReadBlob(file,function(buf){ok(buf,file.type||'image/jpeg',false);},fail);};if(file.size<=1600*1024){passthrough();return;}var fr=new FileReader();fr.onerror=passthrough;fr.onload=function(){var img=new Image();img.onerror=passthrough;img.onload=function(){try{var textSource=(foodSource==='网上APP'||foodSource==='超市'),maxW=textSource?1800:2200,maxH=textSource?10000:2200,w=img.naturalWidth||img.width,h=img.naturalHeight||img.height,scale=Math.min(1,maxW/Math.max(w,1),maxH/Math.max(h,1)),cw=Math.max(1,Math.round(w*scale)),ch=Math.max(1,Math.round(h*scale)),canvas=document.createElement('canvas');canvas.width=cw;canvas.height=ch;var ctx=canvas.getContext('2d');if(!ctx){passthrough();return;}ctx.fillStyle='#fff';ctx.fillRect(0,0,cw,ch);ctx.drawImage(img,0,0,cw,ch);canvas.toBlob(function(blob){if(!blob){passthrough();return;}foodScanReadBlob(blob,function(buf){ok(buf,'image/jpeg',true);},passthrough);},'image/jpeg',textSource?0.92:0.88);}catch(e){passthrough();}};img.src=fr.result;};fr.readAsDataURL(file);}
+  function foodScanSendChunks(sock,buf,rid,onDone,onFail){var total=buf.byteLength||0,offset=0,chunkSize=256*1024,maxBuffered=768*1024,lastPct=-1,stopped=false;function fail(msg){if(stopped)return;stopped=true;if(onFail)onFail(msg||'发送图片失败');}function pump(){if(stopped)return;if(!sock||sock.readyState!==WebSocket.OPEN){fail('识别连接中断，请重试');return;}try{while(offset<total&&sock.bufferedAmount<maxBuffered){var end=Math.min(offset+chunkSize,total);sock.send(buf.slice(offset,end));offset=end;}var pct=total?Math.min(100,Math.floor(offset*100/total)):100;if(pct!==lastPct){lastPct=pct;foodScanSetStatus('正在上传图片… '+pct+'%',true);}if(offset>=total){if(sock.bufferedAmount>64*1024){setTimeout(pump,18);return;}sock.send(JSON.stringify({type:'kitchen.food.scan.stop',request_id:rid}));stopped=true;foodScanSetStatus('图片上传完成，正在识别…',true);if(onDone)onDone();return;}setTimeout(pump,12);}catch(e){fail('发送图片失败，请重试');}}pump();}
+  function startFoodScan(file){if(!file||foodScanBusy)return;if(!/^image\//.test(file.type||'')){foodToast('请选择图片文件');return;}if(file.size>12*1024*1024){foodToast('图片太大，请选择 12MB 以内的图片');return;}foodScanBusy=true;foodScanItems=[];renderFoodScanResults();foodScanSetStatus('正在准备图片…',true);$('foodScanBtn').disabled=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='fs-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);foodScanPrepare(file,function(buf,mime,compressed){try{foodScanSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');foodScanSocket.binaryType='arraybuffer';}catch(e){foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus('无法建立识别连接',false);return;}var finished=false,uploading=true;foodScanSocket.onopen=function(){try{foodScanSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,food_scan:true}}));foodScanSocket.send(JSON.stringify({type:'kitchen.food.scan.start',request_id:rid,source:foodSource,mime:mime,total_bytes:buf.byteLength,chunked:true,compressed:!!compressed}));foodScanSendChunks(foodScanSocket,buf,rid,function(){uploading=false;},function(msg){uploading=false;foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus(msg||'发送图片失败，请重试',false);try{foodScanSocket.close();}catch(e){}});}catch(e){uploading=false;foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus('发送图片失败，请重试',false);}};foodScanSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.type==='kitchen.food.scan.state'&&!uploading)foodScanSetStatus(m.message||'正在识别…',true);if(m.type==='kitchen.food.scan.result'){finished=true;foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanItems=m.items||[];renderFoodScanResults();var emptyMsg=(m.note==='VISION_UNAVAILABLE')?'图片已上传，但当前视觉模型不可用；订单截图会优先尝试本机文字识别，请查看 Gateway 的 FOOD-OCR 日志':'没有识别到明确食材，可以换一张更清楚的图';foodScanSetStatus(foodScanItems.length?('识别到 '+foodScanItems.length+' 项，请确认后入库'):emptyMsg,false);try{foodScanSocket.close();}catch(e){}}if(m.type==='kitchen.food.scan.error'){finished=true;foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus('识别失败：'+(m.message||'请重试'),false);try{foodScanSocket.close();}catch(e){}}}catch(e){}};foodScanSocket.onerror=function(){if(!finished&&!uploading)foodScanSetStatus('识别连接出现问题，请重试',false);};foodScanSocket.onclose=function(){foodScanSocket=null;if(!finished){foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus('识别连接中断，请重试',false);}};},function(){foodScanBusy=false;$('foodScanBtn').disabled=false;foodScanSetStatus('图片读取失败，请重试',false);});}
+  function commitFoodScan(){if(!foodScanItems.length)return;var rows=foodScanItems.slice(),index=0,saved=0,failed=[];$('foodScanCommit').disabled=true;foodScanSetStatus('正在写入库存…',true);function next(){if(index>=rows.length){$('foodScanCommit').disabled=false;foodScanBusy=false;if(failed.length){foodScanSetStatus('已入库 '+saved+' 项，'+failed.length+' 项失败：'+failed.join('、'),false);}else{foodScanSetStatus('已完成入库 '+saved+' 项',false);foodToast('已入库 '+saved+' 项食材');foodScanItems=[];renderFoodScanResults();}loadFood();return;}var item=rows[index++],name=String(item.name||'').trim();if(!name){failed.push('空名称');next();return;}if(item.mode==='status'||item.unit==='状态'){foodAction('status',{name:name,status:item.status||'充足',category:item.category||'佐料/粮油'},function(err){if(err)failed.push(name);else saved++;next();});}else{foodAction('add',{name:name,amount:item.amount||1,unit:item.unit||'份',category:item.category||'其他',source:foodSource},function(err){if(err)failed.push(name);else saved++;next();});}}next();}
+  function renderFood(){renderFoodHome();renderFoodInventory();renderFoodConsume();renderFoodLog();}
+  function renderFoodHome(){var items=foodState.items||[],recommended=foodState.recommended||[],att=foodState.needs_attention||[],host,i;
+    var meatTypes=0,meatPortions=0,vegTypes=0,eggCount=0,packaged=0,needCount=att.length;for(i=0;i<items.length;i++){var it=items[i];if(it.unit==='状态')continue;if(it.category==='肉类'||it.category==='海鲜'){meatTypes++;if(it.unit==='份')meatPortions+=Number(it.quantity||0);}if(it.category==='蔬菜')vegTypes++;if(it.category==='蛋类'&&it.unit==='个')eggCount+=Number(it.quantity||0);if(it.category==='奶制品'||it.category==='包装食品')packaged++;}
+    var stats=[['肉 / 海鲜',meatPortions?String(meatPortions)+'份':String(meatTypes)+'种'],['蔬菜',String(vegTypes)+'种'],['鸡蛋',String(eggCount)+'个'],['待补状态',String(needCount)+'项']];host=$('foodSummary');host.innerHTML='';for(i=0;i<stats.length;i++){var st=el('div','food-stat');st.appendChild(el('span','',stats[i][0]));st.appendChild(el('strong','',stats[i][1]));host.appendChild(st);}
+    host=$('foodRecommendedList');host.innerHTML='';if(!recommended.length){foodEmpty(host,'目前还没有可排序的食材。');}else{for(i=0;i<Math.min(recommended.length,10);i++){var item=recommended[i],r=el('div','food-row food-ranked-row'),rank=el('span','food-rank',String(i+1)),m=el('div','food-row-main');m.appendChild(el('div','food-row-name',item.name));m.appendChild(el('div','food-row-meta',foodUnitText(item)+' · '+(item.category||'食材')));r.appendChild(rank);r.appendChild(m);var tag=item.priority_window||'暂不着急';r.appendChild(el('div','food-row-value food-recommend-tag',tag));host.appendChild(r);}}
+    renderModernFoodBits();
+  }
+  function renderFoodLog(){var host=$('foodLogList');if(!host)return;var events=foodState.events||[],dateEl=$('foodLogDate'),nameEl=$('foodLogName'),date=(dateEl?dateEl.value:'').trim(),q=(nameEl?nameEl.value:'').trim().toLowerCase(),shown=[];for(var i=0;i<events.length;i++){var ev=events[i],created=String(ev.created_at||''),name=String(ev.name||'');if(date&&created.slice(0,10)!==date)continue;if(q&&name.toLowerCase().indexOf(q)<0)continue;shown.push(ev);}var count=$('foodLogCount');if(count)count.textContent='共 '+shown.length+' 条记录';host.innerHTML='';if(!shown.length){foodEmpty(host,'没有符合当前筛选条件的记录。');return;}for(var j=0;j<shown.length;j++){var e=shown[j],label=e.event_type==='add'?'买入':(e.event_type==='consume'?'消耗':(e.event_type==='status'?'状态':(e.event_type==='rename'?'改名':'调整'))),val='';if(e.event_type==='add')val='+'+e.amount+' '+e.unit;if(e.event_type==='consume')val='−'+e.amount+' '+e.unit;if(e.event_type==='status'||e.event_type==='priority'||e.event_type==='rename'||e.event_type==='adjust')val=e.note||'';var row=el('div','food-row'),main=el('div','food-row-main');main.appendChild(el('div','food-row-name food-event-'+e.event_type,label+' · '+e.name));main.appendChild(el('div','food-row-meta',String(e.created_at||'').replace('T',' ').slice(0,16)+(e.source?' · '+e.source:'')));row.appendChild(main);row.appendChild(el('div','food-row-value',val));host.appendChild(row);}}
+  var foodEditItem=null;
+  function closeFoodEdit(){foodEditItem=null;if($('foodEditModal'))$('foodEditModal').className='modal food-edit-modal';}
+  function openFoodEdit(item,focusQty){foodEditItem=item;if(!$('foodEditModal'))return;$('foodEditName').value=String(item.name||'');var qtyRow=$('foodEditQuantityRow'),qty=$('foodEditQuantity'),unit=$('foodEditUnit'),note=$('foodEditNote');if(item.unit==='状态'){qtyRow.style.display='none';note.textContent='这类食材使用“充足 / 一般 / 快没了”状态管理，这里只修改名称。';}else{qtyRow.style.display='grid';qty.value=String(item.quantity==null?0:item.quantity);qty.step=item.unit==='份'?'0.5':'1';unit.textContent=item.unit||'';note.textContent='数量修改属于库存盘点，不会记成烹饪消耗。坏掉、丢弃或登记错误，都可以直接改成实际剩余数量。';}$('foodEditModal').className='modal food-edit-modal show';setTimeout(function(){try{(focusQty&&item.unit!=='状态'?qty:$('foodEditName')).focus();}catch(e){}},80);}
+  function saveFoodEdit(){if(!foodEditItem)return;var oldName=String(foodEditItem.name||''),newName=String($('foodEditName').value||'').trim();if(!newName){foodToast('名称不能为空');return;}var params={name:oldName,new_name:newName};if(foodEditItem.id!==undefined&&foodEditItem.id!==null)params.item_id=foodEditItem.id;if(foodEditItem.unit!=='状态'){var q=parseFloat($('foodEditQuantity').value);if(!isFinite(q)||q<0){foodToast('请输入正确的库存数量');return;}params.quantity=q;}var btn=$('foodEditSave'),note=$('foodEditNote'),oldText=btn.textContent;btn.disabled=true;btn.textContent='保存中…';if(note)note.textContent='正在写入库存并校验…';foodAction('edit',params,function(err,data){btn.disabled=false;btn.textContent=oldText;if(err){if(note)note.textContent='保存失败：'+err.message;return;}var edited=data&&data.edited;if(!edited||String(edited.name||'')!==newName){if(note)note.textContent='保存校验失败：Gateway 返回的数据没有发生变化，请重试。';return;}foodEditItem=edited;closeFoodEdit();foodToast('已保存：'+newName);foodInventoryPage=1;loadFood();});}
+  if($('foodEditCancel'))$('foodEditCancel').onclick=closeFoodEdit;if($('foodEditSave'))$('foodEditSave').onclick=saveFoodEdit;if($('foodEditModal'))$('foodEditModal').onclick=function(ev){if(ev.target===this)closeFoodEdit();};
+  function foodInventoryPriorityRank(v){var m={'这两天':0,'本周':1,'暂不着急':2};return Object.prototype.hasOwnProperty.call(m,v)?m[v]:3;}
+  function foodInventoryUpdatedText(v){var t=String(v||'').replace('T',' ');return t?t.slice(5,16):'—';}
+  function renderFoodInventory(){
+    var all=(foodState.items||[]).slice(),host=$('foodInventoryList');if(!host)return;
+    var searchEl=$('foodInventorySearch'),catEl=$('foodInventoryCategory'),dateEl=$('foodInventoryIntakeDate'),sortEl=$('foodInventorySort'),sizeEl=$('foodInventoryPageSize');
+    var q=(searchEl?searchEl.value:'').trim().toLowerCase(),cat=(catEl?catEl.value:''),intakeDate=(dateEl?dateEl.value:''),sort=(sortEl?sortEl.value:'priority');
+    foodInventoryPageSize=Math.max(5,parseInt(sizeEl?sizeEl.value:'10',10)||10);
+    var items=all.filter(function(it){if(cat&&String(it.category||'')!==cat)return false;if(intakeDate&&String(it.last_added_at||'').slice(0,10)!==intakeDate)return false;if(!q)return true;var hay=[it.name,it.category,it.source,it.storage,it.status,it.priority_window,it.last_added_at].join(' ').toLowerCase();return hay.indexOf(q)>=0;});
+    items.sort(function(a,b){
+      if(sort==='intake')return String(b.last_added_at||'').localeCompare(String(a.last_added_at||''))||String(a.name||'').localeCompare(String(b.name||''));
+      if(sort==='updated')return String(b.updated_at||'').localeCompare(String(a.updated_at||''));
+      if(sort==='category')return (String(a.category||'').localeCompare(String(b.category||''))||String(a.name||'').localeCompare(String(b.name||'')));
+      if(sort==='name')return String(a.name||'').localeCompare(String(b.name||''));
+      var ra=a.unit==='状态'?4:foodInventoryPriorityRank(String(a.priority_window||'暂不着急')),rb=b.unit==='状态'?4:foodInventoryPriorityRank(String(b.priority_window||'暂不着急'));
+      return ra-rb||String(a.updated_at||'').localeCompare(String(b.updated_at||''))||String(a.name||'').localeCompare(String(b.name||''));
+    });
+    var pages=Math.max(1,Math.ceil(items.length/foodInventoryPageSize));foodInventoryPage=Math.min(Math.max(1,foodInventoryPage),pages);
+    var start=(foodInventoryPage-1)*foodInventoryPageSize,end=Math.min(items.length,start+foodInventoryPageSize),pageItems=items.slice(start,end);
+    if($('foodInventoryCount'))$('foodInventoryCount').textContent=items.length?('显示 '+(start+1)+'–'+end+' / 共 '+items.length+' 项'):'共 0 项';
+    if($('foodInventoryPageInfo'))$('foodInventoryPageInfo').textContent='第 '+foodInventoryPage+' / '+pages+' 页';
+    if($('foodInventoryPrev'))$('foodInventoryPrev').disabled=foodInventoryPage<=1;
+    if($('foodInventoryNext'))$('foodInventoryNext').disabled=foodInventoryPage>=pages;
+    host.innerHTML='';if(!pageItems.length){foodEmpty(host,q||cat||intakeDate?'没有符合查询条件的食材。':'还没有食材。去“买入食材”加入第一项。');return;}
+    for(var i=0;i<pageItems.length;i++){(function(item){
+      var row=el('div','food-inventory-row'),main=el('div','food-inventory-main'),nameLine=el('div','food-inventory-name-line');nameLine.appendChild(el('strong','',item.name));var renameBtn=el('button','food-inventory-rename','编辑');renameBtn.type='button';renameBtn.onclick=function(){openFoodEdit(item,false);};nameLine.appendChild(renameBtn);main.appendChild(nameLine);
+      var meta=[item.category||'食材'];if(item.source)meta.push('来源 '+item.source);if(item.storage)meta.push(item.storage);if(item.last_added_at)meta.push('入库 '+foodInventoryUpdatedText(item.last_added_at));main.appendChild(el('small','',meta.join(' · ')));row.appendChild(main);
+      row.appendChild(el('div','food-inventory-qty',foodUnitText(item)));
+      var state=el('div','food-inventory-state');if(item.unit==='状态'){state.appendChild(el('span','food-inventory-badge status-'+(item.status==='快没了'?'low':(item.status==='一般'?'mid':'ok')),item.status||'一般'));}else{
+        var sel=document.createElement('select');sel.className='food-select food-inventory-priority';var opts=['这两天','本周','暂不着急'];for(var j=0;j<opts.length;j++){var o=document.createElement('option');o.value=opts[j];o.textContent=opts[j];if(opts[j]===item.priority_window)o.selected=true;sel.appendChild(o);}sel.onchange=function(){foodAction('priority',{name:item.name,priority:this.value},function(err){if(!err)foodToast(item.name+'：已调整推荐顺序');});};state.appendChild(sel);
+      }row.appendChild(state);row.appendChild(el('div','food-inventory-updated',foodInventoryUpdatedText(item.updated_at)));host.appendChild(row);
+    })(pageItems[i]);}
+  }
+  function renderFoodConsume(){var sel=$('foodConsumeName'),items=foodState.items||[],old=sel.value,i;sel.innerHTML='';for(i=0;i<items.length;i++){var it=items[i];if(it.unit==='状态')continue;var o=document.createElement('option');o.value=it.name;o.textContent=it.name+' · '+foodUnitText(it);sel.appendChild(o);}if(old)sel.value=old;var has=sel.options.length>0;$('foodConsumeAmount').disabled=!has;var submit=$('foodConsumeForm').querySelector('button[type="submit"]');if(submit)submit.disabled=!has;if(!has){var o2=document.createElement('option');o2.textContent='暂无可消耗食材';o2.value='';sel.appendChild(o2);sel.disabled=true;}else sel.disabled=false;}
+  if($('foodShowAllBtn'))$('foodShowAllBtn').onclick=function(){foodSwitch('inventory');};
+  if($('foodInventorySearch'))$('foodInventorySearch').oninput=function(){foodInventoryPage=1;renderFoodInventory();};
+  if($('foodInventoryCategory'))$('foodInventoryCategory').onchange=function(){foodInventoryPage=1;renderFoodInventory();};
+  if($('foodInventoryIntakeDate'))$('foodInventoryIntakeDate').onchange=function(){foodInventoryPage=1;renderFoodInventory();};
+  if($('foodInventorySort'))$('foodInventorySort').onchange=function(){foodInventoryPage=1;renderFoodInventory();};
+  if($('foodInventoryPageSize'))$('foodInventoryPageSize').onchange=function(){foodInventoryPage=1;renderFoodInventory();};
+  if($('foodInventoryPrev'))$('foodInventoryPrev').onclick=function(){if(foodInventoryPage>1){foodInventoryPage--;renderFoodInventory();}};
+  if($('foodInventoryNext'))$('foodInventoryNext').onclick=function(){foodInventoryPage++;renderFoodInventory();};
+  if($('foodLogBtn'))$('foodLogBtn').onclick=function(){foodSwitch('log');};
+  if($('foodLogBack'))$('foodLogBack').onclick=function(){foodSwitch('home');};
+  if($('foodLogDate'))$('foodLogDate').onchange=renderFoodLog;
+  if($('foodLogName'))$('foodLogName').oninput=renderFoodLog;
+  if($('foodLogClear'))$('foodLogClear').onclick=function(){$('foodLogDate').value='';$('foodLogName').value='';renderFoodLog();};
+  (function(){var buttons=document.querySelectorAll('.food-channel'),i;for(i=0;i<buttons.length;i++)buttons[i].onclick=function(){var j;foodSource=this.getAttribute('data-source')||'菜市场';for(j=0;j<buttons.length;j++)buttons[j].className='food-channel'+(buttons[j]===this?' active':'');var hints={菜市场:'菜市场：拍食材最方便；数量不准时在识别结果里改一下。',网上APP:'网上APP：优先直接选择订单截图，通常识别最完整。',超市:'超市：优先拍小票，也可以直接拍买回来的商品。'};$('foodChannelHint').textContent=hints[foodSource]||'';};})();
+  $('foodScanBtn').onclick=function(){$('foodScanFile').click();};$('foodScanFile').onchange=function(){var f=this.files&&this.files[0];this.value='';if(f)startFoodScan(f);};$('foodScanAddMissing').onclick=foodScanAddMissing;$('foodScanClear').onclick=foodScanReset;$('foodScanCommit').onclick=commitFoodScan;
+  $('foodAddCategory').onchange=function(){var c=this.value,u=$('foodAddUnit');if(c==='肉类'||c==='海鲜'||c==='蔬菜')u.value='份';else if(c==='蛋类')u.value='个';else if(c==='奶制品'||c==='包装食品')u.value='盒';else if(c==='主食')u.value='包';};
+  $('foodAddForm').onsubmit=function(ev){ev.preventDefault();var name=$('foodAddName').value.trim(),amount=parseFloat($('foodAddAmount').value||'0');if(!name||!(amount>0)){foodToast('先填写食材名称和数量');return;}foodAction('add',{name:name,amount:amount,unit:$('foodAddUnit').value,category:$('foodAddCategory').value,source:foodSource},function(err){if(!err){foodToast(name+' 已加入');$('foodAddName').value='';$('foodAddAmount').value='1';foodSwitch('home');}});};
+  $('foodConsumeForm').onsubmit=function(ev){ev.preventDefault();var name=$('foodConsumeName').value,amount=parseFloat($('foodConsumeAmount').value||'0');if(!name||!(amount>0)){foodToast('请选择食材并填写用量');return;}foodAction('consume',{name:name,amount:amount},function(err){if(!err){foodToast('已记录 '+name+' 的消耗');$('foodConsumeAmount').value='1';foodSwitch('home');}});};
+  $('foodStatusForm').onsubmit=function(ev){ev.preventDefault();var name=$('foodStatusName').value.trim();if(!name){foodToast('先填写佐料或粮油名称');return;}foodAction('status',{name:name,status:$('foodStatusValue').value,category:'佐料/粮油'},function(err){if(!err){foodToast(name+'：'+$('foodStatusValue').value);$('foodStatusName').value='';}});};
+
+  function setHomeMode(on,pageKind){
+    var p=$('mainPanel');if(p)p.className='panel'+(on?' home-mode':'');
+    if(pageKind)document.body.setAttribute('data-k-page',pageKind);
+    if(on){document.body.classList.add('home-active');}else{document.body.classList.remove('home-active');if($('qaDock'))$('qaDock').classList.remove('qa-active');}
+  }
+  function homeFoodSummaryText(){var items=foodState.items||[],meat=0,veg=0,eggs=0,att=(foodState.needs_attention||[]).length;for(var i=0;i<items.length;i++){var it=items[i];if(it.unit==='状态')continue;if((it.category==='肉类'||it.category==='海鲜')&&it.unit==='份')meat+=Number(it.quantity||0);if(it.category==='蔬菜')veg+=1;if(it.category==='蛋类'&&it.unit==='个')eggs+=Number(it.quantity||0);}var bits=[];if(meat)bits.push('肉/海鲜 '+meat+'份');if(veg)bits.push('蔬菜 '+veg+'种');if(eggs)bits.push('鸡蛋 '+eggs+'个');if(att)bits.push(att+'项需补');return bits.length?bits.join(' · '):'先从第一笔真实食材记录开始';}
+  function renderModernFoodBits(){var stats=$('homeFoodStats'),list=$('homePriorityList'),more=$('homePriorityMore');if(stats)stats.textContent=homeFoodSummaryText();if(!list)return;list.innerHTML='';var arr=foodState.priority||[];if(!arr.length){list.appendChild(el('div','home-priority-empty','目前没有需要赶着吃的东西，挺好。'));}else{for(var i=0;i<Math.min(arr.length,4);i++){(function(it){var row=el('button','home-priority-item');row.type='button';var left=el('div','');left.appendChild(el('div','home-priority-name',it.name));left.appendChild(el('div','home-priority-meta',foodUnitText(it)+' · '+(it.category||'食材')));row.appendChild(left);var tag=el('span','home-priority-tag'+(it.priority_window==='本周'?' week':''),it.priority_window||'建议先用');row.appendChild(tag);row.onclick=function(){openFood('inventory');};list.appendChild(row);})(arr[i]);}}if(more)more.onclick=function(){openFood('home');};}
+  function navActiveForView(v){if(!v||!v.type)return 'home';if(v.type==='kitchen.show_idle')return 'home';if(v.type==='kitchen.show_dashboard')return 'today';if(v.type==='kitchen.show_shopping')return 'shopping';if(v.type==='kitchen.show_menu'||v.type==='kitchen.show_picker'||v.type==='kitchen.show_prep'||v.type==='kitchen.show_recipe'||v.type==='kitchen.show_finish'||v.type==='kitchen.show_save_private'||v.type==='kitchen.show_timeline')return 'today';return 'home';}
+  function updateGlobalNav(active){var nav=$('globalBottomNav');if(!nav)return;var bs=nav.querySelectorAll('button[data-global-nav]');for(var i=0;i<bs.length;i++)bs[i].classList.toggle('active',bs[i].getAttribute('data-global-nav')===active);}
+  function globalNavigate(target){if($('foodModal')&&$('foodModal').classList.contains('show')){$('foodModal').className='food-modal';$('foodModal').setAttribute('aria-hidden','true');}if(target==='home')action('home');else if(target==='today')action('today');else if(target==='food')openFood('home');else if(target==='shopping')openShoppingModal();}
+  function bottomNav(active){updateGlobalNav(active);return document.createDocumentFragment();}
+  (function(){var nav=$('globalBottomNav');if(!nav)return;var bs=nav.querySelectorAll('button[data-global-nav]');for(var i=0;i<bs.length;i++){bs[i].onclick=function(){globalNavigate(this.getAttribute('data-global-nav'));};}})();
+  function dishNames(v){var items=(v&&v.items&&v.items.length!==undefined)?v.items:[],names=[];for(var i=0;i<items.length;i++)names.push(typeof items[i]==='string'?items[i]:String((items[i]&&items[i].name)||('菜品 '+(i+1))));return names;}
+  function renderModernHome(v){
+    setHomeMode(true,'home');var host=$('content');host.innerHTML='';var dash=el('div','home-dashboard'),names=dishNames(v);
+    var welcome=el('section','mock-welcome');
+    var wcopy=el('div','mock-welcome-copy');wcopy.appendChild(el('div','mock-greeting',names.length?'晚饭准备好了吗？':'晚上好！'));wcopy.appendChild(el('div','mock-greeting-sub',names.length?'今天的菜单已经在这里，随时可以开始。':'今天的菜单还没定，先从选菜开始吧。'));
+    var primary=el('button','mock-big-primary',names.length?'开工烧饭  →':'🍴 获取今日菜谱  →');primary.type='button';primary.onclick=function(){action(names.length?'dashboard':'home');};wcopy.appendChild(primary);
+    if(!names.length)wcopy.appendChild(el('div','mock-primary-note','让小K为你准备一份合适的菜单'));
+    welcome.appendChild(wcopy);
+    dash.appendChild(welcome);
+
+    if(names.length){var today=el('section','mock-home-today');var th=el('div','mock-section-head');var ttl=el('div','');ttl.appendChild(el('strong','','今日菜谱'));ttl.appendChild(el('small','',names.length+' 道菜'));th.appendChild(ttl);var enter=el('button','mock-text-link','查看全部  ›');enter.onclick=function(){action('today');};th.appendChild(enter);today.appendChild(th);var tl=el('div','mock-home-dishes');for(var i=0;i<Math.min(names.length,4);i++){var row=el('button','mock-home-dish');row.type='button';row.appendChild(el('span','mock-home-dish-num',String(i+1)));row.appendChild(el('strong','',names[i]));row.appendChild(el('span','mock-home-dish-arrow','›'));row.onclick=(function(n){return function(){action('recipe',{value:n});};})(names[i]);tl.appendChild(row);}today.appendChild(tl);dash.appendChild(today);}
+
+    var cards=el('div','mock-feature-grid');
+    function feature(icon,title,sub,fn){var b=el('button','mock-feature-card');b.type='button';b.innerHTML='<span class="mock-feature-icon">'+icon+'</span><strong>'+title+'</strong><small>'+sub+'</small>';b.onclick=fn;cards.appendChild(b);}
+    var icoMenu='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3v8M4 3v5a3 3 0 0 0 6 0V3M7 11v10M16 3v18M16 3c3 2 4 5 4 8h-4"/></svg>';
+    var icoShop='<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h2l2.2 10.2a2 2 0 0 0 2 1.6h7.9a2 2 0 0 0 2-1.6L21 8H7M10 21h.01M18 21h.01"/></svg>';
+    var icoFood='<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="14" height="18" rx="2"/><path d="M5 10h14M9 6v1M9 13v2"/></svg>';
+    var icoTimer='<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l3 2M9 2h6M12 2v3"/></svg>';
+    feature(icoMenu,'选择今日菜谱','从库存和私房菜中选择',function(){action('picker');});
+    feature(icoShop,'今日采购清单','缺什么一目了然',openShoppingModal);
+    feature(icoFood,'食材管理','查看和管理家中食材',function(){openFood('home');});
+    feature(icoTimer,'厨房计时','让烹饪更从容',openStandaloneTimer);dash.appendChild(cards);
+    dash.appendChild(bottomNav('home'));host.appendChild(dash);loadFood();
+  }
+  function timerForDishStep(dish,step){for(var i=0;i<latestTimers.length;i++){var t=latestTimers[i];if(t.kind!=='standalone'&&t.dish===dish&&Number(t.step)===Number(step))return t;}return null;}
+  function dashboardTimerLabel(t){return t.kind==='standalone'?'厨房通用':((t.dish||'菜品')+' · 第'+(Number(t.step)+1)+'步');}
+  function renderDashboardCurrentTimer(v){var host=$('r49CurrentTimerHost');if(!host)return;host.innerHTML='';var c=v.current||null;if(!c)return;var t=timerForDishStep(c.name,c.step),box=el('div','r49-main-timer'),copy=el('div','r49-main-timer-copy');
+    if(t){copy.appendChild(el('small','',c.name+' · 本步骤计时'));var tm=el('strong',t.status==='finished'?'done':'',t.status==='finished'?'时间到':fmt(remaining(t)));tm.setAttribute('data-r49-timer-time',t.timer_id);copy.appendChild(tm);box.appendChild(copy);var b=el('button','',t.status==='running'?'暂停':(t.status==='paused'?'继续':'结束提醒'));b.onclick=function(){if(t.status==='running')action('timer_pause',{timer_id:t.timer_id});else if(t.status==='paused')action('timer_resume',{timer_id:t.timer_id});else action('timer_dismiss',{timer_id:t.timer_id});};box.appendChild(b);}
+    else if(c.timer_hint&&Number(c.timer_hint.default_sec)>0){copy.appendChild(el('small','','本步骤建议计时'));copy.appendChild(el('strong','',fmt(Number(c.timer_hint.default_sec))));box.appendChild(copy);var st=el('button','','开始计时');st.onclick=function(){action('timer_start',{seconds:Number(c.timer_hint.default_sec)});};box.appendChild(st);}
+    else{copy.appendChild(el('small','','本步骤'));copy.appendChild(el('strong','','无需计时'));box.appendChild(copy);var more=el('button','','厨房计时');more.onclick=openTimerCenter;box.appendChild(more);}host.appendChild(box);
+  }
+  function renderDashboardTimers(v){var host=$('r49DashboardTimerHost');if(!host)return;host.innerHTML='';var arr=latestTimers.slice(0);arr.sort(function(a,b){if(a.status==='finished'&&b.status!=='finished')return -1;if(b.status==='finished'&&a.status!=='finished')return 1;return Number(a.ends_at||9e18)-Number(b.ends_at||9e18);});var shown=0;for(var i=0;i<arr.length&&shown<3;i++){var t=arr[i];if(v.current&&t.kind!=='standalone'&&t.dish===v.current.name&&Number(t.step)===Number(v.current.step))continue;(function(tt){var b=el('button','r49-timer-mini '+tt.status);b.type='button';b.appendChild(el('span','dish',dashboardTimerLabel(tt)));var tx=el('strong','',tt.status==='finished'?'时间到':fmt(remaining(tt)));tx.setAttribute('data-r49-timer-time',tt.timer_id);b.appendChild(tx);b.onclick=function(){if(tt.kind==='standalone')openTimerCenter();else action('timer_open',{timer_id:tt.timer_id});};host.appendChild(b);})(t);shown++;}if(!shown)host.appendChild(el('div','r49-pending-empty','目前没有后台计时。'));renderDashboardCurrentTimer(v);}
+  function renderDashboard(v){setHomeMode(true,'dashboard');var host=$('content');host.innerHTML='';var page=el('div','r49-dashboard');
+    var hd=el('div','r49-dash-head'),hc=el('div','');hc.appendChild(el('h2','','厨房中台'));hc.appendChild(el('p','',v.message||'一屏掌控正在做的菜'));hd.appendChild(hc);var da=el('div','r50-dash-actions');da.appendChild(el('div','r49-dash-status','厨房运行正常'));var finishDay=el('button','r50-finish-day','✓ 结束今日厨房');finishDay.type='button';finishDay.onclick=function(){action('finish_start');};da.appendChild(finishDay);hd.appendChild(da);page.appendChild(hd);
+    var body=el('div','r49-dash-body'),c=v.current||null,left=el('section','r49-card r49-current');left.appendChild(el('div','r49-label','● 当前烹饪'));
+    if(c){var title=el('div','r49-current-title'),tg=el('div','');tg.appendChild(el('h3','',c.name));var pct=Math.max(0,Math.min(100,Math.round(((Number(c.step)||0)+1)*100/Math.max(1,Number(c.total_steps)||1)))),prog=el('div','r49-progress'),fill=el('i','');fill.style.width=pct+'%';prog.appendChild(fill);tg.appendChild(prog);title.appendChild(tg);title.appendChild(el('span','r49-step-count','第 '+((Number(c.step)||0)+1)+' / '+Math.max(1,Number(c.total_steps)||1)+' 步'));left.appendChild(title);left.appendChild(el('div','r49-step-copy',c.step_text||'准备开始'));var bottom=el('div','r49-current-bottom'),th=el('div','');th.id='r49CurrentTimerHost';bottom.appendChild(th);var cont=el('button','r49-continue','继续做这道菜  ›');cont.onclick=function(){action('recipe',{value:c.name});};bottom.appendChild(cont);left.appendChild(bottom);}else{left.appendChild(el('div','r49-step-copy','今天还没有菜谱。'));var go=el('button','r49-continue','选择今日菜谱');go.onclick=function(){action('today');};left.appendChild(go);}body.appendChild(left);
+    var side=el('div','r49-side'),others=el('section','r49-card r49-side-card');var allItems=(v.items&&v.items.length!==undefined)?v.items:[];var otherItems=[];for(var oi=0;oi<allItems.length;oi++){var oitem=allItems[oi]||{},oname=String(oitem.name||'');if(oname&&(!c||oname!==c.name))otherItems.push(oitem);}others.appendChild(el('h4','','其他菜'+(otherItems.length?' · '+otherItems.length:'')));var ol=el('div','r49-other-list');if(!otherItems.length){ol.appendChild(el('div','r49-other-empty','今天没有其他待烧的菜。'));}else{for(var oi2=0;oi2<Math.min(otherItems.length,4);oi2++){(function(item){var label=String(item.name||''),started=!!item.has_progress&&Number(item.progress_step||0)>0,row=el('button','r49-other-row'+(started?' started':''));row.type='button';row.appendChild(el('strong','',label));row.appendChild(el('span','',started?'已开始':'待开始'));row.onclick=function(){action('recipe',{value:label});};ol.appendChild(row);})(otherItems[oi2]);}}others.appendChild(ol);side.appendChild(others);
+    var timers=el('section','r49-card r49-side-card');var trh=el('div','');trh.style.display='flex';trh.style.justifyContent='space-between';trh.style.alignItems='center';trh.appendChild(el('h4','','后台计时'));var all=el('button','r49-timer-center-link','查看全部 ›');all.onclick=openTimerCenter;trh.appendChild(all);timers.appendChild(trh);var tlh=el('div','r49-timer-mini-list');tlh.id='r49DashboardTimerHost';timers.appendChild(tlh);side.appendChild(timers);
+    var prep=el('section','r49-card r49-side-card');prep.appendChild(el('h4','','统一备菜'));var pe=el('div','r49-prep-entry'),pc=el('div','r49-prep-copy'),done=Number(v.prep_completed||0),ptotal=Number(v.prep_total||0),ppct=ptotal?Math.max(0,Math.min(100,Math.round(done*100/ptotal))):0;pc.appendChild(el('strong','',v.prep_all_done?'备菜已完成':(ptotal?done+' / '+ptotal+' 已完成':'查看今日备菜')));pc.appendChild(el('small','',v.prep_all_done?'需要复查时可以随时进入。':'开火前把清洗、切配、腌制等一次处理完。'));var pp=el('div','r49-prep-progress'),pi=el('i','');pi.style.width=(v.prep_all_done?100:ppct)+'%';pp.appendChild(pi);pc.appendChild(pp);pe.appendChild(pc);var pb=el('button','r49-prep-button',v.prep_all_done?'查看备菜':'进入备菜');pb.type='button';pb.onclick=function(){action('prep');};pe.appendChild(pb);prep.appendChild(pe);side.appendChild(prep);body.appendChild(side);page.appendChild(body);
+    var qb=el('div','r49-quickbar');function q(icon,text,fn){var b=el('button','','');b.type='button';b.appendChild(el('span','ico',icon));b.appendChild(el('span','',text));b.onclick=fn;qb.appendChild(b);}q('🛒','今日采购',openShoppingModal);q('◷','厨房计时',openTimerCenter);page.appendChild(qb);host.appendChild(page);renderDashboardTimers(v);updateGlobalNav('today');}
+  function renderTodayMenu(v){
+    setHomeMode(true,'today');var host=$('content');host.innerHTML='';var page=el('div','mock-page today-page'),names=dishNames(v),items=v.items||[];
+    var head=el('div','mock-page-head');var hc=el('div','');hc.appendChild(el('h2','','今日菜谱'));hc.appendChild(el('p','',names.length?(names.length+' 道菜 · 今天就按这个吃'):'今天还没有选菜'));head.appendChild(hc);page.appendChild(head);
+    var list=el('div','mock-menu-list');if(!names.length){var empty=el('section','mock-empty');empty.appendChild(el('strong','','今天还没有菜谱'));empty.appendChild(el('span','','先去选择今天想吃的菜吧。'));var eb=el('button','mock-big-primary','获取今日菜谱 →');eb.onclick=function(){action('today');};empty.appendChild(eb);list.appendChild(empty);}else{for(var i=0;i<items.length;i++){(function(item,index){var label=typeof item==='string'?item:String((item&&item.name)||('菜品 '+(index+1))),row=el('div','mock-menu-row');row.appendChild(el('span','mock-menu-index',index+1));var mid=el('button','mock-menu-copy mock-menu-open');mid.type='button';mid.appendChild(el('strong','',label));var meta='等待统一备菜';if(item&&item.has_progress&&Number(item.total_steps)>0){var ps=Number(item.progress_step)||0;meta=ps<=0?'等待统一备菜':'烹饪进度 '+ps+' / '+Math.max(1,Number(item.total_steps)-1);}mid.appendChild(el('small','',meta));mid.onclick=function(){action('recipe',{value:label});};row.appendChild(mid);var acts=el('span','mock-menu-actions');var open=el('button','mock-menu-arrow','›');open.type='button';open.onclick=function(){action('recipe',{value:label});};acts.appendChild(open);var rm=el('button','mock-menu-remove','移除');rm.type='button';rm.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();openTodayRemoveModal(label);};acts.appendChild(rm);row.appendChild(acts);list.appendChild(row);})(items[i],i);}}page.appendChild(list);
+    var add=el('button','mock-soft-action','＋ 继续添加菜品');add.onclick=function(){action('picker');};page.appendChild(add);
+    if(names.length){var prep=el('button','mock-bottom-primary','▶  开始统一备菜');prep.onclick=function(){action('prep');};page.appendChild(prep);var util=el('div','mock-inline-actions mock-inline-actions-single');var finish=el('button','','结束今日厨房');finish.onclick=function(){action('finish_start');};util.appendChild(finish);page.appendChild(util);}page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function renderPrep(v){
+    setHomeMode(true,'prep');var host=$('content');host.innerHTML='';var page=el('div','mock-page prep-page'),groups=v.groups||[],done=Number(v.completed||0),total=Number(v.total||0);
+    var head=el('div','mock-cook-head'),hc=el('div','');hc.appendChild(el('h2','','统一备菜'));hc.appendChild(el('p','',v.message||'把今天所有菜的准备工作一次完成'));head.appendChild(hc);var backDash=el('button','mock-cook-menu-back','厨房中台');backDash.type='button';backDash.setAttribute('aria-label','返回厨房中台');backDash.title='返回厨房中台';backDash.onclick=function(){action('dashboard');};head.appendChild(backDash);page.appendChild(head);
+    var prog=el('section','mock-prep-progress');var top=el('div','');top.appendChild(el('strong','',v.all_done?'全部完成':'备菜进度'));top.appendChild(el('span','',done+' / '+total));prog.appendChild(top);var bar=el('div','mock-progress-bar'),fill=el('i','');fill.style.width=(total?Math.round(done*100/total):0)+'%';bar.appendChild(fill);prog.appendChild(bar);page.appendChild(prog);
+    var wrap=el('div','mock-prep-groups');for(var i=0;i<groups.length;i++){(function(g){var card=el('section','mock-prep-card'+(g.done?' done':''));var hd=el('div','mock-prep-head');hd.appendChild(el('strong','',g.dish||'菜品'));hd.appendChild(el('span','',g.done?'已完成':'待完成'));card.appendChild(hd);var refs=[];if((g.ingredients||[]).length)refs.push('食材：'+g.ingredients.join('、'));if((g.seasoning||[]).length)refs.push('调味：'+g.seasoning.join('、'));if(refs.length)card.appendChild(el('div','mock-prep-ref',refs.join('\n')));var tasks=el('div','mock-prep-tasks'),ts=g.tasks||[];for(var j=0;j<ts.length;j++){(function(t){var lab=el('label','mock-check-row'+(t.done?' checked':'')),cb=document.createElement('input');cb.type='checkbox';cb.checked=!!t.done;cb.onchange=function(){cb.disabled=true;action('prep_toggle',{value:t.id,done:cb.checked?'1':'0'},function(){cb.disabled=false;});};lab.appendChild(cb);lab.appendChild(el('span','',t.text));tasks.appendChild(lab);})(ts[j]);}card.appendChild(tasks);wrap.appendChild(card);})(groups[i]);}page.appendChild(wrap);if(v.all_done)page.appendChild(el('div','mock-success','✓ 所有备菜都完成了，可以开始正式烹饪。'));page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function renderPicker(v){
+    setHomeMode(true,'picker');var host=$('content');host.innerHTML='';var page=el('div','mock-page picker-page');var head=el('div','mock-page-head'),hc=el('div','');hc.appendChild(el('h2','','选择今日菜谱'));hc.appendChild(el('p','','从库存或私房菜中挑选，组成今天的菜单'));head.appendChild(hc);page.appendChild(head);
+    var active=String(v.active_source||'inventory'),today=v.today_names||[],sources=el('div','mock-source-grid'),body=el('div','mock-picker-body');
+    function sourceCard(key,icon,title,sub){var b=el('button','mock-source-card'+(active===key?' active':''));b.type='button';b.innerHTML='<span class="mock-source-icon">'+icon+'</span><span class="mock-source-copy"><strong>'+title+'</strong><small>'+sub+'</small></span><span class="mock-source-arrow">→</span>';b.onclick=function(){active=key;drawSources();drawBody();};return b;}
+    function drawSources(){sources.innerHTML='';sources.appendChild(sourceCard('inventory','▰','库存推荐菜','先选择家里已有的食材，再让小K推荐'));sources.appendChild(sourceCard('private','♥','私房菜','直接读取 Obsidian 私房菜目录'));}
+    function recipeList(arr,emptyText){var wrap=el('div','mock-recipe-section');var search=document.createElement('input');search.className='mock-search';search.placeholder='搜索菜名…';var list=el('div','mock-recipe-list');function drawRows(){var q=(search.value||'').trim().toLowerCase();list.innerHTML='';var shown=0;for(var i=0;i<arr.length;i++){var it=arr[i],name=String(it.name||'');if(q&&name.toLowerCase().indexOf(q)<0)continue;var row=el('div','mock-recipe-row'),mid=el('div','mock-recipe-copy');mid.appendChild(el('strong','',name));var bits=[];if(it.estimated_text)bits.push(it.estimated_text);if(it.recommendation_reason)bits.push(it.recommendation_reason);if((it.inventory_matches||[]).length)bits.push('可用：'+it.inventory_matches.join('、'));if(it.source_kind==='private')bits.push('私房菜');mid.appendChild(el('small','',bits.join(' · ')||'菜谱'));row.appendChild(mid);var already=today.indexOf(name)>=0,add=el('button','mock-add-recipe',already?'已加入':'+ 加入');add.disabled=already;add.onclick=(function(id){return function(){action('today_add',{value:id});};})(it.id);row.appendChild(add);list.appendChild(row);shown++;}if(!shown)list.appendChild(el('div','mock-empty-line',emptyText));}search.oninput=drawRows;wrap.appendChild(search);wrap.appendChild(list);drawRows();return wrap;}
+    function inventoryStep(){var selected=v.inventory_selected||[],results=v.recommended||[];if(selected.length){body.appendChild(el('div','mock-selected-note','已选择：'+selected.join('、')));var back=el('button','mock-text-action','← 重新选择食材');back.onclick=function(){action('picker');};body.appendChild(back);body.appendChild(recipeList(results,'暂时没有匹配到合适菜谱，可以换一组食材。'));return;}var items=v.inventory_items||[];if(!items.length){body.appendChild(el('div','mock-empty','食材管理里还没有可用食材。'));return;}var title=el('div','mock-section-title');title.appendChild(el('strong','','选择已有食材'));title.appendChild(el('small','','勾选你今天想优先使用的食材'));body.appendChild(title);var grid=el('div','mock-inventory-list');for(var i=0;i<items.length;i++){var it=items[i],lab=el('label','mock-inventory-row'),ck=document.createElement('input');ck.type='checkbox';ck.value=it.name;ck.className='inventory-choice';lab.appendChild(ck);var name=el('span','mock-inventory-name');name.appendChild(el('strong','',it.name));var meta=[];if(it.category)meta.push(it.category);if(it.quantity!==undefined&&it.unit)meta.push(String(it.quantity)+' '+it.unit);name.appendChild(el('small','',meta.join(' · ')));lab.appendChild(name);lab.appendChild(el('span','mock-category-pill',it.category||'食材'));grid.appendChild(lab);}body.appendChild(grid);var go=el('button','mock-bottom-primary','根据所选食材推荐菜谱  →');go.onclick=function(){var picked=[],nodes=document.querySelectorAll('.inventory-choice:checked');for(var n=0;n<nodes.length;n++)picked.push(nodes[n].value);if(!picked.length){foodToast('请先选择至少一种食材');return;}go.disabled=true;go.textContent='正在推荐…';action('inventory_recommend',{value:JSON.stringify(picked)},function(err){if(err){go.disabled=false;go.textContent='根据所选食材推荐菜谱  →';foodToast('推荐失败，请稍后再试');}});};body.appendChild(go);}
+    function drawBody(){body.innerHTML='';if(active==='private')body.appendChild(recipeList(v.private_recipes||[],(v.private_recipe_dirs||[]).length?'私房菜目录已找到，但没有解析到可用菜谱。':'没有找到 Obsidian 私房菜目录。'));else inventoryStep();}
+    drawSources();page.appendChild(sources);page.appendChild(body);page.appendChild(bottomNav('today'));host.appendChild(page);drawBody();
+  }
+  function renderFinish(v){
+    setHomeMode(true,'finish');var host=$('content');host.innerHTML='';var page=el('div','finish-page');
+    var head=el('div','page-heading'),hc=el('div','');hc.appendChild(el('h2','','今日厨房收尾'));hc.appendChild(el('p','','今天的菜都做完后，再结束今天的厨房流程。'));head.appendChild(hc);page.appendChild(head);
+    var summary=el('section','finish-summary');summary.appendChild(el('div','finish-summary-icon','✓'));summary.appendChild(el('h3','','准备结束今天的厨房？'));summary.appendChild(el('p','',v.message||'确认后先统一登记今天的食材消耗，再选择是否保存私房菜。'));page.appendChild(summary);
+    var note=el('section','finish-note');note.appendChild(el('div','finish-note-icon','🍳'));var nt=el('div','');nt.appendChild(el('strong','','先做今日食材结算，再保存私房菜'));nt.appendChild(el('span','','今天所有菜的食材只在收尾时统一核对一次，不会在每道菜做完时打断你。'));note.appendChild(nt);page.appendChild(note);
+    var acts=el('div','finish-modern-actions');acts.style.gridTemplateColumns='1fr';var yes=el('button','finish-modern-primary','进入今日食材结算');yes.onclick=function(){action('finish_confirm');};acts.appendChild(yes);page.appendChild(acts);page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function renderSavePrivate(v){
+    setHomeMode(true,'finish');var host=$('content');host.innerHTML='';var page=el('div','finish-page private-save-page');
+    var head=el('div','page-heading'),hc=el('div','');hc.appendChild(el('h2','','今天留下哪些菜？'));hc.appendChild(el('p','','满意的菜可以加入“私房菜”，以后直接从菜谱库再做。'));head.appendChild(hc);page.appendChild(head);
+    var summary=el('section','finish-summary');summary.appendChild(el('div','finish-summary-icon','♡'));summary.appendChild(el('h3','','保存到私房菜'));summary.appendChild(el('p','',v.message||'只勾选你真正想留下的菜；不勾选也可以直接结束今天的厨房。'));page.appendChild(summary);
+    var items=v.items||[],list=el('div','private-list');for(var i=0;i<items.length;i++){var row=el('label','private-row');var ck=document.createElement('input');ck.type='checkbox';ck.value=items[i];ck.className='private-choice';row.appendChild(ck);var txt=el('span','',items[i]);txt.appendChild(el('small','','加入私房菜'));row.appendChild(txt);list.appendChild(row);}page.appendChild(list);
+    var acts=el('div','finish-modern-actions');var none=el('button','finish-modern-secondary','直接结束');none.onclick=function(){action('finish_no_save');};acts.appendChild(none);var save=el('button','finish-modern-primary','保存所选并结束');save.onclick=function(){var picked=[],nodes=document.querySelectorAll('.private-choice:checked');for(var n=0;n<nodes.length;n++)picked.push(nodes[n].value);action('finish_save',{value:JSON.stringify(picked)});};acts.appendChild(save);page.appendChild(acts);page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function renderCookingFlow(v){
+    setHomeMode(true,'cooking');var host=$('content');host.innerHTML='';var page=el('div','mock-page cook-page'),stepNum=(parseInt(v.step,10)||0)+1,total=parseInt(v.total_steps,10)||1,isPrep=v.step_kind==='prep',isLast=stepNum>=total;
+    var top=el('div','mock-cook-head');var tg=el('div','');tg.appendChild(el('h2','',v.title||'菜谱'));tg.appendChild(el('p','','第 '+stepNum+' / '+total+' 步'));top.appendChild(tg);var backMenu=el('button','mock-cook-menu-back','厨房中台');backMenu.type='button';backMenu.setAttribute('aria-label','返回厨房中台');backMenu.title='返回厨房中台';backMenu.onclick=function(){action('dashboard');};top.appendChild(backMenu);page.appendChild(top);
+    var stage=el('div','mock-stage');stage.appendChild(el('span',isPrep?'active':'','1 备菜'));stage.appendChild(el('span',!isPrep&&!isLast?'active':'','2 烹饪'));stage.appendChild(el('span',isLast?'active':'','3 完成'));page.appendChild(stage);
+    var layout=el('div','mock-cook-layout');
+    var prev=el('button','mock-side-nav prev','‹');prev.type='button';prev.setAttribute('aria-label','上一步');prev.title='上一步';prev.disabled=stepNum<=1;prev.onclick=function(){action('prev');};layout.appendChild(prev);
+    var center=el('div','mock-cook-center');var card=el('section','mock-cook-card');card.appendChild(el('div','mock-step-kicker',isPrep?'当前步骤 · 备菜':'当前步骤'));card.appendChild(el('div','mock-step-text',v.step_text||'（本步骤内容为空）'));var timerHost=el('div','');timerHost.id='stepTimerHost';card.appendChild(timerHost);var tips=v.key_points||[];if(tips.length){var tip=el('div','mock-k-tip');tip.appendChild(el('strong','','● 小K贴士'));tip.appendChild(el('span','',tips.join('；')));card.appendChild(tip);}var qt=el('button','mock-cook-timer-button','⏱ 多计时器中心');qt.onclick=openTimerCenter;card.appendChild(qt);center.appendChild(card);layout.appendChild(center);
+    var next=el('button','mock-side-nav next','›');next.type='button';next.setAttribute('aria-label','下一步');next.title='下一步';next.disabled=stepNum>=total;next.onclick=function(){action('next');};layout.appendChild(next);
+    page.appendChild(layout);host.appendChild(page);renderStepTimer(v);page.appendChild(bottomNav('today'));
+  }
+  function renderConsumption(v){
+    setHomeMode(true,'consumption');var host=$('content');host.innerHTML='';var page=el('div','mock-page consumption-page'),isDay=String(v.scope||'')==='day';
+    var head=el('div','mock-page-head'),hc=el('div','');hc.appendChild(el('h2','',isDay?'今日食材结算':'登记消耗'));hc.appendChild(el('p','',isDay?'核对今天实际用掉的食材和数量，确认后一次扣减库存。':((v.dish||'这道菜')+' · 按实际使用量扣减库存')));head.appendChild(hc);if(isDay){var backDash=el('button','mock-cook-menu-back','厨房中台');backDash.type='button';backDash.onclick=function(){action('dashboard');};head.appendChild(backDash);}page.appendChild(head);
+    if(isDay){var note=el('section','finish-note');note.appendChild(el('div','finish-note-icon','▰'));var nt=el('div','');nt.appendChild(el('strong','','按实际消耗核对'));nt.appendChild(el('span','','系统已把今日菜谱涉及到的现有库存合并到一起；用量不对时直接用 ＋ / − 调整，没用到的改为 0。'));note.appendChild(nt);page.appendChild(note);}
+    var items=v.items||[];if(!items.length){var empty=el('section','mock-empty');empty.appendChild(el('strong','','没有匹配到可扣减的库存食材'));empty.appendChild(el('span','',isDay?'可以直接继续到私房菜收尾；也可以之后在食材管理里手动修正。':'可能是食材名称不同，或这些原料没有录入库存。'));page.appendChild(empty);}else{var list=el('div','consumption-list');for(var i=0;i<items.length;i++){(function(it){var row=el('section','consumption-row');var copy=el('div','consumption-copy');copy.appendChild(el('strong','',it.name));var detail=String(it.recipe_text||'');if((it.dishes||[]).length)detail=(it.dishes.join('、')+(detail?' · '+detail:''));copy.appendChild(el('small','',detail+' · 库存 '+String(it.available)+' '+String(it.unit||'')));row.appendChild(copy);var ctl=el('div','consumption-control');var minus=el('button','','−');minus.type='button';var input=document.createElement('input');input.type='number';input.className='consumption-amount';input.setAttribute('data-name',it.name);input.min='0';input.max=String(it.available);input.step=(it.unit==='份'?'0.5':'1');input.value=String(it.suggested||0);var plus=el('button','','＋');plus.type='button';function clamp(n){var step=parseFloat(input.step)||1,max=parseFloat(input.max)||9999;n=Math.max(0,Math.min(max,n));return Math.round(n/step)*step;}minus.onclick=function(){input.value=String(clamp((parseFloat(input.value)||0)-(parseFloat(input.step)||1)));};plus.onclick=function(){input.value=String(clamp((parseFloat(input.value)||0)+(parseFloat(input.step)||1)));};ctl.appendChild(minus);ctl.appendChild(input);ctl.appendChild(el('span','consumption-unit',it.unit||''));ctl.appendChild(plus);row.appendChild(ctl);list.appendChild(row);})(items[i]);}page.appendChild(list);}
+    var actions=el('div','consumption-actions');var skip=el('button','mock-soft-action',isDay?'暂不结算':'暂不扣库存');skip.type='button';skip.onclick=function(){if(isDay)action('day_consume_skip');else action('menu');};actions.appendChild(skip);var save=el('button','mock-bottom-primary',isDay?'确认食材消耗并继续':'确认消耗并返回今日菜谱');save.type='button';save.onclick=function(){var rows=document.querySelectorAll('.consumption-amount'),vals=[];for(var j=0;j<rows.length;j++){var a=Math.max(0,parseFloat(rows[j].value)||0);if(a>0)vals.push({name:rows[j].getAttribute('data-name'),amount:a});}save.disabled=true;save.textContent=isDay?'正在结算食材消耗…':'正在登记…';action(isDay?'day_consume_commit':'recipe_consume_commit',{value:JSON.stringify(vals)},function(err){if(err){save.disabled=false;save.textContent=isDay?'确认食材消耗并继续':'确认消耗并返回今日菜谱';}});};actions.appendChild(save);page.appendChild(actions);page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function renderShopping(v){
+    setHomeMode(true,'shopping');var host=$('content');host.innerHTML='';var page=el('div','mock-page utility-page');var head=el('div','mock-cook-head'),hc=el('div','');hc.appendChild(el('h2','','今日采购清单'));hc.appendChild(el('p','',v.message||'勾选后自动保存，离开页面也不会丢'));head.appendChild(hc);var homeBtn=el('button','mock-cook-menu-back','首页');homeBtn.type='button';homeBtn.onclick=function(){action('home');};head.appendChild(homeBtn);page.appendChild(head);var groups=v.groups||[];if(!groups.length){page.appendChild(el('div','mock-empty','今天暂时没有需要采购的内容。'));}else{for(var i=0;i<groups.length;i++){var card=el('section','mock-shopping-card');card.appendChild(el('strong','',groups[i].name||'建议购买'));var items=groups[i].items||[];var list=el('div','mock-shopping-list');for(var j=0;j<items.length;j++){(function(item){var text=(item&&typeof item==='object')?String(item.text||''):String(item||''),itemId=(item&&typeof item==='object')?String(item.id||''):'',inv=(item&&typeof item==='object')?item.inventory:null;var lab=el('label','mock-shopping-row'+((item&&item.checked)?' checked':'')),ck=document.createElement('input');ck.type='checkbox';ck.checked=!!(item&&item.checked);ck.onchange=function(){var wanted=ck.checked;ck.disabled=true;action('shopping_toggle',{value:itemId,done:wanted?'1':'0'},function(err){ck.disabled=false;if(err){ck.checked=!wanted;lab.classList.toggle('checked',ck.checked);return;}lab.classList.toggle('checked',wanted);});};lab.appendChild(ck);var copy=el('span','shopping-item-copy');copy.appendChild(el('span','shopping-item-text',text));lab.appendChild(copy);if(inv&&inv.label)lab.appendChild(el('span','shopping-stock-badge',String(inv.label)));list.appendChild(lab);})(items[j]);}card.appendChild(list);page.appendChild(card);}}page.appendChild(bottomNav('shopping'));host.appendChild(page);
+  }
+  function renderTimeline(v){
+    setHomeMode(true,'timeline');var host=$('content');host.innerHTML='';var page=el('div','utility-page');var head=el('div','page-heading'),hc=el('div','');hc.appendChild(el('h2','','烧菜顺序'));hc.appendChild(el('p','',String(v.eyebrow||'').replace(' · ','  ·  ')));head.appendChild(hc);page.appendChild(head);var items=v.items||[];if(!items.length){page.appendChild(el('div','utility-empty','今天还没有可显示的烧菜顺序。'));}else{var card=el('section','utility-page-card'),ol=el('ol','');for(var i=0;i<items.length;i++)ol.appendChild(el('li','',items[i]));card.appendChild(ol);page.appendChild(card);}page.appendChild(bottomNav('today'));host.appendChild(page);
+  }
+  function qaStateLabel(st){var m={idle:'可以提问',listening:'正在听…',uploading:'正在发送…',recognizing:'正在识别…',thinking:'正在回答…',speaking:'正在生成语音…',done:'回答完成',error:'出现问题'};return m[st]||'问小K';}
+  function qaRender(q){if(!q)return;var st=String(q.status||'idle'),updated=Number(q.updated_at||0),age=updated?((Date.now()/1000)-updated):0;var serverBusy=(st==='uploading'||st==='recognizing'||st==='thinking'||st==='speaking');if(serverBusy&&age>180){serverBusy=false;st='error';q.error='上一条问答状态已超时，已经自动解锁，可以重新提问。';qaBusy=false;}else{qaBusy=serverBusy;}if(!qaRecording){$('qaBtn').disabled=false;$('qaBtn').className='qa-btn'+(qaBusy?' busy':'');$('qaBtn').textContent=qaBusy?'处理中…':'🎙 问小K';}$('qaStatus').textContent=qaRecording?'正在听…再次点击结束':qaStateLabel(st);$('qaTranscript').textContent=q.transcript?('你：'+q.transcript):'';$('qaAnswer').textContent=q.answer?('小K：'+q.answer):(st==='error'?(q.error||'语音问答失败'):'');var qd=$('qaDock');if(qd){var active=qaRecording||qaBusy||st==='done'||st==='error'||!!q.answer||!!q.transcript;qd.className='qa-dock'+(active?' qa-active':'');}}
   function qaFloatConcat(parts){var total=0,i;for(i=0;i<parts.length;i++)total+=parts[i].length;var out=new Float32Array(total),p=0;for(i=0;i<parts.length;i++){out.set(parts[i],p);p+=parts[i].length;}return out;}
   function qaDownsample(input,inRate,outRate){if(!input||!input.length)return new Float32Array(0);if(inRate===outRate)return input;if(outRate>inRate)outRate=inRate;var ratio=inRate/outRate,newLen=Math.max(1,Math.round(input.length/ratio)),out=new Float32Array(newLen),offset=0;for(var i=0;i<newLen;i++){var next=Math.min(input.length,Math.round((i+1)*ratio)),sum=0,count=0;for(var j=offset;j<next;j++){sum+=input[j];count++;}out[i]=count?sum/count:0;offset=next;}return out;}
   function qaWav(samples,rate){var b=new ArrayBuffer(44+samples.length*2),v=new DataView(b);function ws(o,t){for(var i=0;i<t.length;i++)v.setUint8(o+i,t.charCodeAt(i));}ws(0,'RIFF');v.setUint32(4,36+samples.length*2,true);ws(8,'WAVE');ws(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,rate,true);v.setUint32(28,rate*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);ws(36,'data');v.setUint32(40,samples.length*2,true);var o=44;for(var i=0;i<samples.length;i++,o+=2){var x=Math.max(-1,Math.min(1,samples[i]));v.setInt16(o,x<0?x*32768:x*32767,true);}return b;}
   function qaStopTracks(stream){if(!stream)return;try{var tracks=stream.getTracks?stream.getTracks():[];for(var i=0;i<tracks.length;i++){try{tracks[i].stop();}catch(e){}}}catch(e){}}
   function qaCleanupCapture(){if(qaAutoStop){clearTimeout(qaAutoStop);qaAutoStop=null;}try{if(qaProcessor){qaProcessor.disconnect();qaProcessor.onaudioprocess=null;}}catch(e){}try{if(qaSource)qaSource.disconnect();}catch(e){}qaStopTracks(qaStream);qaStream=null;qaProcessor=null;qaSource=null;if(qaCtx){try{qaCtx.close();}catch(e){}}qaCtx=null;}
-  function qaStart(){if(qaBusy){$('qaStatus').textContent='上一条问题还在处理中，请稍候…';return;}if(qaRecording){qaStop();return;}unlockAudio();var gum=navigator.mediaDevices&&navigator.mediaDevices.getUserMedia;if(!gum){qaRender({status:'error',error:'当前页面无法使用麦克风，请确认使用 HTTPS 地址。',updated_at:Date.now()/1000});return;}$('qaBtn').disabled=false;$('qaBtn').className='qa-btn busy';$('qaBtn').textContent='请求麦克风…';$('qaStatus').textContent='正在请求麦克风权限…';navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(stream){qaStream=stream;var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unavailable');qaCtx=new C();try{qaCtx.resume();}catch(e){}qaSampleRate=qaCtx.sampleRate||48000;qaSource=qaCtx.createMediaStreamSource(stream);qaProcessor=qaCtx.createScriptProcessor(4096,1,1);qaChunks=[];qaProcessor.onaudioprocess=function(ev){if(!qaRecording)return;var input=ev.inputBuffer.getChannelData(0);qaChunks.push(new Float32Array(input));};qaSource.connect(qaProcessor);qaProcessor.connect(qaCtx.destination);qaRecording=true;qaStartedAt=Date.now();$('qaBtn').disabled=false;$('qaBtn').className='qa-btn recording';$('qaBtn').textContent='⏹ 结束提问';$('qaStatus').textContent='正在听…再次点击结束';$('qaTranscript').textContent='';$('qaAnswer').textContent='';qaAutoStop=setTimeout(function(){if(qaRecording)qaStop();},qaMaxMs);}).catch(function(err){qaCleanupCapture();qaRecording=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'无法取得麦克风：'+String(err&&err.message?err.message:err),updated_at:Date.now()/1000});});}
-  function qaStop(){if(!qaRecording)return;qaRecording=false;var duration=(Date.now()-qaStartedAt)/1000,parts=qaChunks.slice(),rate=qaSampleRate||48000;qaCleanupCapture();$('qaBtn').className='qa-btn busy';$('qaBtn').disabled=true;$('qaBtn').textContent='处理中…';if(duration<0.35||!parts.length){qaBusy=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问逐光';qaRender({status:'error',error:'录音太短，请再说一次。',updated_at:Date.now()/1000});return;}var joined=qaFloatConcat(parts),down=qaDownsample(joined,rate,16000),wav=qaWav(down,16000);qaSend(wav);}
-  function qaSend(wav){qaBusy=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='kq-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);qaRender({status:'uploading',request_id:rid,updated_at:Date.now()/1000});try{qaSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');qaSocket.binaryType='arraybuffer';}catch(e){qaBusy=false;qaRender({status:'error',error:'无法建立语音上传连接',updated_at:Date.now()/1000});return;}var finished=false;qaSocket.onopen=function(){try{qaSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,media_audio:true,airplay:true,mic_probe:true,qa_ptt:true}}));qaSocket.send(JSON.stringify({type:'kitchen.qa.start',request_id:rid,format:'audio/wav',sample_rate:16000}));qaSocket.send(wav);qaSocket.send(JSON.stringify({type:'kitchen.qa.stop',request_id:rid}));}catch(e){qaRender({status:'error',error:'发送录音失败',updated_at:Date.now()/1000});}};qaSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.qa)qaRender(m.qa);if(m.type==='kitchen.qa.transcript'&&m.text)$('qaTranscript').textContent='你：'+m.text;if(m.type==='kitchen.qa.answer'&&m.text)$('qaAnswer').textContent='逐光：'+m.text;if(m.type==='kitchen.qa.result'){finished=true;qaBusy=false;if(m.qa)qaRender(m.qa);if(m.audio)syncAudio(m.audio);try{qaSocket.close();}catch(e){}}if(m.type==='kitchen.qa.error'){finished=true;qaBusy=false;qaRender(m.qa||{status:'error',error:m.message||'语音问答失败',updated_at:Date.now()/1000});try{qaSocket.close();}catch(e){}}}catch(e){}};qaSocket.onerror=function(){};qaSocket.onclose=function(){qaSocket=null;if(!finished){/* HTTP polling is authoritative and can recover the final result. */}};}
-  function qaTap(ev){if(ev){try{ev.preventDefault();}catch(e){}}qaStart();}if(window.PointerEvent){$('qaBtn').addEventListener('pointerup',qaTap,false);}else{$('qaBtn').addEventListener('click',qaTap,false);}$('qaClear').onclick=function(){$('qaTranscript').textContent='';$('qaAnswer').textContent='';action('qa_dismiss',{},function(){qaRender({status:'idle',updated_at:Date.now()/1000});});};
+  function qaStart(){if(qaBusy){$('qaStatus').textContent='上一条问题还在处理中，请稍候…';return;}if(qaRecording){qaStop();return;}unlockAudio();var gum=navigator.mediaDevices&&navigator.mediaDevices.getUserMedia;if(!gum){qaRender({status:'error',error:'当前页面无法使用麦克风，请确认使用 HTTPS 地址。',updated_at:Date.now()/1000});return;}$('qaBtn').disabled=false;$('qaBtn').className='qa-btn busy';$('qaBtn').textContent='请求麦克风…';$('qaStatus').textContent='正在请求麦克风权限…';navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}).then(function(stream){qaStream=stream;var C=window.AudioContext||window.webkitAudioContext;if(!C)throw new Error('AudioContext unavailable');qaCtx=new C();try{qaCtx.resume();}catch(e){}qaSampleRate=qaCtx.sampleRate||48000;qaSource=qaCtx.createMediaStreamSource(stream);qaProcessor=qaCtx.createScriptProcessor(4096,1,1);qaChunks=[];qaProcessor.onaudioprocess=function(ev){if(!qaRecording)return;var input=ev.inputBuffer.getChannelData(0);qaChunks.push(new Float32Array(input));};qaSource.connect(qaProcessor);qaProcessor.connect(qaCtx.destination);qaRecording=true;qaStartedAt=Date.now();$('qaBtn').disabled=false;$('qaBtn').className='qa-btn recording';$('qaBtn').textContent='⏹ 结束提问';$('qaStatus').textContent='正在听…再次点击结束';$('qaTranscript').textContent='';$('qaAnswer').textContent='';qaAutoStop=setTimeout(function(){if(qaRecording)qaStop();},qaMaxMs);}).catch(function(err){qaCleanupCapture();qaRecording=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问小K';qaRender({status:'error',error:'无法取得麦克风：'+String(err&&err.message?err.message:err),updated_at:Date.now()/1000});});}
+  function qaStop(){if(!qaRecording)return;qaRecording=false;var duration=(Date.now()-qaStartedAt)/1000,parts=qaChunks.slice(),rate=qaSampleRate||48000;qaCleanupCapture();$('qaBtn').className='qa-btn busy';$('qaBtn').disabled=true;$('qaBtn').textContent='处理中…';if(duration<0.35||!parts.length){qaBusy=false;$('qaBtn').disabled=false;$('qaBtn').className='qa-btn';$('qaBtn').textContent='🎙 问小K';qaRender({status:'error',error:'录音太短，请再说一次。',updated_at:Date.now()/1000});return;}var joined=qaFloatConcat(parts),down=qaDownsample(joined,rate,16000),wav=qaWav(down,16000);qaSend(wav);}
+  function qaSend(wav){qaBusy=true;var scheme=(location.protocol==='https:')?'wss:':'ws:',rid='kq-'+String(Date.now())+'-'+Math.floor(Math.random()*10000);qaRender({status:'uploading',request_id:rid,updated_at:Date.now()/1000});try{qaSocket=new WebSocket(scheme+'//'+location.host+'/kitchen/ws');qaSocket.binaryType='arraybuffer';}catch(e){qaBusy=false;qaRender({status:'error',error:'无法建立语音上传连接',updated_at:Date.now()/1000});return;}var finished=false;qaSocket.onopen=function(){try{qaSocket.send(JSON.stringify({type:'kitchen.hello',protocol:kitchenProtocol,device_id:deviceId,capabilities:{touch:true,display:true,http_poll:true,timers:true,local_audio:true,media_audio:true,airplay:true,mic_probe:true,qa_ptt:true}}));qaSocket.send(JSON.stringify({type:'kitchen.qa.start',request_id:rid,format:'audio/wav',sample_rate:16000}));qaSocket.send(wav);qaSocket.send(JSON.stringify({type:'kitchen.qa.stop',request_id:rid}));}catch(e){qaRender({status:'error',error:'发送录音失败',updated_at:Date.now()/1000});}};qaSocket.onmessage=function(ev){try{var m=JSON.parse(ev.data);if(m.qa)qaRender(m.qa);if(m.type==='kitchen.qa.transcript'&&m.text)$('qaTranscript').textContent='你：'+m.text;if(m.type==='kitchen.qa.answer'&&m.text)$('qaAnswer').textContent='小K：'+m.text;if(m.type==='kitchen.qa.result'){finished=true;qaBusy=false;if(m.qa)qaRender(m.qa);if(m.audio)syncAudio(m.audio);try{qaSocket.close();}catch(e){}}if(m.type==='kitchen.qa.error'){finished=true;qaBusy=false;qaRender(m.qa||{status:'error',error:m.message||'语音问答失败',updated_at:Date.now()/1000});try{qaSocket.close();}catch(e){}}}catch(e){}};qaSocket.onerror=function(){};qaSocket.onclose=function(){qaSocket=null;if(!finished){/* HTTP polling is authoritative and can recover the final result. */}};}
+  function qaTap(ev){if(ev){try{ev.preventDefault();}catch(e){}}var qd=$('qaDock');if(qd)qd.className='qa-dock qa-active';qaStart();}if(window.PointerEvent){$('qaBtn').addEventListener('pointerup',qaTap,false);}else{$('qaBtn').addEventListener('click',qaTap,false);}$('qaHeaderBtn').onclick=qaTap;$('qaClear').onclick=function(){$('qaTranscript').textContent='';$('qaAnswer').textContent='';action('qa_dismiss',{},function(){qaRender({status:'idle',updated_at:Date.now()/1000});});};
   function playKitchenAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;if(standaloneAlarmId||!audioUnlocked||audioPlaying)return;if(Number(a.expires_at||0)>0&&Number(a.expires_at)<Date.now()/1000){lastAudioId=a.event_id;pendingAudio=null;return;}var p=initKitchenPlayer();if(!p)return;audioPlaying=true;p.onended=function(){audioPlaying=false;lastAudioId=a.event_id;pendingAudio=null;ackAudio(a.event_id);audioButtonState();};p.onerror=function(){audioPlaying=false;console.log('kitchen media playback failed code='+(p.error?p.error.code:'unknown'));audioButtonState();};try{p.src=a.url+'&_='+Date.now();p.load();var started=p.play();if(started&&started.catch){started.catch(function(e){audioPlaying=false;console.log('kitchen media play rejected',e);audioButtonState();});}}catch(e){audioPlaying=false;console.log('kitchen media playback failed',e);audioButtonState();}}
+  function timerCenterOpen(){return $('timerCenterModal')&&$('timerCenterModal').classList.contains('show');}
+  function renderTimerCenter(){var host=$('timerCenterHost');if(!host)return;host.innerHTML='';var body=el('div','timer-center-body'),grid=el('div','timer-center-grid'),arr=latestTimers.slice(0);arr.sort(function(a,b){if(a.status==='finished'&&b.status!=='finished')return -1;if(b.status==='finished'&&a.status!=='finished')return 1;return Number(a.ends_at||9e18)-Number(b.ends_at||9e18);});if(!arr.length){grid.appendChild(el('div','timer-center-empty','目前没有正在运行的计时器。\n可以直接从下方快速新建一个厨房通用计时。'));}else{for(var i=0;i<Math.min(arr.length,6);i++){(function(t){var card=el('section','timer-center-item '+t.status),tag=el('div','timer-center-tag');tag.appendChild(el('span','',t.kind==='standalone'?'厨房通用':(t.dish||'菜品')));tag.appendChild(el('small','',t.kind==='standalone'?'独立计时':'第 '+(Number(t.step)+1)+' 步'));card.appendChild(tag);var tm=el('div','timer-center-time',t.status==='finished'?'时间到':fmt(remaining(t)));tm.setAttribute('data-r49-timer-time',t.timer_id);card.appendChild(tm);var acts=el('div','timer-center-actions');if(t.status==='running'){var pause=el('button','primary','暂停');pause.onclick=function(){action('timer_pause',{timer_id:t.timer_id});};acts.appendChild(pause);}else if(t.status==='paused'){var resume=el('button','primary','继续');resume.onclick=function(){action('timer_resume',{timer_id:t.timer_id});};acts.appendChild(resume);}else{var done=el('button','primary','结束提醒');done.onclick=function(){action('timer_dismiss',{timer_id:t.timer_id});};acts.appendChild(done);}var open=el('button',t.status==='finished'?'danger':'',t.kind==='standalone'?'设置':'回到菜谱');open.onclick=function(){if(t.kind==='standalone'){if(t.status==='finished')action('timer_dismiss',{timer_id:t.timer_id});else{closeTimerCenter();openStandaloneTimer();}}else{closeTimerCenter();action('timer_open',{timer_id:t.timer_id});}};acts.appendChild(open);card.appendChild(acts);grid.appendChild(card);})(arr[i]);}}
+    body.appendChild(grid);var quick=el('div','timer-center-quick');quick.appendChild(el('strong','','快速新建'));[[60,'1分钟'],[300,'5分钟'],[600,'10分钟'],[900,'15分钟'],[1800,'30分钟']].forEach(function(x){var b=el('button','',''+x[1]);b.onclick=function(){action('timer_standalone_start',{seconds:x[0]});};quick.appendChild(b);});var custom=el('button','primary','自定义');custom.onclick=function(){closeTimerCenter();openStandaloneTimer();};quick.appendChild(custom);body.appendChild(quick);host.appendChild(body);}
+  function openTimerCenter(){unlockAudio();$('timerCenterModal').className='modal timer-center-modal show';renderTimerCenter();}
+  function closeTimerCenter(){$('timerCenterModal').className='modal timer-center-modal';}
+  $('timerCenterClose').onclick=closeTimerCenter;$('timerCenterModal').onclick=function(ev){if(ev.target===$('timerCenterModal'))closeTimerCenter();};
   function finishedStandalone(){for(var i=0;i<latestTimers.length;i++){var t=latestTimers[i];if(t.kind==='standalone'&&t.status==='finished')return t;}return null;}
+  function standaloneTimer(){for(var i=0;i<latestTimers.length;i++){if(latestTimers[i].kind==='standalone')return latestTimers[i];}return null;}
   function startStandaloneAlarm(t){if(!t||!t.timer_id||standaloneAlarmId===t.timer_id)return;if(audioPlaying)return;var p=initKitchenPlayer();if(!p||!audioUnlocked)return;standaloneAlarmId=t.timer_id;try{p.onended=null;p.onerror=function(){console.log('standalone timer alarm playback failed');};p.loop=true;p.src='/kitchen/alarm.wav?_='+Date.now();p.load();var started=p.play();if(started&&started.catch){started.catch(function(e){standaloneAlarmId='';p.loop=false;console.log('standalone timer alarm rejected',e);});}}catch(e){standaloneAlarmId='';try{p.loop=false;}catch(_e){}console.log('standalone timer alarm failed',e);}}
   function stopStandaloneAlarm(){if(!standaloneAlarmId)return;standaloneAlarmId='';var p=initKitchenPlayer();if(p){try{p.loop=false;p.pause();p.removeAttribute('src');p.load();}catch(e){}}audioPlaying=false;if(pendingAudio)playKitchenAudio(pendingAudio);}
   function syncStandaloneAlarm(){var t=finishedStandalone();if(t){startStandaloneAlarm(t);}else{stopStandaloneAlarm();}}
   function syncAudio(a){if(!a||!a.event_id)return;if(a.event_id===lastAudioId)return;pendingAudio=a;playKitchenAudio(a);}
   function ackAudio(id){if(!id)return;xhrGet('/kitchen/action?action=audio_ack&value='+encodeURIComponent(id),function(){});}
-  function action(name,params,cb){var url='/kitchen/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!==''){url+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}}xhrGet(url,function(err,text){if(err){if(cb)cb(err);return;}try{var r=JSON.parse(text);if(r&&r.timers)syncTimers(r.timers);if(r&&r.audio)syncAudio(r.audio);if(r&&r.qa)qaRender(r.qa);if(r&&r.view)render(r.view,true);if(cb)cb(null,r);}catch(e){showError('操作响应解析失败');if(cb)cb(e);}});}
+  function action(name,params,cb){var url='/kitchen/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!==''){url+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}}xhrGet(url,function(err,text){if(err){try{var er=JSON.parse(text||'{}');if(er&&er.error)err.serverMessage=String(er.error);}catch(ignore){}if(cb)cb(err);else showError(err.serverMessage||('操作失败：'+err.message));return;}var r=null;try{r=JSON.parse(text);}catch(e){showError('操作响应解析失败');if(cb)cb(e);return;}try{if(r&&r.timers)syncTimers(r.timers);if(r&&r.audio)syncAudio(r.audio);if(r&&r.qa)qaRender(r.qa);if(r&&r.view)render(r.view,true);}catch(e){console.log('Kitchen view render failed after successful action',e);if(!cb)showError('页面刷新失败，请稍后重试');}if(cb)cb(null,r);});}
   function navButton(text,name,primary){var b=el('button',primary?'primary':'',text);b.onclick=function(){action(name);};return b;}
   function fmt(sec){sec=Math.max(0,Math.ceil(Number(sec)||0));var m=Math.floor(sec/60),s=sec%60;return (m<10?'0':'')+m+':'+(s<10?'0':'')+s;}
-  function remaining(t){if(!t)return 0;if(t.status==='running'&&t.ends_at){return Math.max(0,Math.ceil(Number(t.ends_at)-Date.now()/1000));}return Math.max(0,Number(t.remaining_sec)||0);}
+  function clientClockMs(){try{if(window.performance&&typeof window.performance.now==='function')return window.performance.now();}catch(e){}return Date.now();}
+  function anchorTimer(t){if(!t)return t;var precise=Number(t.remaining_precise_sec);if(!isFinite(precise))precise=Number(t.remaining_sec)||0;t._client_remaining=Math.max(0,precise);t._client_anchor_ms=clientClockMs();return t;}
+  function remaining(t){if(!t)return 0;if(t.status==='running'){var base=Number(t._client_remaining);if(!isFinite(base))base=Number(t.remaining_precise_sec);if(!isFinite(base))base=Number(t.remaining_sec)||0;var anchor=Number(t._client_anchor_ms);var elapsed=isFinite(anchor)?Math.max(0,(clientClockMs()-anchor)/1000):0;return Math.max(0,base-elapsed);}return Math.max(0,Number(t.remaining_precise_sec)||Number(t.remaining_sec)||0);}
   function timerForView(v){if(!v||v.type!=='kitchen.show_recipe')return null;for(var i=0;i<latestTimers.length;i++){var t=latestTimers[i];if(t.dish===v.title&&Number(t.step)===Number(v.step))return t;}return null;}
   function stepSize(sec){sec=Number(sec)||0;if(sec<=90)return 10;if(sec<=600)return 30;return 60;}
   function draftKey(v){return (v&&v.title?v.title:'')+'#'+String(v&&v.step!==undefined?v.step:0);}
-  function suggested(v){var key=draftKey(v);if(drafts[key])return drafts[key];var hint=v&&v.timer_hint?v.timer_hint:null;var sec=hint&&hint.default_sec?Number(hint.default_sec):30;sec=Math.max(5,Math.min(5999,sec));drafts[key]=sec;return sec;}
+  function suggested(v){var key=draftKey(v);if(Object.prototype.hasOwnProperty.call(drafts,key))return drafts[key];var hint=v&&v.timer_hint?v.timer_hint:null;if(!hint||!hint.default_sec)return 0;var sec=Number(hint.default_sec)||0;sec=Math.max(5,Math.min(5999,sec));drafts[key]=sec;return sec;}
   function setDraft(v,sec){sec=Math.max(5,Math.min(5999,Math.round(sec)));drafts[draftKey(v)]=sec;renderStepTimer(v);}
-  function renderTimerStrip(){var strip=$('timerStrip');strip.innerHTML='';var shown=0;for(var i=0;i<latestTimers.length;i++){(function(t){if(t.status==='finished'&&t.kind!=='standalone'&&currentView&&currentView.type==='kitchen.show_recipe'&&t.dish===currentView.title&&Number(t.step)===Number(currentView.step)){return;}var chip=el('div','timer-chip '+t.status);var label=t.kind==='standalone'?'独立计时':(t.dish+' · '+(Number(t.step)+1)+'步');var right=t.status==='finished'?'时间到':fmt(remaining(t));chip.appendChild(el('span','',label));chip.appendChild(el('strong','',right));chip.onclick=function(){if(t.kind==='standalone'){openModal(Math.max(5,remaining(t)||t.duration_sec),{timer:t});}else{action('timer_open',{timer_id:t.timer_id});}};if(t.status==='finished'){var x=el('button','chip-x','×');x.setAttribute('aria-label','关闭提醒');x.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();action('timer_dismiss',{timer_id:t.timer_id});};chip.appendChild(x);}strip.appendChild(chip);shown++;})(latestTimers[i]);}strip.style.display=shown?'flex':'none';}
-  function syncTimers(timers){latestTimers=(timers&&timers.length!==undefined)?timers:[];renderTimerStrip();syncStandaloneAlarm();if(currentView&&currentView.type==='kitchen.show_recipe')renderStepTimer(currentView);if(currentView&&currentView.type==='kitchen.show_idle')renderIdleStandaloneTimer();}
+  function renderTimerStrip(){var strip=$('timerStrip');if(!strip)return;strip.innerHTML='';var shown=0;for(var i=0;i<latestTimers.length;i++){(function(t){if(t.status==='finished'&&t.kind!=='standalone'&&currentView&&currentView.type==='kitchen.show_recipe'&&t.dish===currentView.title&&Number(t.step)===Number(currentView.step)){return;}var chip=el('div','timer-chip '+t.status);var label=t.kind==='standalone'?'独立计时':(t.dish+' · '+(Number(t.step)+1)+'步');var right=t.status==='finished'?'时间到':fmt(remaining(t));chip.appendChild(el('span','',label));chip.appendChild(el('strong','',right));chip.onclick=function(){if(t.kind==='standalone'){openStandaloneTimer();}else{action('timer_open',{timer_id:t.timer_id});}};if(t.status==='finished'){var x=el('button','chip-x','×');x.setAttribute('aria-label','关闭提醒');x.onclick=function(ev){if(ev&&ev.stopPropagation)ev.stopPropagation();action('timer_dismiss',{timer_id:t.timer_id});};chip.appendChild(x);}strip.appendChild(chip);shown++;})(latestTimers[i]);}strip.style.display=shown?'flex':'none';}
+  function syncTimers(timers){latestTimers=(timers&&timers.length!==undefined)?timers:[];for(var ai=0;ai<latestTimers.length;ai++)anchorTimer(latestTimers[ai]);renderTimerStrip();syncStandaloneAlarm();if(currentView&&currentView.type==='kitchen.show_recipe')renderStepTimer(currentView);if(currentView&&currentView.type==='kitchen.show_dashboard')renderDashboardTimers(currentView);if(timerCenterOpen())renderTimerCenter();if($('idleTimerHost'))renderIdleStandaloneTimer();}
   function timerButton(text,fn,cls){var b=el('button',cls||'',text);b.onclick=fn;return b;}
-  function openModal(seconds,target){seconds=Math.max(5,Math.min(5999,Math.round(seconds||30)));$('minInput').value=Math.floor(seconds/60);$('secInput').value=seconds%60;modalTarget=target;$('timerModal').className='modal show';setTimeout(function(){try{$('minInput').focus();}catch(e){}},50);}
-  function closeModal(){$('timerModal').className='modal';modalTarget=null;}
-  $('modalCancel').onclick=closeModal;$('modalOK').onclick=function(){var m=parseInt($('minInput').value||'0',10)||0,s=parseInt($('secInput').value||'0',10)||0,total=m*60+s;total=Math.max(5,Math.min(5999,total));var target=modalTarget;closeModal();if(!target)return;if(target.timer){action('timer_set',{timer_id:target.timer.timer_id,seconds:total});}else if(target.standalone){action('timer_standalone_start',{seconds:total});}else if(target.view){setDraft(target.view,total);}};
-  function standaloneTimer(){for(var i=0;i<latestTimers.length;i++){if(latestTimers[i].kind==='standalone')return latestTimers[i];}return null;}
-  function renderIdleStandaloneTimer(){var host=$('idleTimerHost');if(!host)return;host.innerHTML='';var t=standaloneTimer(),box=el('div','idle-timer');var head=el('div','idle-timer-head');head.appendChild(el('div','idle-timer-title','⏱ 独立计时器'));head.appendChild(el('div','idle-timer-note',t?(t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'请结束提醒')):'无需加载菜单'));box.appendChild(head);if(!t){var presets=el('div','idle-timer-presets');[[300,'5分钟'],[600,'10分钟'],[900,'15分钟']].forEach(function(x){presets.appendChild(timerButton(x[1],function(){action('timer_standalone_start',{seconds:x[0]});}));});presets.appendChild(timerButton('自定义',function(){openModal(300,{standalone:true});},'primary'));box.appendChild(presets);}else{var tt=el('div','idle-timer-time'+(t.status==='finished'?' finished':''),t.status==='finished'?'时间到':fmt(remaining(t)));tt.id='idleStandaloneTime';box.appendChild(tt);var c=el('div','idle-timer-actions');if(t.status==='running'){c.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary'));c.appendChild(timerButton('＋1分钟',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:60});}));c.appendChild(timerButton('重新设置',function(){openModal(Math.max(5,remaining(t)),{timer:t});}));c.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}else if(t.status==='paused'){c.appendChild(timerButton('▶ 继续',function(){action('timer_resume',{timer_id:t.timer_id});},'primary'));c.appendChild(timerButton('＋1分钟',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:60});}));c.appendChild(timerButton('重新设置',function(){openModal(Math.max(5,remaining(t)||t.duration_sec),{timer:t});}));c.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}else{var done=timerButton('结束提醒',function(){action('timer_dismiss',{timer_id:t.timer_id});},'danger');done.style.gridColumn='1 / -1';c.appendChild(done);}box.appendChild(c);}host.appendChild(box);}
-  function renderStepTimer(v){var host=$('stepTimerHost');if(!host)return;host.innerHTML='';var hint=v.timer_hint||null,t=timerForView(v);if(!hint&&!t)return;var box=el('div','step-timer'+(t&&t.status==='finished'?' finished':''));var left=el('div');left.appendChild(el('div','timer-title',t?'本步骤计时':'建议计时'));var sec=t?remaining(t):suggested(v);var timeEl=el('div','timer-time',fmt(sec));timeEl.id='currentTimerTime';timeEl.onclick=function(){openModal(sec,t?{timer:t}:{view:v});};left.appendChild(timeEl);var state='';if(t){state=t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'时间到');}else if(hint){state='默认 '+fmt(hint.default_sec)+(Number(hint.max_sec)>Number(hint.default_sec)?' · 可延长到 '+fmt(hint.max_sec):'');}left.appendChild(el('div','timer-state',state));box.appendChild(left);var controls=el('div','timer-controls');var step=stepSize(sec);
-    if(!t){controls.appendChild(timerButton('－'+fmt(step),function(){setDraft(v,suggested(v)-step);}));controls.appendChild(timerButton('▶ 开始',function(){action('timer_start',{seconds:suggested(v)});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){setDraft(v,suggested(v)+step);}));controls.appendChild(timerButton('设置',function(){openModal(suggested(v),{view:v});}));}
-    else if(t.status==='running'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}
-    else if(t.status==='paused'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('▶ 继续',function(){action('timer_resume',{timer_id:t.timer_id});},'primary'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('设置',function(){openModal(sec,{timer:t});}));}
-    else{controls.appendChild(timerButton('＋'+fmt(step)+'继续',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});},'primary'));controls.appendChild(timerButton('重新计时',function(){action('timer_start',{seconds:suggested(v)});}));controls.appendChild(timerButton('完成',function(){action('timer_dismiss',{timer_id:t.timer_id});}));}
+  var standaloneTimerMode='countdown',standaloneDraftSec=900;
+  var stopwatchState={running:false,elapsed_ms:0,started_ms:0};
+  try{var sw=JSON.parse(localStorage.getItem('kitchen.stopwatch.v1')||'{}');if(sw&&typeof sw==='object'){stopwatchState.running=!!sw.running;stopwatchState.elapsed_ms=Math.max(0,Number(sw.elapsed_ms)||0);stopwatchState.started_ms=Math.max(0,Number(sw.started_ms)||0);}}catch(e){}
+  function saveStopwatch(){try{localStorage.setItem('kitchen.stopwatch.v1',JSON.stringify(stopwatchState));}catch(e){}}
+  function stopwatchSeconds(){var ms=Number(stopwatchState.elapsed_ms)||0;if(stopwatchState.running&&stopwatchState.started_ms)ms+=Math.max(0,Date.now()-stopwatchState.started_ms);return Math.floor(ms/1000);}
+  function stopwatchStart(){if(!stopwatchState.running){stopwatchState.running=true;stopwatchState.started_ms=Date.now();saveStopwatch();renderIdleStandaloneTimer();}}
+  function stopwatchPause(){if(stopwatchState.running){stopwatchState.elapsed_ms=Math.max(0,(Number(stopwatchState.elapsed_ms)||0)+(Date.now()-stopwatchState.started_ms));stopwatchState.running=false;stopwatchState.started_ms=0;saveStopwatch();renderIdleStandaloneTimer();}}
+  function stopwatchReset(){stopwatchState={running:false,elapsed_ms:0,started_ms:0};saveStopwatch();renderIdleStandaloneTimer();}
+  function overlayAction(name,params,cb){var url='/kitchen/action?action='+encodeURIComponent(name),k;params=params||{};for(k in params){if(params.hasOwnProperty(k)&&params[k]!==undefined&&params[k]!==null&&params[k]!==''){url+='&'+encodeURIComponent(k)+'='+encodeURIComponent(String(params[k]));}}xhrGet(url,function(err,text){if(err){if(cb)cb(err);else showError('操作失败：'+err.message);return;}var r=null;try{r=JSON.parse(text);}catch(e){if(cb)cb(e);else showError('操作响应解析失败');return;}try{if(r&&r.timers)syncTimers(r.timers);if(r&&r.audio)syncAudio(r.audio);if(r&&r.qa)qaRender(r.qa);}catch(ignore){}if(cb)cb(null,r);});}
+  function renderShoppingOverlay(v){var host=$('shoppingModalHost');if(!host)return;host.innerHTML='';var groups=(v&&v.groups)||[];if(!groups.length){host.appendChild(el('div','shopping-modal-empty','今天暂时没有需要采购的内容。'));return;}for(var i=0;i<groups.length;i++){var card=el('section','mock-shopping-card');card.appendChild(el('strong','',groups[i].name||'建议购买'));var items=groups[i].items||[],list=el('div','mock-shopping-list');for(var j=0;j<items.length;j++){(function(item){var text=(item&&typeof item==='object')?String(item.text||''):String(item||''),itemId=(item&&typeof item==='object')?String(item.id||''):'',inv=(item&&typeof item==='object')?item.inventory:null;var lab=el('label','mock-shopping-row'+((item&&item.checked)?' checked':'')),ck=document.createElement('input');ck.type='checkbox';ck.checked=!!(item&&item.checked);ck.onchange=function(){var wanted=ck.checked;ck.disabled=true;overlayAction('shopping_toggle_overlay',{value:itemId,done:wanted?'1':'0'},function(err,r){ck.disabled=false;if(err){ck.checked=!wanted;return;}renderShoppingOverlay((r&&r.overlay)||v);});};lab.appendChild(ck);var copy=el('span','shopping-item-copy');copy.appendChild(el('span','shopping-item-text',text));lab.appendChild(copy);if(inv&&inv.label)lab.appendChild(el('span','shopping-stock-badge',String(inv.label)));list.appendChild(lab);})(items[j]);}card.appendChild(list);host.appendChild(card);}}
+  function openShoppingModal(){var m=$('shoppingModal');if(!m)return;m.className='modal show';var h=$('shoppingModalHost');if(h)h.innerHTML='<div class="shopping-modal-empty">正在读取今日采购…</div>';overlayAction('shopping_overlay',{},function(err,r){if(err){if(h)h.innerHTML='<div class="shopping-modal-empty">采购清单读取失败，请稍后再试。</div>';return;}renderShoppingOverlay((r&&r.overlay)||{});});}
+  function closeShoppingModal(){if($('shoppingModal'))$('shoppingModal').className='modal';}
+  if($('shoppingModalClose'))$('shoppingModalClose').onclick=closeShoppingModal;
+  if($('shoppingModal'))$('shoppingModal').onclick=function(ev){if(ev.target===$('shoppingModal'))closeShoppingModal();};
+  function openStandaloneTimer(){$('standaloneTimerModal').className='modal show';try{renderIdleStandaloneTimer();}catch(e){console.log('Kitchen standalone timer render failed',e);var h=$('idleTimerHost');if(h){h.innerHTML='';var box=el('div','kitchen-timer-ui');box.appendChild(el('div','kitchen-timer-big',fmt(standaloneDraftSec)));box.appendChild(el('div','kitchen-timer-sub','计时器正在恢复，请重新打开一次'));h.appendChild(box);}}}
+  function closeStandaloneTimer(){$('standaloneTimerModal').className='modal';}
+  $('standaloneTimerClose').onclick=closeStandaloneTimer;
+  $('standaloneTimerModal').onclick=function(ev){if(ev.target===$('standaloneTimerModal'))closeStandaloneTimer();};
+  function kitchenTimerModeButton(label,mode){var b=el('button',standaloneTimerMode===mode?'active':'',label);b.type='button';b.onclick=function(){standaloneTimerMode=mode;renderIdleStandaloneTimer();};return b;}
+  function countdownStartButton(t){var b=el('button','kitchen-timer-main',t?(t.status==='running'?'暂停':(t.status==='paused'?'继续':'结束提醒')):'▶ 开始计时');b.type='button';b.onclick=function(){if(!t)action('timer_standalone_start',{seconds:standaloneDraftSec});else if(t.status==='running')action('timer_pause',{timer_id:t.timer_id});else if(t.status==='paused')action('timer_resume',{timer_id:t.timer_id});else action('timer_dismiss',{timer_id:t.timer_id});};return b;}
+  function renderIdleStandaloneTimer(){var host=$('idleTimerHost');if(!host)return;host.innerHTML='';var root=el('div','kitchen-timer-ui');var modes=el('div','kitchen-timer-mode');modes.appendChild(kitchenTimerModeButton('倒计时','countdown'));modes.appendChild(kitchenTimerModeButton('正计时','stopwatch'));root.appendChild(modes);
+    if(standaloneTimerMode==='stopwatch'){var swt=el('div','kitchen-timer-big',fmt(stopwatchSeconds()));swt.id='stopwatchTime';root.appendChild(swt);root.appendChild(el('div','kitchen-timer-sub',stopwatchState.running?'正在正计时':'适合记录焯水、醒面或自由计时'));var main=el('button','kitchen-timer-main',stopwatchState.running?'暂停':'▶ 开始计时');main.type='button';main.onclick=stopwatchState.running?stopwatchPause:stopwatchStart;root.appendChild(main);var sacts=el('div','kitchen-timer-secondary');var rs=el('button','','重置');rs.type='button';rs.onclick=stopwatchReset;sacts.appendChild(rs);var noop=el('button','','');noop.style.visibility='hidden';noop.disabled=true;sacts.appendChild(noop);var cl=el('button','','关闭');cl.type='button';cl.onclick=closeStandaloneTimer;sacts.appendChild(cl);root.appendChild(sacts);host.appendChild(root);return;}
+    var t=standaloneTimer();if(!t){var presets=el('div','kitchen-timer-presets');[[60,'1分钟'],[300,'5分钟'],[600,'10分钟'],[900,'15分钟'],[1800,'30分钟'],[3600,'1小时']].forEach(function(x){var b=el('button','kitchen-timer-preset'+(standaloneDraftSec===x[0]?' active':''),x[1]);b.type='button';b.onclick=function(){standaloneDraftSec=x[0];renderIdleStandaloneTimer();};presets.appendChild(b);});root.appendChild(presets);root.appendChild(el('div','kitchen-timer-big',fmt(standaloneDraftSec)));root.appendChild(el('div','kitchen-timer-sub','倒计时结束后会持续提醒，直到你主动结束'));root.appendChild(countdownStartButton(null));}
+    else{var sec=t.status==='finished'?0:remaining(t);var big=el('div','kitchen-timer-big',t.status==='finished'?'时间到':fmt(sec));big.id='idleStandaloneTime';root.appendChild(big);root.appendChild(el('div','kitchen-timer-sub',t.status==='running'?'倒计时进行中':(t.status==='paused'?'已暂停':'提醒中')));root.appendChild(countdownStartButton(t));var c=el('div','kitchen-timer-secondary');if(t.status!=='finished'){var plus=el('button','','＋1分钟');plus.type='button';plus.onclick=function(){action('timer_adjust',{timer_id:t.timer_id,seconds:60});};c.appendChild(plus);var reset=el('button','','重新设置');reset.type='button';reset.onclick=function(){openModal(Math.max(5,remaining(t)||t.duration_sec),{timer:t});};c.appendChild(reset);var cancel=el('button','danger','取消');cancel.type='button';cancel.onclick=function(){action('timer_cancel',{timer_id:t.timer_id});};c.appendChild(cancel);}else{var done=el('button','danger','结束提醒');done.type='button';done.style.gridColumn='1 / -1';done.onclick=function(){action('timer_dismiss',{timer_id:t.timer_id});};c.appendChild(done);}root.appendChild(c);}
+    host.appendChild(root);
+  }
+  var pendingTodayRemoveDish='';
+  function openTodayRemoveModal(label){pendingTodayRemoveDish=String(label||'');$('todayRemoveName').textContent=pendingTodayRemoveDish;$('todayRemoveStatus').textContent='';$('todayRemoveConfirm').disabled=false;$('todayRemoveModal').className='modal show';}
+  function closeTodayRemoveModal(){$('todayRemoveModal').className='modal';pendingTodayRemoveDish='';$('todayRemoveStatus').textContent='';$('todayRemoveConfirm').disabled=false;}
+  $('todayRemoveCancel').onclick=closeTodayRemoveModal;$('todayRemoveModal').onclick=function(ev){if(ev.target===$('todayRemoveModal'))closeTodayRemoveModal();};
+  $('todayRemoveConfirm').onclick=function(){if(!pendingTodayRemoveDish)return;var dish=pendingTodayRemoveDish,btn=$('todayRemoveConfirm');btn.disabled=true;$('todayRemoveStatus').textContent='正在从今日菜谱移除…';action('today_remove',{value:dish},function(err){if(err){btn.disabled=false;$('todayRemoveStatus').textContent='移除失败：'+(err.serverMessage||err.message||'请稍后再试');return;}closeTodayRemoveModal();setTimeout(poll,60);});};
+  function renderStepTimer(v){var host=$('stepTimerHost');if(!host)return;host.innerHTML='';var hint=v.timer_hint||null,t=timerForView(v);
+    // Untimed steps intentionally render no step-timer UI. Every cooking page
+    // already has the standalone Kitchen Timer, so a second generic timer button
+    // only adds clutter. Existing/running recipe timers remain visible.
+    if(!t&&!hint)return;
+    var box=el('div','step-timer'+(t&&t.status==='finished'?' finished':''));var left=el('div');left.appendChild(el('div','timer-title',t?'本步骤计时':'建议计时'));var sec=t?remaining(t):suggested(v);var timeEl=el('div','timer-time',fmt(sec));timeEl.id='currentTimerTime';timeEl.onclick=function(){openModal(Math.max(5,sec),t?{timer:t}:{view:v});};left.appendChild(timeEl);var state='';if(t){state=t.status==='running'?'计时中':(t.status==='paused'?'已暂停':'时间到');}else{state='建议 '+fmt(hint.default_sec)+(Number(hint.max_sec)>Number(hint.default_sec)?' · 最长 '+fmt(hint.max_sec):'');}left.appendChild(el('div','timer-state',state));box.appendChild(left);var controls=el('div','timer-controls');var step=stepSize(sec);
+    if(!t){controls.appendChild(timerButton('－'+fmt(step),function(){setDraft(v,suggested(v)-step);}));controls.appendChild(timerButton('▶ 开始',function(){action('timer_start',{seconds:suggested(v)});},'primary timer-touch-main'));controls.appendChild(timerButton('＋'+fmt(step),function(){setDraft(v,suggested(v)+step);}));controls.appendChild(timerButton('设置',function(){openModal(suggested(v),{view:v});}));}
+    else if(t.status==='running'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('Ⅱ 暂停',function(){action('timer_pause',{timer_id:t.timer_id});},'primary timer-touch-main'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('取消',function(){action('timer_cancel',{timer_id:t.timer_id});},'danger'));}
+    else if(t.status==='paused'){controls.appendChild(timerButton('－'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:-step});}));controls.appendChild(timerButton('▶ 继续',function(){action('timer_resume',{timer_id:t.timer_id});},'primary timer-touch-main'));controls.appendChild(timerButton('＋'+fmt(step),function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});}));controls.appendChild(timerButton('设置',function(){openModal(sec,{timer:t});}));}
+    else{controls.appendChild(timerButton('＋'+fmt(step)+'继续',function(){action('timer_adjust',{timer_id:t.timer_id,seconds:step});},'primary timer-touch-main'));controls.appendChild(timerButton('重新计时',function(){action('timer_start',{seconds:Math.max(5,suggested(v)||300)});}));controls.appendChild(timerButton('完成',function(){action('timer_dismiss',{timer_id:t.timer_id});}));}
     box.appendChild(controls);host.appendChild(box);
   }
-  function tickTimers(){renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe'){var t=timerForView(currentView),n=$('currentTimerTime');if(t&&n)n.textContent=fmt(remaining(t));}if(currentView&&currentView.type==='kitchen.show_idle'){var st=standaloneTimer(),sn=$('idleStandaloneTime');if(st&&sn&&st.status!=='finished')sn.textContent=fmt(remaining(st));}}
+  function tickTimers(){renderTimerStrip();if(currentView&&currentView.type==='kitchen.show_recipe'){var t=timerForView(currentView),n=$('currentTimerTime');if(t&&n)n.textContent=fmt(remaining(t));}var nodes=document.querySelectorAll('[data-r49-timer-time]');for(var ri=0;ri<nodes.length;ri++){var id=nodes[ri].getAttribute('data-r49-timer-time'),rt=null;for(var rj=0;rj<latestTimers.length;rj++){if(latestTimers[rj].timer_id===id){rt=latestTimers[rj];break;}}if(rt)nodes[ri].textContent=rt.status==='finished'?'时间到':fmt(remaining(rt));}var st=standaloneTimer(),sn=$('idleStandaloneTime');if(st&&sn&&st.status!=='finished')sn.textContent=fmt(remaining(st));var swt=$('stopwatchTime');if(swt&&standaloneTimerMode==='stopwatch')swt.textContent=fmt(stopwatchSeconds());}
   function render(v,force){
-    if(!v||!v.type)return;var rev=String(v.revision||'');if(!force&&rev&&rev===lastRevision){currentView=v;return;}if(rev)lastRevision=rev;currentView=v;clearView();
-    $('eyebrow').textContent=v.eyebrow||'HOME AI · 厨房';$('title').textContent=v.title||'厨房终端';$('message').textContent=v.message||'';$('footer').textContent=(v.footer||'')+' · __KITCHEN_UI_VERSION__';
-    if(v.type==='kitchen.show_idle'){var ia=el('div','idle-actions');var pull=el('button','','加载今日菜单');pull.onclick=function(){action('today');};ia.appendChild(pull);$('content').appendChild(ia);var ih=el('div','');ih.id='idleTimerHost';$('content').appendChild(ih);renderIdleStandaloneTimer();return;}
-    if(v.type==='kitchen.show_done'){var note=el('div','done-note','稍后会自动回到等待页面。');$('content').appendChild(note);return;}
+    if(!v||!v.type)return;var rev=String(v.revision||'');if(!force&&rev&&rev===lastRevision){currentView=v;return;}if(rev)lastRevision=rev;currentView=v;clearView();updateGlobalNav(navActiveForView(v));
+    if(v.type==='kitchen.show_idle'){renderModernHome(v);return;}if(v.type==='kitchen.show_dashboard'){renderDashboard(v);return;}if(v.type==='kitchen.show_menu'){renderTodayMenu(v);return;}if(v.type==='kitchen.show_picker'){renderPicker(v);return;}if(v.type==='kitchen.show_prep'){renderPrep(v);return;}if(v.type==='kitchen.show_recipe'){renderCookingFlow(v);return;}if(v.type==='kitchen.show_consumption'){renderConsumption(v);return;}if(v.type==='kitchen.show_finish'){renderFinish(v);return;}if(v.type==='kitchen.show_save_private'){renderSavePrivate(v);return;}if(v.type==='kitchen.show_shopping'){renderShopping(v);return;}if(v.type==='kitchen.show_timeline'){renderTimeline(v);return;}
+    setHomeMode(false);
+    $('eyebrow').textContent=v.eyebrow||'HOME AI · 厨房';$('title').textContent=v.title||'小K';$('message').textContent=v.message||'';$('footer').textContent=(v.footer||'')+' · __KITCHEN_UI_VERSION__';
+    if(v.type==='kitchen.show_done'){action('home');return;}
     if(v.type==='kitchen.show_message')return;
     if(v.type==='kitchen.show_menu'){var grid=el('div','menu');var items=(v.items&&v.items.length!==undefined)?v.items:[];for(var i=0;i<items.length;i++){(function(index){var item=items[index];var label=(typeof item==='string')?item:((item&&item.name)?item.name:('菜品 '+(index+1)));var b=el('button','');b.appendChild(el('span','',label));if(item&&item.has_progress&&Number(item.total_steps)>0){var pstep=Number(item.progress_step)||0;var ptxt=pstep===0?'继续 · 备菜':('继续 · 第 '+(pstep+1)+' / '+Number(item.total_steps)+' 步');b.appendChild(el('span','menu-progress',ptxt));}b.onclick=function(){action('recipe',{value:label});};grid.appendChild(b);})(i);}$('content').appendChild(grid);var tools=el('div','toolbar');var shop=el('button','action','购物清单');shop.onclick=function(){action('shopping');};tools.appendChild(shop);var time=el('button','action','烧菜顺序');time.onclick=function(){action('timeline');};tools.appendChild(time);var finish=el('button','action finish-btn','结束今日烹饪');finish.onclick=function(){action('finish_start');};tools.appendChild(finish);$('content').appendChild(tools);return;}
     if(v.type==='kitchen.show_recipe'){$('message').textContent='';var metaText=(v.type_label||'菜谱')+(v.estimated_text?' · '+v.estimated_text:'');$('content').appendChild(el('div','recipe-meta',metaText));var card=el('div','step-card');var stepNum=(parseInt(v.step,10)||0)+1,total=parseInt(v.total_steps,10)||1;var stepLabel=(v.step_kind==='prep')?('备菜 · '+stepNum+' / '+total):('步骤 '+stepNum+' / '+total);card.appendChild(el('div','step-label',stepLabel));card.appendChild(el('div','step-text',v.step_text||'（本步骤内容为空）'));var timerHost=el('div','');timerHost.id='stepTimerHost';card.appendChild(timerHost);var tips=v.key_points||[];if(tips.length){var box=el('div','tips');box.appendChild(el('h3','','关键提醒'));var ul=el('ul');for(var j=0;j<tips.length;j++){ul.appendChild(el('li','',tips[j]));}box.appendChild(ul);card.appendChild(box);}$('content').appendChild(card);renderStepTimer(v);$('nav').style.display='grid';$('nav').appendChild(navButton('← 上一步','prev',false));$('nav').appendChild(navButton('返回菜单','menu',false));$('nav').appendChild(navButton('下一步 →','next',true));return;}
@@ -6933,7 +8590,8 @@ main{flex:1;min-height:0;display:flex;justify-content:center}.panel{width:100%;m
 })();
 </script>
 </body>
-</html>'''
+</html>
+'''
     html = (
         html.replace("__KITCHEN_UI_VERSION__", KITCHEN_UI_VERSION)
         .replace("__KITCHEN_PROTOCOL__", KITCHEN_PROTOCOL)
@@ -6996,6 +8654,7 @@ def _kitchen_audio_http_response(wav: bytes, range_header: str = "") -> Response
 
 
 async def gateway_http_request(connection: Any, request: Any) -> Response | None:
+    global KITCHEN_CURRENT_STATE
     # Serve KitchenTerminal HTTP without creating a second web server.
     raw_path = str(getattr(request, "path", "") or "")
     parsed = urlsplit(raw_path)
@@ -7005,6 +8664,16 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
         return None
     if path in {KITCHEN_HTTP_PATH, KITCHEN_HTTP_PATH + "/"}:
         return _http_response(200, "OK", _kitchen_html(), "text/html; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/assets/home_hero.jpg":
+        asset = Path(__file__).with_name("home_hero_crop.jpg")
+        if asset.exists():
+            return _http_response(200, "OK", asset.read_bytes(), "image/jpeg")
+        return _http_response(404, "Not Found", b"asset not found", "text/plain; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/assets/home_food.jpg":
+        asset = Path(__file__).with_name("home_food_crop.jpg")
+        if asset.exists():
+            return _http_response(200, "OK", asset.read_bytes(), "image/jpeg")
+        return _http_response(404, "Not Found", b"asset not found", "text/plain; charset=utf-8")
     if path == KITCHEN_HTTP_PATH + "/view":
         _kitchen_maybe_return_idle()
         body = json.dumps({
@@ -7018,6 +8687,45 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
             "server_time": datetime.now().astimezone().isoformat(),
         }, ensure_ascii=False).encode("utf-8")
         return _http_response(200, "OK", body, "application/json; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/food/view":
+        body = json.dumps(_food_snapshot(), ensure_ascii=False).encode("utf-8")
+        return _http_response(200, "OK", body, "application/json; charset=utf-8")
+    if path == KITCHEN_HTTP_PATH + "/food/action":
+        action = str((query.get("action") or [""])[0]).strip().lower()
+        name = str((query.get("name") or [""])[0]).strip()
+        amount_text = str((query.get("amount") or [""])[0]).strip()
+        unit = str((query.get("unit") or ["份"])[0]).strip() or "份"
+        category = str((query.get("category") or ["其他"])[0]).strip() or "其他"
+        source = str((query.get("source") or [""])[0]).strip()
+        status = str((query.get("status") or [""])[0]).strip()
+        priority = str((query.get("priority") or [""])[0]).strip()
+        new_name = str((query.get("new_name") or [""])[0]).strip()
+        quantity_text = str((query.get("quantity") or [""])[0]).strip()
+        item_id_text = str((query.get("item_id") or [""])[0]).strip()
+        try:
+            if action == "add":
+                _food_add(name, float(amount_text or "1"), unit, category, source)
+            elif action == "consume":
+                _food_consume(name, float(amount_text or "1"))
+            elif action == "status":
+                _food_set_status(name, status, category)
+            elif action == "priority":
+                _food_set_priority(name, priority)
+            elif action == "rename":
+                _food_rename(name, new_name)
+            elif action == "edit":
+                edited = _food_edit(name, new_name or name, None if quantity_text == "" else float(quantity_text), None if item_id_text == "" else int(item_id_text))
+            else:
+                raise ValueError(f"unsupported food action: {action}")
+            payload = _food_snapshot()
+            if action == "edit":
+                payload["edited"] = edited
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            return _http_response(200, "OK", body, "application/json; charset=utf-8")
+        except (ValueError, TypeError, sqlite3.Error) as exc:
+            body = json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False).encode("utf-8")
+            return _http_response(400, "Bad Request", body, "application/json; charset=utf-8")
+
     if path == KITCHEN_HTTP_PATH + "/alarm.wav":
         request_headers = getattr(request, "headers", None)
         range_header = request_headers.get("Range", "") if request_headers is not None else ""
@@ -7035,10 +8743,19 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
         action = str((query.get("action") or [""])[0]).strip().lower()
         action = {
             "show_today": "today", "menu.today": "today", "menu.load": "today", "pull_today": "today",
+            "show_home": "home", "menu.home": "home",
+            "show_dashboard": "dashboard", "cook.dashboard": "dashboard", "menu.dashboard": "dashboard",
+            "menu.picker": "picker", "show_picker": "picker",
+            "menu.inventory_recommend": "inventory_recommend", "inventory.recommend": "inventory_recommend",
+            "menu.add_recipe": "today_add", "menu.remove_recipe": "today_remove",
+            "menu.prep": "prep", "show_prep": "prep", "prep.toggle": "prep_toggle",
             "recipe.open": "recipe", "menu.recipe": "recipe",
             "step.next": "next", "recipe.next": "next", "step.prev": "prev", "recipe.prev": "prev",
+            "recipe.consume.open": "recipe_consume_open", "recipe.consume.commit": "recipe_consume_commit",
+            "day.consume.commit": "day_consume_commit", "day.consume.skip": "day_consume_skip",
             "menu.back": "menu", "show_menu": "menu",
-            "menu.shopping": "shopping", "show_shopping": "shopping",
+            "menu.shopping": "shopping", "show_shopping": "shopping", "shopping.toggle": "shopping_toggle",
+            "shopping.overlay": "shopping_overlay", "shopping.overlay.toggle": "shopping_toggle_overlay",
             "menu.timeline": "timeline", "show_timeline": "timeline",
             "day.finish": "finish_start", "day.finish.confirm": "finish_confirm",
             "day.finish.none": "finish_no_save", "day.finish.save": "finish_save",
@@ -7047,9 +8764,38 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
         value = str((query.get("value") or [""])[0]).strip()
         timer_id = str((query.get("timer_id") or [""])[0]).strip()
         seconds_text = str((query.get("seconds") or [""])[0]).strip()
+        done_text = str((query.get("done") or [""])[0]).strip().lower()
         try:
+            overlay_payload = None
             if action == "today":
                 await _kitchen_show_today_menu()
+            elif action == "home":
+                await _kitchen_show_home()
+            elif action == "dashboard":
+                await _kitchen_show_dashboard()
+            elif action == "picker":
+                await _kitchen_show_picker()
+            elif action == "inventory_recommend":
+                try:
+                    selected = json.loads(value) if value else []
+                except json.JSONDecodeError as exc:
+                    raise KitchenMenuError("invalid inventory selection") from exc
+                if not isinstance(selected, list):
+                    raise KitchenMenuError("invalid inventory selection")
+                await _kitchen_show_inventory_recommendations([str(x) for x in selected])
+            elif action == "today_add":
+                menu = _kitchen_add_library_recipe_to_today(value)
+                await _kitchen_show_menu(menu)
+            elif action == "today_remove":
+                menu = _kitchen_remove_recipe_from_today(value)
+                await _kitchen_show_menu(menu)
+            elif action == "prep":
+                await _kitchen_show_prep()
+            elif action == "prep_toggle":
+                menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+                payload = _kitchen_set_prep_task(menu, value, done_text in {"1", "true", "yes", "on"})
+                KITCHEN_CURRENT_STATE = {"screen": "prep", "date": str(menu.get("date") or ""), "dish": "", "step": 0}
+                await kitchen_broadcast(payload)
             elif action == "recipe":
                 delivered, recipe = await _kitchen_open_recipe_by_name(value, None)
                 if recipe is None:
@@ -7058,11 +8804,46 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
                 await _kitchen_move_step(1)
             elif action == "prev":
                 await _kitchen_move_step(-1)
+            elif action == "recipe_consume_open":
+                await _kitchen_show_recipe_consumption(value)
+            elif action == "recipe_consume_commit":
+                try:
+                    rows = json.loads(value) if value else []
+                except json.JSONDecodeError as exc:
+                    raise KitchenMenuError("invalid recipe consumption") from exc
+                if not isinstance(rows, list):
+                    raise KitchenMenuError("invalid recipe consumption")
+                await _kitchen_commit_recipe_consumption(rows)
+            elif action == "day_consume_commit":
+                try:
+                    rows = json.loads(value) if value else []
+                except json.JSONDecodeError as exc:
+                    raise KitchenMenuError("invalid daily consumption") from exc
+                if not isinstance(rows, list):
+                    raise KitchenMenuError("invalid daily consumption")
+                await _kitchen_commit_day_consumption(rows, speak=True)
+            elif action == "day_consume_skip":
+                await _kitchen_skip_day_consumption(speak=True)
             elif action == "menu":
                 menu = KITCHEN_CURRENT_MENU or _kitchen_load()
                 await _kitchen_show_menu(menu)
             elif action == "shopping":
                 await _kitchen_show_shopping()
+            elif action == "shopping_overlay":
+                menu = KITCHEN_CURRENT_MENU
+                if menu is None or str(menu.get("date") or "") != _kitchen_today():
+                    menu = _kitchen_load()
+                overlay_payload = _kitchen_shopping_payload(menu)
+            elif action == "shopping_toggle":
+                menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+                payload = _kitchen_set_shopping_item(menu, value, done_text in {"1", "true", "yes", "on"})
+                KITCHEN_CURRENT_STATE = {"screen": "shopping", "date": str(menu.get("date") or ""), "dish": "", "step": 0}
+                await kitchen_broadcast(payload)
+            elif action == "shopping_toggle_overlay":
+                menu = KITCHEN_CURRENT_MENU
+                if menu is None or str(menu.get("date") or "") != _kitchen_today():
+                    menu = _kitchen_load()
+                overlay_payload = _kitchen_set_shopping_item(menu, value, done_text in {"1", "true", "yes", "on"})
             elif action == "timeline":
                 await _kitchen_show_timeline()
             elif action == "finish_start":
@@ -7113,6 +8894,8 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
             else:
                 raise KitchenMenuError(f"unsupported action: {action}")
             payload = {"ok": True, "action": action, "view": KITCHEN_CURRENT_VIEW, "state": KITCHEN_CURRENT_STATE, "timers": _kitchen_timer_snapshot(), "audio": _kitchen_audio_public(), "qa": _kitchen_qa_public()}
+            if overlay_payload is not None:
+                payload["overlay"] = overlay_payload
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             return _http_response(200, "OK", body, "application/json; charset=utf-8")
         except (KitchenMenuError, ValueError, TypeError) as exc:
@@ -7163,8 +8946,752 @@ def _kitchen_today() -> str:
     return datetime.now().astimezone().date().isoformat()
 
 
+def _kitchen_extra_state() -> dict[str, Any]:
+    """Legacy R20-R35 extra-menu state, kept only for one-time migration."""
+    try:
+        raw = json.loads(KITCHEN_TODAY_EXTRA_FILE.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _kitchen_markdown_scalar(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return '""'
+    if re.fullmatch(r"[A-Za-z0-9_.-]+", text):
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _kitchen_recipe_cook_steps(recipe: dict[str, Any]) -> tuple[list[str], list[dict[str, Any] | None]]:
+    steps = list(recipe.get("cook_steps") or [])
+    timers = list(recipe.get("cook_step_timers") or [])
+    if not steps:
+        raw_steps = list(recipe.get("steps") or [])
+        kinds = list(recipe.get("step_kinds") or [])
+        raw_timers = list(recipe.get("step_timers") or [])
+        for idx, step in enumerate(raw_steps):
+            if idx < len(kinds) and kinds[idx] == "prep":
+                continue
+            steps.append(str(step))
+            timers.append(raw_timers[idx] if idx < len(raw_timers) else None)
+    while len(timers) < len(steps):
+        timers.append(None)
+    return [str(x).strip() for x in steps if str(x).strip()], timers[:len(steps)]
+
+
+def _kitchen_serialize_menu(menu: dict[str, Any]) -> str:
+    """Serialize the authoritative Today Menu back to Obsidian Kitchen Schema v1."""
+    date_text = str(menu.get("date") or _kitchen_today())
+    items = [dict(x) if isinstance(x, dict) else {"name": str(x)} for x in (menu.get("items") or [])]
+    recipes = [ensure_recipe_prep_first(dict(x)) for x in (menu.get("recipes") or []) if isinstance(x, dict)]
+    by_name = {str(r.get("name") or "").strip(): r for r in recipes}
+    # Ensure item order follows the visible Today's Menu and references only recipes that exist.
+    clean_items = []
+    for idx, item in enumerate(items):
+        name = str(item.get("name") or "").strip()
+        if not name or name not in by_name or name == "白米饭":
+            continue
+        clean_items.append({
+            "name": name,
+            "category": str(item.get("category") or "other"),
+            "cook_order": idx + 1,
+        })
+    # If a caller passed recipes without item rows, keep them instead of silently losing them.
+    known = {x["name"] for x in clean_items}
+    for recipe in recipes:
+        name = str(recipe.get("name") or "").strip()
+        if name and name != "白米饭" and name not in known:
+            clean_items.append({"name": name, "category": "other", "cook_order": len(clean_items) + 1})
+            known.add(name)
+
+    lines = ["---", "type: dinner-menu", "schema: kitchen-menu-v1", f"date: {date_text}"]
+    weekday = str(menu.get("weekday") or "").strip()
+    if weekday:
+        lines.append(f"weekday: {_kitchen_markdown_scalar(weekday)}")
+    servings = menu.get("servings")
+    if servings not in (None, ""):
+        lines.append(f"servings: {servings}")
+    style = str(menu.get("style") or "").strip()
+    if style:
+        lines.append(f"style: {_kitchen_markdown_scalar(style)}")
+    estimated = menu.get("estimated_minutes")
+    if estimated not in (None, ""):
+        lines.append(f"estimated_minutes: {estimated}")
+    status = str(menu.get("status") or "planned").strip() or "planned"
+    lines.append(f"status: {_kitchen_markdown_scalar(status)}")
+    lines.append("menu:")
+    for item in clean_items:
+        lines.extend([
+            f"  - name: {_kitchen_markdown_scalar(item['name'])}",
+            f"    category: {_kitchen_markdown_scalar(item['category'])}",
+            f"    cook_order: {item['cook_order']}",
+        ])
+    lines.extend(["---", "", "## 🛒 一、超市购物单"])
+    shopping = menu.get("shopping") or []
+    if shopping:
+        for group in shopping:
+            if not isinstance(group, dict):
+                continue
+            title = str(group.get("name") or "建议购买").strip()
+            lines.extend([f"**{title}**"])
+            for item in group.get("items") or []:
+                text = str(item).strip()
+                if text:
+                    lines.append(f"- {text}")
+            lines.append("")
+    else:
+        lines.append("> 暂无")
+
+    lines.extend(["", "## 📋 二、今晚菜单"])
+    for idx, item in enumerate(clean_items, 1):
+        lines.append(f"{idx}. **{item['name']}**")
+
+    lines.extend(["", "## 🔪 三、统一备菜"])
+    for idx, item in enumerate(clean_items, 1):
+        recipe = by_name[item["name"]]
+        prep = [str(x).strip() for x in (recipe.get("prep_items") or []) if str(x).strip()]
+        if prep:
+            lines.append(f"### {idx}. {item['name']}")
+            lines.extend(f"- {x}" for x in prep)
+            lines.append("")
+
+    lines.extend(["", "## 🍳 四、烹饪步骤"])
+    for idx, item in enumerate(clean_items, 1):
+        recipe = by_name[item["name"]]
+        name = item["name"]
+        lines.append(f"### {idx}. {name}")
+        type_label = str(recipe.get("type_label") or "").strip()
+        estimated_text = str(recipe.get("estimated_text") or "").strip()
+        if type_label:
+            lines.append(f"**类型**：{type_label}")
+        if estimated_text:
+            lines.append(f"**预计用时**：{estimated_text}")
+        ingredients = [str(x).strip() for x in (recipe.get("ingredients") or []) if str(x).strip()]
+        seasoning = [str(x).strip() for x in (recipe.get("seasoning") or []) if str(x).strip()]
+        prep = [str(x).strip() for x in (recipe.get("prep_items") or []) if str(x).strip()]
+        key_points = [str(x).strip() for x in (recipe.get("key_points") or []) if str(x).strip()]
+        lines.append("#### 食材")
+        lines.extend(f"- {x}" for x in ingredients) if ingredients else lines.append("- 无需额外食材")
+        lines.append("#### 调味")
+        lines.extend(f"- {x}" for x in seasoning) if seasoning else lines.append("- 按需调味")
+        if prep:
+            lines.append("#### 备菜")
+            lines.extend(f"- {x}" for x in prep)
+        lines.append("#### 做法")
+        cook_steps, cook_timers = _kitchen_recipe_cook_steps(recipe)
+        for step_idx, step in enumerate(cook_steps, 1):
+            lines.append(f"{step_idx}. {step}")
+            hint = cook_timers[step_idx - 1] if step_idx - 1 < len(cook_timers) else None
+            if isinstance(hint, dict) and str(hint.get("source") or "") == "explicit" and str(hint.get("label") or "").strip():
+                lines.append(f"   - ⏱️ 计时：{str(hint.get('label')).strip()}")
+        lines.append("#### 关键点")
+        lines.extend(f"- {x}" for x in key_points) if key_points else lines.append("- 按步骤完成即可。")
+        lines.append("")
+
+    lines.extend(["", "## ⏱️ 五、省事操作时间线"])
+    timeline = [str(x).strip() for x in (menu.get("timeline") or []) if str(x).strip()]
+    if timeline:
+        lines.extend(f"{idx}. {text}" for idx, text in enumerate(timeline, 1))
+    else:
+        for idx, item in enumerate(clean_items, 1):
+            lines.append(f"{idx}. {item['name']}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _kitchen_write_menu_to_obsidian(menu: dict[str, Any]) -> Path:
+    """Atomically write the one authoritative Today Menu file in Obsidian."""
+    KITCHEN_MENU_DIR.mkdir(parents=True, exist_ok=True)
+    date_text = str(menu.get("date") or _kitchen_today())
+    target = KITCHEN_MENU_DIR / f"{date_text}.md"
+    tmp = target.with_name(target.name + f".tmp-{os.getpid()}")
+    text = _kitchen_serialize_menu(menu)
+    # Never replace the Obsidian source with a document the current parser cannot read back.
+    parse_kitchen_menu(text, source=str(target))
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
+    return target
+
+
+def _kitchen_migrate_legacy_extras_once() -> None:
+    """Move legacy Gateway extra-recipes into Obsidian, then delete the second store."""
+    if not KITCHEN_TODAY_EXTRA_FILE.exists():
+        return
+    state = _kitchen_extra_state()
+    if not state:
+        try:
+            KITCHEN_TODAY_EXTRA_FILE.unlink()
+        except OSError:
+            pass
+        return
+    migrated = 0
+    for date_text, extras in state.items():
+        if not isinstance(extras, list):
+            continue
+        try:
+            menu = load_kitchen_menu(KITCHEN_MENU_DIR, str(date_text))
+        except (KitchenMenuError, OSError):
+            menu = _kitchen_empty_today_menu(date_text=str(date_text))
+        existing = {str(r.get("name") or "") for r in (menu.get("recipes") or [])}
+        for raw in extras:
+            if not isinstance(raw, dict) or not isinstance(raw.get("recipe"), dict):
+                continue
+            recipe = ensure_recipe_prep_first(dict(raw["recipe"]))
+            name = str(recipe.get("name") or "").strip()
+            if not name or name == "白米饭" or name in existing:
+                continue
+            menu.setdefault("recipes", []).append(recipe)
+            menu.setdefault("items", []).append({"name": name, "category": str(raw.get("category") or "other"), "cook_order": len(menu.get("items") or []) + 1})
+            existing.add(name)
+            migrated += 1
+        _kitchen_write_menu_to_obsidian(menu)
+    try:
+        KITCHEN_TODAY_EXTRA_FILE.unlink()
+    except OSError as exc:
+        print(f"[KITCHEN-WARN] legacy extra-state cleanup failed: {exc}")
+    print(f"[KITCHEN] migrated legacy Today Menu extras into Obsidian count={migrated}")
+
+
+def _kitchen_private_section(text: str, fragment: str) -> str:
+    m = re.search(rf"^##\s+[^\n]*{re.escape(fragment)}[^\n]*\n(?P<body>.*?)(?=^##\s+|\Z)", text, re.M | re.S)
+    return m.group("body").strip() if m else ""
+
+def _kitchen_private_first_section(text: str, fragments: list[str]) -> str:
+    for fragment in fragments:
+        body = _kitchen_private_section(text, fragment)
+        if body:
+            return body
+    return ""
+
+def _kitchen_private_bullets(text: str) -> list[str]:
+    return [re.sub(r"^\s*[-*+]\s+", "", line).strip() for line in text.splitlines() if re.match(r"^\s*[-*+]\s+", line) and "计时" not in line]
+
+def _kitchen_private_steps(text: str) -> list[str]:
+    out: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        m = re.match(r"^\s*\d+[.)、]\s*(.+)$", line)
+        if m:
+            if current:
+                out.append(current.strip())
+            current = m.group(1).strip()
+            continue
+        stripped = line.strip()
+        if current and stripped and not stripped.startswith("- ⏱") and not stripped.startswith("- ⏱️"):
+            current += " " + stripped
+    if current:
+        out.append(current.strip())
+    return out
+
+def _kitchen_parse_private_recipe(path: Path) -> dict[str, Any] | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+
+    name = ""
+    # Prefer explicit Obsidian/YAML metadata when available.
+    for key in ("name", "title"):
+        m = re.search(rf"^{key}:\s*(.+?)\s*$", text, re.M | re.I)
+        if not m:
+            continue
+        raw = m.group(1).strip()
+        try:
+            name = str(json.loads(raw))
+        except Exception:
+            name = raw.strip("'\"")
+        if name:
+            break
+
+    # Accept KitchenTerminal's heading and ordinary Obsidian '# 菜名'.
+    if not name:
+        m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
+        if m:
+            name = m.group(1).strip()
+            name = re.sub(r"^[🍳🥘🍲🥗🍜🍛🍚\s]+", "", name).strip()
+            name = re.sub(r"^(?:私房菜|菜谱)\s*[·：:\-|]\s*", "", name).strip()
+    if not name:
+        name = path.stem.strip()
+
+    ingredients_text = _kitchen_private_first_section(text, ["食材", "材料", "主料", "原料"])
+    seasoning_text = _kitchen_private_first_section(text, ["调味", "调料", "佐料", "辅料"])
+    prep_text = _kitchen_private_first_section(text, ["备菜", "准备", "预处理"])
+    steps_text = _kitchen_private_first_section(text, ["做法", "烹饪步骤", "制作步骤", "步骤", "制作方法", "烹饪方法"])
+    key_text = _kitchen_private_first_section(text, ["关键点", "注意事项", "小贴士", "技巧", "要点"])
+
+    steps = _kitchen_private_steps(steps_text) if steps_text else []
+    if not steps and steps_text:
+        # Some Obsidian recipes use bullet steps rather than numbered steps.
+        steps = _kitchen_private_bullets(steps_text)
+    if not steps and steps_text:
+        for block in re.split(r"\n\s*\n|\n", steps_text):
+            line = re.sub(r"^\s*[-*+>]\s*", "", block).strip()
+            if line and not line.startswith("#") and "计时" not in line:
+                steps.append(line)
+    if not steps:
+        # Older personal notes may simply put a numbered method list in the body.
+        steps = _kitchen_private_steps(text)
+
+    if not name or not steps:
+        return None
+
+    recipe = {
+        "name": name,
+        "type_label": "私房菜",
+        "estimated_text": "",
+        "ingredients": _kitchen_private_bullets(ingredients_text),
+        "seasoning": _kitchen_private_bullets(seasoning_text),
+        "prep_items": _kitchen_private_bullets(prep_text),
+        "steps": steps,
+        "step_timers": [None] * len(steps),
+        "key_points": _kitchen_private_bullets(key_text),
+    }
+    return ensure_recipe_prep_first(recipe)
+
+
+def _kitchen_private_recipe_dirs() -> list[Path]:
+    """Find nearby Obsidian 私房菜 folders without requiring one fixed layout."""
+    candidates: list[Path] = [
+        KITCHEN_PRIVATE_RECIPE_DIR,
+        KITCHEN_MENU_DIR / "私房菜",
+        KITCHEN_MENU_DIR.parent / "私房菜",
+    ]
+
+    roots: list[Path] = []
+    for root in (KITCHEN_MENU_DIR.parent, KITCHEN_MENU_DIR.parent.parent):
+        if root.exists() and root not in roots:
+            roots.append(root)
+    for root in roots:
+        try:
+            candidates.extend(root.glob("*/私房菜"))
+            if root == KITCHEN_MENU_DIR.parent:
+                candidates.extend(root.glob("*/*/私房菜"))
+        except OSError:
+            pass
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        folder = raw.expanduser()
+        try:
+            key = str(folder.resolve())
+        except OSError:
+            key = str(folder)
+        if key in seen or not folder.is_dir():
+            continue
+        seen.add(key)
+        result.append(folder)
+    return result
+
+def _kitchen_library_id(source: str, name: str) -> str:
+    return hashlib.sha1((str(source) + "\\n" + str(name)).encode("utf-8")).hexdigest()[:18]
+
+
+def _kitchen_private_recipe_library() -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for folder in _kitchen_private_recipe_dirs():
+        try:
+            for path in folder.rglob("*.md"):
+                try:
+                    key = str(path.resolve())
+                except OSError:
+                    key = str(path)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                paths.append(path)
+        except OSError:
+            continue
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for path in sorted(paths, key=_mtime, reverse=True)[:240]:
+        recipe = _kitchen_parse_private_recipe(path)
+        if not recipe:
+            continue
+        name = str(recipe.get("name") or "").strip()
+        if not name:
+            continue
+        entries.append({
+            "id": _kitchen_library_id(str(path), name),
+            "name": name,
+            "source_kind": "private",
+            "source_label": "私房菜",
+            "source": str(path),
+            "recipe": recipe,
+        })
+    return entries
+
+def _kitchen_recipe_library() -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = _kitchen_private_recipe_library()
+    seen: set[str] = set()
+    if KITCHEN_MENU_DIR.exists():
+        paths = sorted(KITCHEN_MENU_DIR.glob("*.md"), key=lambda x: x.name, reverse=True)[:120]
+        for path in paths:
+            try:
+                menu = load_kitchen_menu(KITCHEN_MENU_DIR, path.stem)
+            except (KitchenMenuError, OSError):
+                continue
+            for raw in menu.get("recipes") or []:
+                recipe = ensure_recipe_prep_first(dict(raw))
+                name = str(recipe.get("name") or "").strip()
+                key = name.lower()
+                if not name or key in seen:
+                    continue
+                seen.add(key)
+                entries.append({
+                    "id": _kitchen_library_id(str(path), name),
+                    "name": name,
+                    "source_kind": "history",
+                    "source_label": "历史菜谱",
+                    "source": str(path),
+                    "recipe": recipe,
+                })
+    return entries
+
+
+def _kitchen_library_public(entry: dict[str, Any], inventory_names: list[str] | None = None) -> dict[str, Any]:
+    recipe = entry.get("recipe") or {}
+    ingredient_text = " ".join(
+        str(x) for x in ((recipe.get("ingredients") or []) + (recipe.get("seasoning") or []))
+    )
+    matches = [name for name in (inventory_names or []) if name and name in ingredient_text]
+    return {
+        "id": str(entry.get("id") or ""),
+        "name": str(entry.get("name") or ""),
+        "source_kind": str(entry.get("source_kind") or "history"),
+        "source_label": str(entry.get("source_label") or "菜谱"),
+        "type_label": str(recipe.get("type_label") or ""),
+        "estimated_text": str(recipe.get("estimated_text") or ""),
+        "inventory_matches": matches,
+        "recommendation_reason": str(entry.get("recommendation_reason") or ""),
+    }
+
+
+def _kitchen_empty_today_menu(date_text: str | None = None) -> dict[str, Any]:
+    return {
+        "date": str(date_text or _kitchen_today()),
+        "weekday": "",
+        "servings": 3,
+        "estimated_minutes": None,
+        "items": [],
+        "recipes": [],
+        "shopping": [],
+        "timeline": [],
+        "source": "gateway-empty-today",
+    }
+
+
+def _kitchen_menu_or_empty_today() -> dict[str, Any]:
+    _kitchen_migrate_legacy_extras_once()
+    menu = KITCHEN_CURRENT_MENU
+    if menu is not None and str(menu.get("date") or "") == _kitchen_today():
+        return menu
+    try:
+        return _kitchen_load()
+    except (KitchenMenuError, OSError):
+        return _kitchen_empty_today_menu()
+
+
+def _kitchen_inventory_public_items() -> list[dict[str, Any]]:
+    snap = _food_snapshot()
+    result: list[dict[str, Any]] = []
+    for item in snap.get("items") or []:
+        name = str(item.get("name") or "").strip()
+        unit = str(item.get("unit") or "").strip()
+        quantity = float(item.get("quantity") or 0)
+        if not name or unit == "状态" or quantity <= 0:
+            continue
+        result.append({
+            "name": name,
+            "category": str(item.get("category") or ""),
+            "quantity": int(quantity) if quantity.is_integer() else round(quantity, 2),
+            "unit": unit,
+        })
+    return result
+
+
+def _kitchen_picker_payload(menu: dict[str, Any], *, selected: list[str] | None = None, recommended: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    # Initial picker load is deliberately light: no historical recipe scan and
+    # no inventory-to-recipe matching until the user chooses ingredients.
+    private = [_kitchen_library_public(e) for e in _kitchen_private_recipe_library()]
+    return {
+        "type": "kitchen.show_picker",
+        "eyebrow": "小K · 今日菜谱",
+        "title": "选择今日菜谱",
+        "message": "先选今天想用的食材，再看库存推荐菜；也可以直接从私房菜选择",
+        "today_names": [str(x.get("name") or "") if isinstance(x, dict) else str(x) for x in (menu.get("items") or [])],
+        "inventory_items": _kitchen_inventory_public_items(),
+        "inventory_selected": list(selected or []),
+        "recommended": list(recommended or []),
+        "private_recipes": private[:120],
+        "private_recipe_dirs": [str(x) for x in _kitchen_private_recipe_dirs()],
+        "active_source": "inventory",
+        "footer": "今日菜谱是每天真正的做饭入口",
+    }
+
+
+def _kitchen_compact_generated_steps(steps: list[str], max_steps: int = 7) -> list[str]:
+    """Compact over-fragmented AI cooking steps without dropping content.
+
+    This is intentionally conservative: only adjacent text steps are merged.
+    Generated recommendations do not carry per-step timers, so merging here is
+    safe and keeps the kitchen UI at a practical 4-7 stage granularity.
+    """
+    clean = [str(x).strip() for x in steps if str(x).strip()]
+    if len(clean) <= max_steps:
+        return clean
+    while len(clean) > max_steps:
+        # Merge the shortest adjacent pair first; micro-steps naturally collapse
+        # before longer stage descriptions.
+        best_i = min(range(len(clean)-1), key=lambda i: len(clean[i]) + len(clean[i+1]))
+        a = clean[best_i].rstrip('。；;，, ')
+        b = clean[best_i+1].lstrip('。；;，, ')
+        clean[best_i:best_i+2] = [a + '；' + b]
+    return clean
+
+
+async def _kitchen_inventory_recommend_entries(selected: list[str]) -> list[dict[str, Any]]:
+    selected_clean: list[str] = []
+    seen: set[str] = set()
+    for raw in selected:
+        name = str(raw or "").strip()
+        if name and name not in seen:
+            selected_clean.append(name)
+            seen.add(name)
+    if not selected_clean:
+        raise KitchenMenuError("请先选择至少一种食材")
+
+    snap = _food_snapshot()
+    available_bits: list[str] = []
+    for item in snap.get("items") or []:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        unit = str(item.get("unit") or "").strip()
+        if unit == "状态":
+            status = str(item.get("status") or "一般")
+            available_bits.append(f"{name}({status})")
+        else:
+            q = item.get("quantity")
+            available_bits.append(f"{name}({q}{unit})")
+
+    prompt = f"""你是小K家庭厨房的库存推荐模块。默认家庭3人。
+用户从现有库存里主动选择了这些今天想优先使用的食材：{ '、'.join(selected_clean) }。
+当前家里可用食材/佐料概况：{ '、'.join(available_bits[:80]) }。
+
+请推荐4到6道适合今天做的家常菜。要求：
+1. 优先消耗用户主动选择的食材，可搭配当前库存里的其他食材；
+2. 不要把“白米饭”作为一道菜，白米饭只视为默认配饭主食；
+3. 菜名和做法要具体、真实、适合3人家庭；
+4. 每道菜给出完整可执行菜谱，后续会直接加入“小K今日菜谱”；
+5. prep_items 只放不需要开火的准备工作，例如清洗、切配、泡发、解冻、腌制、调汁、称量；焯水、预热、烧水/烧开水都属于正式烹饪，必须放进 steps，禁止放入 prep_items；
+6. 正式烹饪步骤控制在4到7步，每一步必须代表一个完整烹饪阶段，不要把“下油、放葱、翻炒两下、加盐”拆成四个独立步骤；
+7. 同一锅、同一阶段内连续发生的动作合并写在同一步里，用“；”连接，只有火候/等待/转锅等明显阶段变化才另起一步；
+8. 不要为了凑步骤数增加无意义步骤；
+9. 只输出JSON，不要Markdown，不要解释。
+
+JSON格式必须严格为：
+{{
+  "recipes": [
+    {{
+      "name": "菜名",
+      "reason": "为什么适合当前所选食材，20字以内",
+      "type_label": "主菜/蔬菜/汤/其他",
+      "estimated_text": "约20分钟",
+      "ingredients": ["食材及家庭用量"],
+      "seasoning": ["调味及用量"],
+      "prep_items": ["所有不需要开火的准备事项"],
+      "steps": ["正式烹饪步骤1", "正式烹饪步骤2"],
+      "key_points": ["关键提醒"]
+    }}
+  ]
+}}"""
+    headers = {"Content-Type": "application/json"}
+    if OPENCLAW_TOKEN:
+        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+    kitchen_user = os.getenv("HOMEAI_KITCHEN_OPENCLAW_USER", "home-ai-kitchen:main").strip() or "home-ai-kitchen:main"
+    payload = {
+        "model": OPENCLAW_MODEL,
+        "user": kitchen_user,
+        "stream": False,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    try:
+        async with _openclaw_http_client(OPENCLAW_KITCHEN_TIMEOUT_SEC) as client:
+            response = await _post_with_retry(
+                client,
+                f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            body = response.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise KitchenMenuError("小K没有返回推荐菜谱")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        parsed = _extract_json_object(str(content))
+        raw_recipes = parsed.get("recipes") or []
+    except KitchenMenuError:
+        raise
+    except Exception as exc:
+        raise KitchenMenuError(f"库存推荐暂时不可用：{exc}") from exc
+
+    entries: list[dict[str, Any]] = []
+    for raw in raw_recipes[:6]:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name or name == "白米饭":
+            continue
+        steps = _kitchen_compact_generated_steps([str(x).strip() for x in (raw.get("steps") or []) if str(x).strip()])
+        prep_items = [str(x).strip() for x in (raw.get("prep_items") or []) if str(x).strip()]
+        if not steps:
+            continue
+        recipe = ensure_recipe_prep_first({
+            "name": name,
+            "type_label": str(raw.get("type_label") or "家常菜"),
+            "estimated_text": str(raw.get("estimated_text") or ""),
+            "ingredients": [str(x).strip() for x in (raw.get("ingredients") or []) if str(x).strip()],
+            "seasoning": [str(x).strip() for x in (raw.get("seasoning") or []) if str(x).strip()],
+            "prep_items": prep_items,
+            "steps": steps,
+            "step_timers": [None] * len(steps),
+            "key_points": [str(x).strip() for x in (raw.get("key_points") or []) if str(x).strip()],
+        })
+        rid = "air-" + hashlib.sha1(("|".join(selected_clean) + "\n" + name).encode("utf-8")).hexdigest()[:18]
+        entry = {
+            "id": rid,
+            "name": name,
+            "source_kind": "inventory_ai",
+            "source_label": "库存推荐",
+            "source": "openclaw:inventory-recommend",
+            "recipe": recipe,
+            "recommendation_reason": str(raw.get("reason") or "").strip(),
+        }
+        KITCHEN_PICKER_RECOMMENDATIONS[rid] = entry
+        entries.append(entry)
+    if not entries:
+        raise KitchenMenuError("没有生成可用的库存推荐菜谱")
+    # Keep temporary recommendation cache bounded.
+    if len(KITCHEN_PICKER_RECOMMENDATIONS) > 80:
+        for key in list(KITCHEN_PICKER_RECOMMENDATIONS)[:-60]:
+            KITCHEN_PICKER_RECOMMENDATIONS.pop(key, None)
+    return entries
+
+
+async def _kitchen_inventory_recommend_payload(menu: dict[str, Any], selected: list[str]) -> dict[str, Any]:
+    selected_clean = []
+    seen: set[str] = set()
+    for raw in selected:
+        name = str(raw or "").strip()
+        if name and name not in seen:
+            selected_clean.append(name)
+            seen.add(name)
+    if not selected_clean:
+        raise KitchenMenuError("请先选择至少一种食材")
+    entries = await _kitchen_inventory_recommend_entries(selected_clean)
+    public = [_kitchen_library_public(e, selected_clean) for e in entries]
+    return _kitchen_picker_payload(menu, selected=selected_clean, recommended=public)
+
+
+def _kitchen_find_library_entry(recipe_id: str) -> dict[str, Any] | None:
+    cached = KITCHEN_PICKER_RECOMMENDATIONS.get(str(recipe_id))
+    if cached is not None:
+        return cached
+    for entry in _kitchen_recipe_library():
+        if str(entry.get("id") or "") == str(recipe_id):
+            return entry
+    return None
+
+
+def _kitchen_add_library_recipe_to_today(recipe_id: str) -> dict[str, Any]:
+    global KITCHEN_CURRENT_MENU
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_menu_or_empty_today()
+    entry = _kitchen_find_library_entry(recipe_id)
+    if entry is None:
+        raise KitchenMenuError("recipe library item not found")
+    recipe = ensure_recipe_prep_first(dict(entry.get("recipe") or {}))
+    name = str(recipe.get("name") or "").strip()
+    if not name:
+        raise KitchenMenuError("recipe name is empty")
+    if name == "白米饭":
+        raise KitchenMenuError("白米饭是默认主食，不加入今日菜谱")
+    if recipe_for(menu, name) is not None:
+        return menu
+    menu.setdefault("recipes", []).append(recipe)
+    menu.setdefault("items", []).append({
+        "name": name,
+        "category": str((entry.get("recipe") or {}).get("type_label") or "other"),
+        "cook_order": len(menu.get("items") or []) + 1,
+    })
+    path = _kitchen_write_menu_to_obsidian(menu)
+    KITCHEN_CURRENT_MENU = load_kitchen_menu(KITCHEN_MENU_DIR, str(menu.get("date") or _kitchen_today()))
+    print(f"[KITCHEN] Today Menu added to Obsidian dish={name!r} path={path}")
+    return KITCHEN_CURRENT_MENU
+
+
+def _kitchen_remove_recipe_from_today(name: str) -> dict[str, Any]:
+    global KITCHEN_CURRENT_MENU
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_menu_or_empty_today()
+    target = str(name or "").strip()
+    if not target:
+        raise KitchenMenuError("recipe name is empty")
+    recipe_before = len(menu.get("recipes") or [])
+    item_before = len(menu.get("items") or [])
+    menu["recipes"] = [r for r in (menu.get("recipes") or []) if str((r or {}).get("name") or "") != target]
+    menu["items"] = [x for x in (menu.get("items") or []) if str((x or {}).get("name") if isinstance(x, dict) else x) != target]
+    if len(menu["recipes"]) == recipe_before and len(menu["items"]) == item_before:
+        # Idempotent delete: the dish is already absent, so the requested end state is satisfied.
+        # This also protects against duplicate taps/retries after a successful Obsidian rewrite.
+        KITCHEN_CURRENT_MENU = menu
+        print(f"[KITCHEN] Today Menu remove already absent dish={target!r}")
+        return menu
+    for idx, item in enumerate(menu["items"], 1):
+        if isinstance(item, dict):
+            item["cook_order"] = idx
+    path = _kitchen_write_menu_to_obsidian(menu)
+    date_text = str(menu.get("date") or _kitchen_today())
+    if target in KITCHEN_RECIPE_PROGRESS.get(date_text, {}):
+        KITCHEN_RECIPE_PROGRESS[date_text].pop(target, None)
+        if not KITCHEN_RECIPE_PROGRESS[date_text]:
+            KITCHEN_RECIPE_PROGRESS.pop(date_text, None)
+        save_kitchen_progress()
+    # Prep task ids include the dish name; rebuild/trim valid ids from the updated menu.
+    if date_text in KITCHEN_PREP_CHECKED:
+        valid = set()
+        for recipe in menu.get("recipes") or []:
+            dish = str(recipe.get("name") or "")
+            tasks = [str(x).strip() for x in (recipe.get("prep_items") or []) if str(x).strip()]
+            if not tasks:
+                tasks = ["确认食材、调味和所需厨具已备齐。"]
+            for idx, text in enumerate(tasks):
+                valid.add(_kitchen_prep_task_id(date_text, dish, idx, text))
+        KITCHEN_PREP_CHECKED[date_text].intersection_update(valid)
+        if not KITCHEN_PREP_CHECKED[date_text]:
+            KITCHEN_PREP_CHECKED.pop(date_text, None)
+        save_kitchen_prep_state()
+    KITCHEN_CURRENT_MENU = load_kitchen_menu(KITCHEN_MENU_DIR, date_text)
+    print(f"[KITCHEN] Today Menu removed from Obsidian dish={target!r} path={path}")
+    return KITCHEN_CURRENT_MENU
+
+
 def _kitchen_load(date_text: str | None = None) -> dict[str, Any]:
     global KITCHEN_CURRENT_MENU
+    _kitchen_migrate_legacy_extras_once()
     target = date_text or _kitchen_today()
     menu = load_kitchen_menu(KITCHEN_MENU_DIR, target)
     KITCHEN_CURRENT_MENU = menu
@@ -7205,6 +9732,306 @@ def _kitchen_menu_payload(menu: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _kitchen_dashboard_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    """One-screen landscape cooking cockpit.
+
+    The cockpit is deliberately a view over existing sources of truth:
+    Obsidian menu + progress + prep state + Gateway timers.  It does not
+    create a second cooking state machine.
+    """
+    date_text = str(menu.get("date") or _kitchen_today())
+    menu_payload = _kitchen_menu_payload(menu)
+    items = list(menu_payload.get("items") or [])
+    names = [str(x.get("name") or "") for x in items if str(x.get("name") or "")]
+
+    requested_dish = str(KITCHEN_CURRENT_STATE.get("dish") or "").strip()
+    focus = requested_dish if requested_dish in names else ""
+    if not focus:
+        for item in items:
+            if bool(item.get("has_progress")) and int(item.get("progress_step") or 0) > 0:
+                focus = str(item.get("name") or "")
+                break
+    if not focus and names:
+        focus = names[0]
+
+    current: dict[str, Any] | None = None
+    next_item: dict[str, Any] | None = None
+    if focus:
+        recipe = recipe_for(menu, focus)
+        if recipe is not None:
+            steps = list(recipe.get("steps") or [])
+            step, _ = _kitchen_progress_get(date_text, focus, len(steps)) if steps else (0, False)
+            # When returning from a recipe, preserve the exact step that was on screen.
+            if requested_dish == focus and str(KITCHEN_CURRENT_STATE.get("screen") or "") == "recipe":
+                step = max(0, min(int(KITCHEN_CURRENT_STATE.get("step") or 0), max(0, len(steps) - 1)))
+            current = {
+                "name": focus,
+                "step": step,
+                "total_steps": len(steps),
+                "step_text": str(steps[step]) if steps and 0 <= step < len(steps) else "准备开始这道菜",
+                "step_kind": str((recipe.get("step_kinds") or [])[step] if step < len(recipe.get("step_kinds") or []) else "cook"),
+                "timer_hint": _kitchen_step_timer_hint(recipe, step),
+            }
+            try:
+                idx = names.index(focus)
+            except ValueError:
+                idx = -1
+            if idx >= 0 and idx + 1 < len(names):
+                next_name = names[idx + 1]
+                next_recipe = recipe_for(menu, next_name)
+                next_steps = list((next_recipe or {}).get("steps") or [])
+                next_step, next_progress = _kitchen_progress_get(date_text, next_name, len(next_steps)) if next_steps else (0, False)
+                next_item = {
+                    "name": next_name,
+                    "step": next_step,
+                    "total_steps": len(next_steps),
+                    "has_progress": next_progress,
+                }
+
+    prep = _kitchen_prep_payload(menu)
+    pending: list[dict[str, Any]] = []
+    for group in prep.get("groups") or []:
+        for task in group.get("tasks") or []:
+            if not bool(task.get("done")):
+                pending.append({
+                    "id": str(task.get("id") or ""),
+                    "dish": str(group.get("dish") or ""),
+                    "text": str(task.get("text") or ""),
+                })
+            if len(pending) >= 4:
+                break
+        if len(pending) >= 4:
+            break
+
+    return {
+        "type": "kitchen.show_dashboard",
+        "eyebrow": f"{menu.get('date','')} · 烹饪中",
+        "title": "厨房中台",
+        "message": "一屏掌控当前菜、后台计时和下一步",
+        "items": items,
+        "current": current,
+        "next": next_item,
+        "pending": pending,
+        "prep_completed": int(prep.get("completed") or 0),
+        "prep_total": int(prep.get("total") or 0),
+        "prep_all_done": bool(prep.get("all_done")),
+        "footer": "厨房中台",
+    }
+
+
+
+def _kitchen_consumption_match_text(value: str) -> str:
+    text = str(value or "").lower().strip()
+    text = re.sub(r"[（(].*?[）)]", "", text)
+    text = re.sub(r"\d+(?:\.\d+)?\s*(?:kg|g|克|公斤|斤|两|份|个|颗|根|把|盒|瓶|包|袋|杯|块|片|只|枚)", "", text, flags=re.I)
+    text = re.sub(r"[\s·•，,、:：/\\-]+", "", text)
+    for token in ("新鲜", "冷冻", "冷藏", "净", "约", "适量", "少许", "去皮", "去骨", "切块", "切片", "切段"):
+        text = text.replace(token, "")
+    return text
+
+
+def _kitchen_consumption_number(recipe_text: str, unit: str, available: float) -> float:
+    text = str(recipe_text or "")
+    target_unit = str(unit or "")
+    m = re.search(rf"(\d+(?:\.\d+)?)\s*{re.escape(target_unit)}", text)
+    if m:
+        try:
+            return min(float(available), max(0.0, float(m.group(1))))
+        except ValueError:
+            pass
+    chinese = {"半": 0.5, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    m2 = re.search(rf"([半一二两三四五六七八九十])\s*{re.escape(target_unit)}", text)
+    if m2:
+        return min(float(available), float(chinese.get(m2.group(1), 1)))
+    return min(float(available), 1.0)
+
+
+def _kitchen_recipe_consumption_payload(menu: dict[str, Any], recipe: dict[str, Any]) -> dict[str, Any]:
+    snap = _food_snapshot()
+    inventory = [x for x in (snap.get("items") or []) if str(x.get("unit") or "") != "状态" and float(x.get("quantity") or 0) > 0]
+    recipe_ingredients = [str(x).strip() for x in (recipe.get("ingredients") or []) if str(x).strip()]
+    candidates: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for inv in inventory:
+        name = str(inv.get("name") or "").strip()
+        if not name or name in used_names:
+            continue
+        name_key = _kitchen_consumption_match_text(name)
+        best = ""
+        for raw in recipe_ingredients:
+            ing_key = _kitchen_consumption_match_text(raw)
+            if not ing_key or not name_key:
+                continue
+            if name_key in ing_key or ing_key in name_key:
+                best = raw
+                break
+        if not best:
+            continue
+        available = float(inv.get("quantity") or 0)
+        unit = str(inv.get("unit") or "份")
+        suggested = _kitchen_consumption_number(best, unit, available)
+        if unit != "份":
+            suggested = float(int(suggested)) if float(suggested).is_integer() else suggested
+        candidates.append({
+            "name": name,
+            "category": str(inv.get("category") or "食材"),
+            "unit": unit,
+            "available": int(available) if available.is_integer() else round(available, 2),
+            "suggested": int(suggested) if float(suggested).is_integer() else round(float(suggested), 2),
+            "recipe_text": best,
+        })
+        used_names.add(name)
+    return {
+        "type": "kitchen.show_consumption",
+        "eyebrow": f"{menu.get('date','')} · 今日菜谱",
+        "title": "登记消耗",
+        "dish": str(recipe.get("name") or ""),
+        "items": candidates,
+        "message": "按实际用量登记，确认后会直接扣减食材库存。",
+        "footer": "只扣你确认的数量",
+    }
+
+
+
+def _kitchen_day_consumption_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    aggregated: dict[str, dict[str, Any]] = {}
+    for recipe in menu.get("recipes") or []:
+        if not isinstance(recipe, dict):
+            continue
+        dish_name = str(recipe.get("name") or "").strip()
+        payload = _kitchen_recipe_consumption_payload(menu, recipe)
+        for raw in payload.get("items") or []:
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            row = aggregated.get(name)
+            if row is None:
+                row = {
+                    "name": name,
+                    "category": str(raw.get("category") or "食材"),
+                    "unit": str(raw.get("unit") or "份"),
+                    "available": raw.get("available") or 0,
+                    "suggested": 0.0,
+                    "recipe_texts": [],
+                    "dishes": [],
+                }
+                aggregated[name] = row
+            if dish_name and dish_name not in row["dishes"]:
+                row["dishes"].append(dish_name)
+            text = str(raw.get("recipe_text") or "").strip()
+            if text and text not in row["recipe_texts"]:
+                row["recipe_texts"].append(text)
+            try:
+                row["suggested"] = float(row.get("suggested") or 0) + float(raw.get("suggested") or 0)
+            except (TypeError, ValueError):
+                pass
+    items: list[dict[str, Any]] = []
+    for row in aggregated.values():
+        try:
+            available = float(row.get("available") or 0)
+        except (TypeError, ValueError):
+            available = 0.0
+        suggested = min(available, max(0.0, float(row.get("suggested") or 0)))
+        unit = str(row.get("unit") or "份")
+        if unit != "份" and float(suggested).is_integer():
+            suggested_out: int | float = int(suggested)
+        else:
+            suggested_out = round(suggested, 2)
+        if float(available).is_integer():
+            available_out: int | float = int(available)
+        else:
+            available_out = round(available, 2)
+        items.append({
+            "name": row["name"],
+            "category": row["category"],
+            "unit": unit,
+            "available": available_out,
+            "suggested": suggested_out,
+            "recipe_text": "；".join(row.get("recipe_texts") or []),
+            "dishes": row.get("dishes") or [],
+        })
+    items.sort(key=lambda x: (str(x.get("category") or ""), str(x.get("name") or "")))
+    return {
+        "type": "kitchen.show_consumption",
+        "scope": "day",
+        "eyebrow": f"{menu.get('date','')} · 今日收尾",
+        "title": "今日食材结算",
+        "dish": "",
+        "items": items,
+        "message": "核对今天实际用掉的食材和数量，确认后统一扣减库存。",
+        "footer": "确认实际消耗后扣减库存，然后继续私房菜收尾",
+    }
+
+
+async def _kitchen_show_save_private_after_consumption(*, speak: bool = False) -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    KITCHEN_CURRENT_STATE = {'screen': 'save_private', 'date': str(menu.get('date') or ''), 'dish': '', 'step': 0}
+    delivered = await kitchen_broadcast(_kitchen_save_private_payload(menu))
+    if speak:
+        await _kitchen_speak('库存消耗已经处理。接下来可以选择要保存到私房菜的菜谱，也可以直接结束。', kind='assistant')
+    return delivered
+
+
+async def _kitchen_commit_day_consumption(rows: list[Any], *, speak: bool = False) -> int:
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    allowed = {str(x.get("name") or "") for x in (_kitchen_day_consumption_payload(menu).get("items") or [])}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        try:
+            amount = float(raw.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not name or name not in allowed or amount <= 0:
+            continue
+        _food_consume(name, amount)
+    return await _kitchen_show_save_private_after_consumption(speak=speak)
+
+
+async def _kitchen_skip_day_consumption(*, speak: bool = False) -> int:
+    return await _kitchen_show_save_private_after_consumption(speak=speak)
+
+
+async def _kitchen_show_recipe_consumption(dish_name: str = "") -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    dish = str(dish_name or KITCHEN_CURRENT_STATE.get("dish") or "").strip()
+    recipe = recipe_for(menu, dish)
+    if recipe is None:
+        raise KitchenMenuError(f"recipe not found: {dish}")
+    KITCHEN_CURRENT_STATE = {
+        "screen": "consumption",
+        "date": str(menu.get("date") or ""),
+        "dish": dish,
+        "step": max(0, len(recipe.get("steps") or []) - 1),
+    }
+    return await kitchen_broadcast(_kitchen_recipe_consumption_payload(menu, recipe))
+
+
+async def _kitchen_commit_recipe_consumption(rows: list[Any]) -> int:
+    menu = KITCHEN_CURRENT_MENU or _kitchen_load()
+    dish = str(KITCHEN_CURRENT_STATE.get("dish") or "").strip()
+    recipe = recipe_for(menu, dish)
+    if recipe is None:
+        raise KitchenMenuError(f"recipe not found: {dish}")
+    allowed = {str(x.get("name") or "") for x in (_kitchen_recipe_consumption_payload(menu, recipe).get("items") or [])}
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        try:
+            amount = float(raw.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not name or name not in allowed or amount <= 0:
+            continue
+        _food_consume(name, amount)
+    return await _kitchen_show_menu(menu)
+
+
 def _kitchen_recipe_payload(menu: dict[str, Any], recipe: dict[str, Any], step: int) -> dict[str, Any]:
     steps = recipe.get("steps") or []
     if not steps:
@@ -7228,13 +10055,14 @@ def _kitchen_recipe_payload(menu: dict[str, Any], recipe: dict[str, Any], step: 
 
 
 def _kitchen_shopping_payload(menu: dict[str, Any]) -> dict[str, Any]:
+    groups, _ = _kitchen_shopping_groups_with_state(menu)
     return {
         "type": "kitchen.show_shopping",
         "eyebrow": f"{menu.get('date','')} · 采购",
-        "title": "超市购物单",
-        "message": "",
-        "groups": menu.get("shopping") or [],
-        "footer": "今日菜单购物清单",
+        "title": "今日采购清单",
+        "message": "勾选后自动保存；已有库存会在右侧显示当前数量",
+        "groups": groups,
+        "footer": "今日采购清单",
     }
 
 
@@ -7247,6 +10075,22 @@ def _kitchen_timeline_payload(menu: dict[str, Any]) -> dict[str, Any]:
         "items": menu.get("timeline") or [],
         "footer": "按顺序做，减少厨房同时开战",
     }
+
+
+async def _kitchen_show_dashboard() -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_load()
+    payload = _kitchen_dashboard_payload(menu)
+    current = payload.get("current") or {}
+    KITCHEN_CURRENT_STATE = {
+        "screen": "dashboard",
+        "date": str(menu.get("date") or ""),
+        "dish": str(current.get("name") or ""),
+        "step": max(0, int(current.get("step") or 0)),
+    }
+    return await kitchen_broadcast(payload)
 
 
 async def _kitchen_show_menu(menu: dict[str, Any]) -> int:
@@ -7303,6 +10147,43 @@ async def _kitchen_open_recipe_by_name(name: str, step: int | None = None) -> tu
         return 0, None
     delivered = await _kitchen_open_recipe(recipe, step)
     return delivered, recipe
+
+
+async def _kitchen_show_home() -> int:
+    global KITCHEN_CURRENT_MENU, KITCHEN_CURRENT_STATE
+    # Home's “获取今日菜谱” is a refresh, not a navigation action. Reload the
+    # authoritative Obsidian day file and remain on Home so the CTA can switch
+    # in-place to “开工烧饭” as soon as today's menu exists.
+    try:
+        menu = _kitchen_load()
+    except KitchenMenuError:
+        KITCHEN_CURRENT_MENU = None
+        menu = None
+    KITCHEN_CURRENT_STATE = {"screen": "idle", "date": str((menu or {}).get("date") or ""), "dish": "", "step": 0}
+    return await kitchen_broadcast(_kitchen_idle_payload("今天想做点什么？"))
+
+
+async def _kitchen_show_picker() -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = _kitchen_menu_or_empty_today()
+    KITCHEN_CURRENT_STATE = {"screen": "picker", "date": str(menu.get("date") or ""), "dish": "", "step": 0}
+    return await kitchen_broadcast(_kitchen_picker_payload(menu))
+
+
+async def _kitchen_show_inventory_recommendations(selected: list[str]) -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = _kitchen_menu_or_empty_today()
+    KITCHEN_CURRENT_STATE = {"screen": "picker", "date": str(menu.get("date") or ""), "dish": "", "step": 0}
+    return await kitchen_broadcast(await _kitchen_inventory_recommend_payload(menu, selected))
+
+
+async def _kitchen_show_prep() -> int:
+    global KITCHEN_CURRENT_STATE
+    menu = KITCHEN_CURRENT_MENU
+    if menu is None or str(menu.get("date") or "") != _kitchen_today():
+        menu = _kitchen_load()
+    KITCHEN_CURRENT_STATE = {"screen": "prep", "date": str(menu.get("date") or ""), "dish": "", "step": 0}
+    return await kitchen_broadcast(_kitchen_prep_payload(menu))
 
 
 async def _kitchen_show_shopping() -> int:
@@ -7946,6 +10827,13 @@ async def handle_kitchen_connection(ws: Any) -> None:
                         await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": state["error"], "qa": state})
                     else:
                         session.qa_audio.extend(raw)
+                elif session.food_scan_receiving and not session.food_scan_processing:
+                    if len(session.food_scan_image) + len(raw) > FOOD_SCAN_MAX_BYTES:
+                        session.food_scan_receiving = False
+                        session.food_scan_image.clear()
+                        await _food_scan_notify(session, {"type": "kitchen.food.scan.error", "request_id": session.food_scan_request_id, "ok": False, "message": "图片太大，请选择 12MB 以内的图片"})
+                    else:
+                        session.food_scan_image.extend(raw)
                 continue
             try:
                 msg = json.loads(raw)
@@ -7967,6 +10855,28 @@ async def handle_kitchen_connection(ws: Any) -> None:
                     "view": KITCHEN_CURRENT_VIEW,
                 })
                 print(f"[KITCHEN] hello id={session.device_id}")
+            elif kind == "kitchen.food.scan.start":
+                if session.food_scan_processing:
+                    await _food_scan_notify(session, {"type": "kitchen.food.scan.error", "ok": False, "message": "上一张图片还在识别中"})
+                    continue
+                session.food_scan_request_id = str(msg.get("request_id") or ("fs-" + uuid.uuid4().hex[:12]))[:80]
+                session.food_scan_source = str(msg.get("source") or "菜市场").strip()[:24]
+                session.food_scan_mime = str(msg.get("mime") or "image/jpeg").strip()[:64]
+                session.food_scan_image.clear()
+                session.food_scan_receiving = True
+                await _food_scan_notify(session, {"type": "kitchen.food.scan.state", "request_id": session.food_scan_request_id, "message": "准备接收图片…"})
+                print(f"[FOOD-SCAN] upload start id={session.food_scan_request_id} source={session.food_scan_source} device={session.device_id}")
+            elif kind == "kitchen.food.scan.stop":
+                if not session.food_scan_receiving:
+                    await _food_scan_notify(session, {"type": "kitchen.food.scan.error", "request_id": session.food_scan_request_id, "ok": False, "message": "没有收到图片"})
+                    continue
+                session.food_scan_receiving = False
+                print(f"[FOOD-SCAN] upload complete id={session.food_scan_request_id} bytes={len(session.food_scan_image)}")
+                await _food_scan_notify(session, {"type": "kitchen.food.scan.state", "request_id": session.food_scan_request_id, "message": "图片上传完成，正在识别…"})
+                await _process_food_scan(session)
+            elif kind == "kitchen.food.scan.cancel":
+                session.food_scan_receiving = False
+                session.food_scan_image.clear()
             elif kind == "kitchen.qa.start":
                 if session.qa_processing:
                     await _kitchen_qa_notify(session, {"type": "kitchen.qa.error", "message": "上一条问题还在处理中", "qa": _kitchen_qa_public()})
@@ -8032,6 +10942,11 @@ async def handle_kitchen_connection(ws: Any) -> None:
             session.qa_audio.clear()
             _kitchen_qa_set("error", request_id=abandoned_id, error="录音连接中断，请重新点击问逐光")
             print(f"[KITCHEN-QA-WARN] abandoned upload reset id={abandoned_id or 'unknown'}")
+        if session.food_scan_receiving and not session.food_scan_processing:
+            abandoned_id = session.food_scan_request_id
+            session.food_scan_receiving = False
+            session.food_scan_image.clear()
+            print(f"[FOOD-SCAN-WARN] abandoned upload reset id={abandoned_id or 'unknown'}")
         if session in KITCHEN_SESSIONS:
             KITCHEN_SESSIONS.remove(session)
         print(f"[KITCHEN] terminal disconnected id={session.device_id}")
@@ -8191,7 +11106,11 @@ async def handle_connection(ws) -> None:
         await ws.close(code=1008, reason="wrong path")
         return
 
-    session = ClientSession(ws=ws)
+    session = ClientSession(
+        ws=ws,
+        device_id=HOMEAI_PRIMARY_DEVICE_ID,
+        openclaw_user=OPENCLAW_USER,
+    )
     ACTIVE_SESSIONS.append(session)
     print(f"[WS] client connected path={path or WS_PATH}")
     try:
@@ -8338,10 +11257,33 @@ async def handle_connection(ws) -> None:
                     continue
                 if session.processing:
                     continue
+
+                incoming_trigger = str(msg.get("trigger") or "unknown")
+                if incoming_trigger == "follow_up":
+                    if not session.followup.is_active():
+                        session.followup_candidate_authorized = False
+                        session.recording = False
+                        print(
+                            f"[FOLLOWUP] candidate rejected outside window "
+                            f"device={session.device_id}"
+                        )
+                        await send_state(ws, "idle")
+                        continue
+                    # Reserve the one-shot window immediately. The recent turn
+                    # history remains available to the Context Judge, but a
+                    # second concurrent no-wake candidate cannot enter.
+                    session.followup.close_window("candidate_started")
+                    session.followup_candidate_authorized = True
+                else:
+                    # An explicit wake/button turn is a deliberate fresh entry.
+                    # It must never inherit a stale no-wake gate.
+                    session.followup.reset_chain("explicit_ptt")
+                    session.followup_candidate_authorized = False
+
                 session.audio.clear()
                 session.context = dict(msg.get("context") or {})
                 session.diag_glass_mode = str(msg.get("diag_glass_mode") or "GLASS NORMAL")
-                session.ptt_trigger = str(msg.get("trigger") or "unknown")
+                session.ptt_trigger = incoming_trigger
                 session.recording = True
                 await send_state(ws, "listening")
                 current = (session.context.get("current") or {}).get("headline", "")
@@ -8351,6 +11293,7 @@ async def handle_connection(ws) -> None:
                 )
 
             elif kind == "ptt.stop":
+                was_recording = session.recording
                 session.recording = False
                 stop_trigger = str(msg.get("trigger") or session.ptt_trigger or "unknown")
                 session.ptt_trigger = stop_trigger
@@ -8359,6 +11302,13 @@ async def handle_connection(ws) -> None:
                     f"[PTT] stop trigger={stop_trigger} "
                     f"received={len(session.audio)} declared={declared}"
                 )
+                if stop_trigger == "follow_up" and (
+                    not was_recording or not session.followup_candidate_authorized
+                ):
+                    print("[FOLLOWUP] rejected/stale stop ignored")
+                    session.audio.clear()
+                    await send_state(ws, "idle")
+                    continue
                 asyncio.create_task(process_utterance(session))
 
             elif kind == "ptt.abort":
@@ -8371,6 +11321,9 @@ async def handle_connection(ws) -> None:
                 )
                 session.audio.clear()
                 session.ptt_trigger = abort_trigger
+                if abort_trigger == "follow_up":
+                    session.followup.reset_chain("followup_abort")
+                    session.followup_candidate_authorized = False
                 await send_state(ws, "idle")
 
             elif kind == "playback.slot_ready":
@@ -8466,6 +11419,13 @@ async def preflight(*, require_openclaw: bool = True) -> int:
         f"local=127.0.0.1:{OPENCLAW_LOCAL_PORT} remote=127.0.0.1:{OPENCLAW_REMOTE_PORT}"
     )
     print(f"[CFG] primary session user={OPENCLAW_USER}")
+    print(
+        f"[CFG] followup timeout={FOLLOWUP_TIMEOUT_SEC:.1f}s "
+        f"fence={FOLLOWUP_AUDIO_FENCE_SEC:.1f}s "
+        f"judge_timeout={FOLLOWUP_JUDGE_TIMEOUT_SEC:.1f}s "
+        f"cleanup_timeout={FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC:.1f}s "
+        f"cleanup={FOLLOWUP_JUDGE_SESSION_CLEANUP}"
+    )
     print(
         f"[CFG] device router primary={HOMEAI_PRIMARY_DEVICE_ID}->{OPENCLAW_USER} "
         f"mini={HOMEAI_MINI_DEVICE_ID}->{OPENCLAW_MINI_USER} "
@@ -8602,6 +11562,8 @@ async def main() -> None:
     load_reminder_queue()
     load_kitchen_timers()
     load_kitchen_progress()
+    load_kitchen_prep_state()
+    load_kitchen_shopping_state()
     load_info_skill_cache()
     load_gold_quote_cache()
 

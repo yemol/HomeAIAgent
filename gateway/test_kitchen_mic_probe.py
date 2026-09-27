@@ -15,10 +15,10 @@ required = [
     "navigator.mediaDevices",
     "getUserMedia",
     "function qaStopTracks",
-    "🎙 问逐光",
+    "🎙 问小K",
     "kitchen.qa.start",
     "qa_ptt:true",
-    "加载今日菜单",
+    "开工烧饭",
     "font-size:28px",
     'id="kitchenPlayer"',
     'x-webkit-airplay="allow"',
@@ -46,7 +46,7 @@ for removed in [
 # Every literal $('id') reference must point to an element that exists in the HTML.
 ids = set(re.findall(r'id="([^"]+)"', html))
 refs = set(re.findall(r"\$\('([^']+)'\)", html))
-dynamic_ids = {"stepTimerHost", "currentTimerTime", "idleTimerHost", "idleStandaloneTime"}
+dynamic_ids = {"stepTimerHost", "currentTimerTime", "idleTimerHost", "idleStandaloneTime", "homeFoodStats", "homePriorityList", "homePriorityMore", "homeTimerWrap", "stopwatchTime", "r49CurrentTimerHost", "r49DashboardTimerHost"}
 missing = sorted(refs - ids - dynamic_ids)
 assert not missing, f"missing DOM ids: {missing}"
 

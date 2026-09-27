@@ -8,8 +8,8 @@ if [[ ! -x "$PY" ]]; then
 fi
 
 cleanup_generated() {
-  rm -rf ./__pycache__
-  find . -maxdepth 2 -type f -name '*.pyc' -delete
+  find . -type d -name '__pycache__' -prune -exec rm -rf {} +
+  find . -type f -name '*.pyc' -delete
 }
 trap cleanup_generated EXIT
 cleanup_generated
@@ -20,7 +20,7 @@ echo "[AUDIT] Pre-commit static cleanliness"
 "$PY" ./precommit_static_audit.py
 
 echo "[AUDIT] Python compile"
-"$PY" -m py_compile ./*.py
+"$PY" -m compileall -q .
 cleanup_generated
 
 echo "[AUDIT] Shell syntax"
@@ -35,18 +35,33 @@ echo "[AUDIT] test_config_helpers.sh"
 TESTS=(
   protocol_selftest.py
   test_audio_route_sticky.py
+  test_followup_context.py
+  test_followup_gateway_integration.py
   test_info_cleanup_gateway_rpc.py
   test_info_ephemeral_cleanup.py
   test_info_stateless_user.py
   test_kitchen_audio.py
   test_kitchen_finish.py
+  test_kitchen_food.py
   test_kitchen_menu.py
   test_kitchen_mic_probe.py
   test_kitchen_progress.py
   test_kitchen_prep_migration.py
   test_kitchen_prep_required.py
+  test_kitchen_unified_prep.py
   test_kitchen_qa.py
   test_kitchen_timer.py
+  test_kitchen_timer_ui_r22.py
+  test_kitchen_timer_dom_r23.py
+  test_kitchen_http_state_scope_r24.py
+  test_kitchen_r25_ui.py
+  test_kitchen_r26_finish_ui.py
+  test_kitchen_r27_finish_style.py
+  test_kitchen_food_photo_scan_r28.py
+  test_kitchen_r29_navigation_timer_popup.py
+  test_kitchen_r31_picker_two_step.py
+  test_kitchen_r36_obsidian_today_menu.py
+  test_kitchen_r37_ui_fixes.py
   test_kitchen_standalone_timer.py
   test_kitchen_voice_fastpath.py
   test_long_tts_segmentation.py

@@ -47,6 +47,8 @@ async def main_async() -> None:
         await g._kitchen_begin_finish(speak=False)
         assert g.KITCHEN_CURRENT_STATE["screen"] == "finish"
         await g._kitchen_confirm_finish(speak=False)
+        assert g.KITCHEN_CURRENT_STATE["screen"] == "day_consumption"
+        await g._kitchen_skip_day_consumption(speak=False)
         assert g.KITCHEN_CURRENT_STATE["screen"] == "save_private"
         _, saved = await g._kitchen_finalize_day(["测试河虾"], speak=False)
         assert saved == ["测试河虾"]
@@ -56,12 +58,10 @@ async def main_async() -> None:
         assert "schema: kitchen-private-recipe-v1" in text
         assert "# 🍳 私房菜 · 测试河虾" in text
         assert "⏱️ 计时：30秒，可延长至40秒" in text
-        assert g.KITCHEN_CURRENT_STATE["screen"] == "done"
-        assert g.KITCHEN_CURRENT_MENU is None
-        assert g.KITCHEN_RETURN_IDLE_AT > 0
-        g.KITCHEN_RETURN_IDLE_AT = 1
-        assert g._kitchen_maybe_return_idle() is True
         assert g.KITCHEN_CURRENT_STATE["screen"] == "idle"
+        assert g.KITCHEN_CURRENT_MENU is None
+        assert g.KITCHEN_RETURN_IDLE_AT == 0
+        assert g.KITCHEN_CURRENT_VIEW.get("type") == "kitchen.show_idle"
     html = g._kitchen_html().decode("utf-8")
     assert "KitchenTerminal A3.0b" in html
     assert "结束今日烹饪" in html

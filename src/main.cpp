@@ -22,7 +22,7 @@
 
   // Local custom trigger phrase via Chinese MultiNet.
   static const sr_cmd_t HOMEAI_WAKE_COMMANDS[] = {
-      {0, "你好逐光", "ni hao zhu guang"},
+      {0, "逐光同学", "zhu guang tong xue"},
   };
   static constexpr size_t HOMEAI_WAKE_COMMAND_COUNT =
       sizeof(HOMEAI_WAKE_COMMANDS) / sizeof(HOMEAI_WAKE_COMMANDS[0]);
@@ -376,6 +376,11 @@ static float ttsPcmVisualLevelAt(uint32_t now) {
 #if HOMEAI_WAKEWORD_ENABLE
 // Local command-only Chinese MultiNet wake path. Listening stays on-device.
 static volatile bool wakeWordDetected = false;
+
+// A5.2 observation baseline: keep the same 5s cooldown while testing
+// the 逐光同学 phrase under real household conditions.
+static constexpr uint32_t WAKE_COOLDOWN_MS = 5000;
+static uint32_t lastWakeAcceptedMs = 0;
 static bool wakeEngineReady = false;
 static bool wakeListening = false;
 static bool wakeRecognizerPaused = true;
@@ -445,6 +450,12 @@ static constexpr uint32_t WAKE_HEALTH_LOG_MS = 30000;
 
 // Hands-free capture state after a local wake event.
 static bool autoWakeCaptureActive = false;
+// True only when the current automatic capture came from the A5.0 no-wake
+// follow-up window rather than the normal wake phrase. The existing VAD and
+// capture machinery is shared unchanged.
+static bool autoFollowupCaptureActive = false;
+static bool followupWindowActive = false;
+static uint32_t followupWindowExpiresMs = 0;
 static bool autoWakeSpeechStarted = false;
 static bool autoWakePttStartSent = false;
 static uint32_t autoWakeCaptureStartedMs = 0;
@@ -460,6 +471,9 @@ static constexpr uint32_t AUTO_WAKE_MAX_CAPTURE_MS = AUDIO_MAX_PTT_MS;
 static constexpr uint32_t AUTO_WAKE_MIN_CAPTURE_MS = 700;
 static constexpr uint32_t AUTO_WAKE_PREROLL_MS = 300;
 static constexpr uint32_t AUTO_WAKE_MIN_VOICE_LEVEL = 450;
+
+static void armFollowupWindow(uint32_t timeoutMs);
+static void cancelFollowupWindow(const char* reason);
 #endif
 #endif
 
@@ -2643,6 +2657,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       gatewayTransportFault = true;
       Serial.println("[WS] disconnected");
 #if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+      cancelFollowupWindow("gateway_disconnect");
       pauseWakeRecognizerForTurn();
 #endif
 #if COMPANION_AUDIO_ENABLE
@@ -2738,9 +2753,20 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
             drawGlassFrame();
           }
         } else {
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+          if (companionState == CompanionState::Error) {
+            cancelFollowupWindow("remote_error");
+          }
+#endif
           drawGlassFrame();
         }
       }
+#if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
+      else if (!strcmp(msgType, "followup.arm")) {
+        const uint32_t timeoutMs = doc["timeout_ms"] | 10000u;
+        armFollowupWindow(timeoutMs);
+      }
+#endif
 #if COMPANION_AUDIO_ENABLE
       else if (!strcmp(msgType, "tts.start")) {
         const size_t bytes = doc["bytes"] | 0;
@@ -3018,6 +3044,7 @@ static bool transmitPttBuffer() {
 
 #if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
 static void finishPttCapture();
+static bool startAutoCaptureFromFollowup();
 
 static uint32_t meanAbsLevel(const int16_t* samples, size_t count) {
   if (!samples || count == 0) return 0;
@@ -3377,6 +3404,15 @@ static void onWakeSrEvent(sr_event_t event, int commandId, int phraseId) {
   }
 
   if (event == SR_EVENT_COMMAND && commandId == 0) {
+    const uint32_t now = millis();
+    if (lastWakeAcceptedMs != 0 &&
+        now - lastWakeAcceptedMs < WAKE_COOLDOWN_MS) {
+      Serial.printf("[WAKE-IGNORE] cooldown remaining=%ums\n",
+                    static_cast<unsigned>(
+                        WAKE_COOLDOWN_MS - (now - lastWakeAcceptedMs)));
+      return;
+    }
+    lastWakeAcceptedMs = now;
     wakeWordDetected = true;
     return;
   }
@@ -3403,7 +3439,7 @@ static bool initLocalWakeWordEngine() {
   wakeRecognizerPaused = true;
   wakeEngineReady = true;
 
-  Serial.println("[WAKE] local keyword engine ready: 你好逐光");
+  Serial.println("[WAKE] local keyword engine ready: 逐光同学");
   Serial.println("[WAKE-OBS] A1R25B1 keeps A1R25B0 wake front-end: PGA=6dB; MultiNet acceptance unchanged");
   return true;
 }
@@ -3501,6 +3537,30 @@ static bool startWakeListeningIfPossible() {
   return restartWakeMicPath("listen-start", false);
 }
 
+static void cancelFollowupWindow(const char* reason) {
+  if (!followupWindowActive) return;
+  followupWindowActive = false;
+  followupWindowExpiresMs = 0;
+  Serial.printf("[FOLLOWUP] window closed reason=%s\n", reason ? reason : "unknown");
+}
+
+static void armFollowupWindow(uint32_t timeoutMs) {
+  if (timeoutMs < 1000u) timeoutMs = 1000u;
+  if (timeoutMs > 30000u) timeoutMs = 30000u;
+  followupWindowActive = true;
+  followupWindowExpiresMs = millis() + timeoutMs;
+  Serial.printf("[FOLLOWUP] window armed timeout=%ums\n", static_cast<unsigned>(timeoutMs));
+}
+
+static bool followupWindowExpired(uint32_t now) {
+  if (!followupWindowActive) return false;
+  return static_cast<int32_t>(now - followupWindowExpiresMs) >= 0;
+}
+
+static const char* automaticCaptureTrigger() {
+  return autoFollowupCaptureActive ? "follow_up" : "wake_word";
+}
+
 static void updateWakeAudioFeed() {
   if (!wakeListening || !wakeEngineReady) return;
   if (micStreaming || companionState != CompanionState::Idle) return;
@@ -3534,6 +3594,21 @@ static void updateWakeAudioFeed() {
             wakeRing[safeIdx],
             AUDIO_MIC_BLOCK_SAMPLES,
             now);
+
+        if (followupWindowActive) {
+          if (followupWindowExpired(now)) {
+            cancelFollowupWindow("timeout");
+          } else if (wakeFeedReady &&
+                     wakeLastFeedLevel >= currentAutoVadThreshold()) {
+            Serial.printf(
+                "[FOLLOWUP] speech gate level=%u threshold=%u\n",
+                static_cast<unsigned>(wakeLastFeedLevel),
+                static_cast<unsigned>(currentAutoVadThreshold()));
+            if (startAutoCaptureFromFollowup()) {
+              return;
+            }
+          }
+        }
 
         ESP_SR_M5.feedAudio(
             wakeRing[safeIdx],
@@ -3590,6 +3665,7 @@ static void updateWakeAudioFeed() {
 
 static void resetAutoWakeCaptureState() {
   autoWakeCaptureActive = false;
+  autoFollowupCaptureActive = false;
   autoWakeSpeechStarted = false;
   autoWakePttStartSent = false;
   autoWakeLongestSilenceMs = 0;
@@ -3614,7 +3690,7 @@ static void cancelAutoWakeCaptureNoSpeech() {
   const uint32_t noSpeechLastLevel = autoWakeLastVadLevel;
   const uint32_t noSpeechThreshold = currentAutoVadThreshold();
 
-  sendJsonEvent("ptt.abort", 0, "wake_word", "no_speech");
+  sendJsonEvent("ptt.abort", 0, automaticCaptureTrigger(), "no_speech");
   resetAutoWakeCaptureState();
   pttCaptureBytes = 0;
   pttCaptureOverflow = false;
@@ -3797,7 +3873,7 @@ static void playLocalWakeAckVoice() {
   delay(28);
 }
 
-static bool startVoiceCaptureInternal(bool wakeInitiated) {
+static bool startVoiceCaptureInternal(bool wakeInitiated, bool followupInitiated = false) {
 #if COMPANION_GATEWAY_ENABLE
   if (!gatewayConnected) return false;
 #endif
@@ -3820,13 +3896,13 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
     M5.Speaker.end();
   }
 
-  if (!wakeInitiated) {
-    if (M5.Mic.isRunning()) M5.Mic.end();
-  } else {
+  if (wakeInitiated) {
     // Give the user an immediate local acknowledgement before opening the
-    // hands-free command window.  The speech-start timer is armed only
-    // after this function returns and the microphone is running again.
+    // hands-free command window. The follow-up path deliberately skips this
+    // prompt so a continuation feels conversational rather than re-woken.
     playLocalWakeAckVoice();
+  } else {
+    if (M5.Mic.isRunning()) M5.Mic.end();
   }
 
   diagCheckpoint(CP_PTT_AUDIO_IDLE, true);
@@ -3863,7 +3939,8 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
   micStreaming = true;
   infoPaused = true;
 
-  autoWakeCaptureActive = wakeInitiated;
+  autoWakeCaptureActive = wakeInitiated || followupInitiated;
+  autoFollowupCaptureActive = followupInitiated;
   autoWakeSpeechStarted = false;
   autoWakePttStartSent = false;
   autoWakeCaptureStartedMs = millis();
@@ -3873,19 +3950,23 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
   autoWakeVadVoice = false;
   autoWakeTrimOffsetBytes = 0;
 
-  if (wakeInitiated) {
+  if (wakeInitiated || followupInitiated) {
     wakeDisplaysForActivity();
   }
 
   drawGlassFrame();
   setState(CompanionState::Listening);
 
-  if (!wakeInitiated) {
+  if (!wakeInitiated && !followupInitiated) {
     // Manual PTT retains the existing protocol behavior.
     diagCheckpoint(CP_PTT_EVENT_PRE, true);
     sendJsonEvent("ptt.start", 0, "button_a");
     diagCheckpoint(CP_PTT_RUNNING, true);
     Serial.println("[TRG] button_a");
+  } else if (followupInitiated) {
+    // Like wake-word capture, keep network transfer outside the active Mic/I2S
+    // window. Unlike wake-word capture, there is no local acknowledgement.
+    Serial.println("[FOLLOWUP] capture start");
   } else {
     // Hands-free wake keeps all network audio work out of the active mic
     // window. ptt.start will be sent only after Mic/I2S stops.
@@ -3897,9 +3978,10 @@ static bool startVoiceCaptureInternal(bool wakeInitiated) {
 
 static bool startAutoCaptureFromWake() {
   wakeWordDetected = false;
+  cancelFollowupWindow("explicit_wake");
   Serial.println("[TRG] wake_word");
 
-  if (!startVoiceCaptureInternal(true)) {
+  if (!startVoiceCaptureInternal(true, false)) {
     Serial.println("[WAKE] wake capture could not start");
     return false;
   }
@@ -3907,8 +3989,25 @@ static bool startAutoCaptureFromWake() {
   return true;
 }
 
+static bool startAutoCaptureFromFollowup() {
+  if (!followupWindowActive) return false;
+  cancelFollowupWindow("speech_detected");
+  Serial.println("[TRG] follow_up");
+
+  if (!startVoiceCaptureInternal(false, true)) {
+    Serial.println("[FOLLOWUP] capture could not start");
+    return false;
+  }
+  return true;
+}
+
 static void updateWakeWordSystem() {
   if (!wakeEngineReady) return;
+
+  const uint32_t now = millis();
+  if (followupWindowExpired(now)) {
+    cancelFollowupWindow("timeout");
+  }
 
   // Event callbacks only set a flag. Product-state changes happen here.
   if (wakeWordDetected &&
@@ -3949,6 +4048,7 @@ static void updateWakeWordSystem() {
 
 static bool startPttCapture() {
 #if HOMEAI_WAKEWORD_ENABLE
+  cancelFollowupWindow("button_a");
   return startVoiceCaptureInternal(false);
 #else
   if (!gatewayConnected || micStreaming || ttsSequenceActive || ttsReceiveSlot >= 0) return false;
@@ -4049,7 +4149,7 @@ static void finishPttCapture() {
   if (pttCaptureOverflow || pttCaptureBytes == 0) {
     const char* trigger = "button_a";
 #if HOMEAI_WAKEWORD_ENABLE
-    if (autoWakeCaptureActive) trigger = "wake_word";
+    if (autoWakeCaptureActive) trigger = automaticCaptureTrigger();
 #endif
     const char* reason = pttCaptureOverflow ? "buffer_overflow" : "empty";
     Serial.printf("[AUDIO] PTT abort trigger=%s reason=%s bytes=%u\n",
@@ -4067,7 +4167,7 @@ static void finishPttCapture() {
 #if HOMEAI_WAKEWORD_ENABLE
   if (autoWakeCaptureActive && !autoWakePttStartSent) {
     diagCheckpoint(CP_PTT_EVENT_PRE, true);
-    sendJsonEvent("ptt.start", 0, "wake_word");
+    sendJsonEvent("ptt.start", 0, automaticCaptureTrigger());
     autoWakePttStartSent = true;
     diagCheckpoint(CP_PTT_RUNNING, true);
   }
@@ -4076,7 +4176,7 @@ static void finishPttCapture() {
   if (!transmitPttBuffer()) {
     const char* trigger = "button_a";
 #if HOMEAI_WAKEWORD_ENABLE
-    if (autoWakeCaptureActive) trigger = "wake_word";
+    if (autoWakeCaptureActive) trigger = automaticCaptureTrigger();
 #endif
     sendJsonEvent("ptt.abort", 0, trigger, "tx_failed");
 #if HOMEAI_WAKEWORD_ENABLE
@@ -4089,7 +4189,7 @@ static void finishPttCapture() {
 
   const char* stopTrigger = "button_a";
 #if HOMEAI_WAKEWORD_ENABLE
-  if (autoWakeCaptureActive) stopTrigger = "wake_word";
+  if (autoWakeCaptureActive) stopTrigger = automaticCaptureTrigger();
 #endif
   sendJsonEvent("ptt.stop", pttCaptureBytes, stopTrigger);
   diagCheckpoint(CP_PTT_STOP_SENT, true);
@@ -4262,7 +4362,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== HomeAIAgent A1R25B1 / Glass2 Local Voice + Wake Front-End 6dB / Wake=你好逐光 ===");
+  Serial.println("=== HomeAIAgent Wake A5.2 / 逐光同学 Observation / Wake=逐光同学 ===");
 
   auto cfg = M5.config();
   M5.begin(cfg);

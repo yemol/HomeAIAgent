@@ -74,7 +74,7 @@ async def main_async() -> None:
         html = g._kitchen_html().decode("utf-8")
         assert "KitchenTerminal A3.0b" in html
         assert "homeai-kitchen/1.9" in html
-        assert "🎙 问逐光" in html
+        assert "🎙 问小K" in html
         assert "kitchen.qa.start" in html
         assert "qa_ptt:true" in html
         assert "qaWav" in html

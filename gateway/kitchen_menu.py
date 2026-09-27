@@ -321,11 +321,78 @@ def _prep_keyword(ingredient: str) -> str:
 
 
 _PREP_ACTION_HINTS = (
-    "洗净", "洗好", "切片", "切块", "切段", "切丝", "切丁", "切末",
+    "洗净", "洗好", "清洗", "切片", "切块", "切段", "切丝", "切丁", "切末",
     "切碎", "剁碎", "拍碎", "去皮", "去壳", "去籽", "去蒂", "去根",
     "泡发", "泡软", "浸泡", "解冻", "回温", "沥干", "腌制", "腌一下",
-    "焯水", "焯一下", "调成", "调匀", "拌匀", "称量", "提前烧", "烧开备用",
+    "调汁", "碗汁", "调成", "调匀", "拌匀", "称量", "备齐", "备用",
 )
+
+# Heat is the boundary: unified prep is strictly no-heat preparation.
+# Blanching, preheating and boiling water are cooking-stage work even when a
+# legacy/generated menu placed them under "备菜".
+_HEAT_ACTION_HINTS = (
+    "焯水", "焯一下", "汆烫", "汆水",
+    "预热", "烧水", "提前烧", "烧开", "煮开", "烧沸",
+)
+
+# Hard boundary between prep and actual cooking. These actions belong to the
+# recipe's cooking stages and must never leak into the unified prep checklist.
+_COOK_ACTION_HINTS = _HEAT_ACTION_HINTS + (
+    "开火炒", "热锅", "烧热油", "下油", "倒油", "加油", "爆香", "炒香",
+    "翻炒", "煸炒", "滑炒", "炒至", "煎至", "煎熟", "煎制", "油炸", "炸至",
+    "蒸熟", "上锅蒸", "炖煮", "炖至", "焖煮", "焖至", "煮汤", "煮熟",
+    "熬煮", "熬至", "收汁", "勾芡", "出锅", "装盘", "关火",
+)
+
+_PREP_SPLIT_RE = re.compile(r"[。；;！!，,]+")
+
+
+def _prep_safe_fragments(text: str, *, require_prep_hint: bool = False) -> list[str]:
+    """Return only pre-cooking fragments from one prep/source line.
+
+    Generated or legacy menus occasionally put preparation and active cooking
+    in the same bullet (for example "青椒切丝，热锅下油翻炒"). Unified prep
+    is intentionally no-heat: it may contain washing/cutting/soaking/defrosting/
+    marinating/sauce mixing/weighing work, but never blanching, preheating,
+    boiling water, stir-frying, frying, steaming, braising, thickening or plating.
+    """
+    raw = re.sub(r"^[-*•\d.)、\s]+", "", str(text or "")).strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for piece in _PREP_SPLIT_RE.split(raw):
+        piece = piece.strip(" \t：:")
+        if not piece:
+            continue
+        has_prep = any(hint in piece for hint in _PREP_ACTION_HINTS)
+        if any(hint in piece for hint in _COOK_ACTION_HINTS):
+            # A compact phrase can still start with a valid preparation action,
+            # e.g. "蒜切末后热锅爆香". Keep only the prefix before cooking.
+            cut_at = min((piece.find(h) for h in _COOK_ACTION_HINTS if h in piece), default=-1)
+            prefix = piece[:cut_at].rstrip(" 后再然后并且，,；; ") if cut_at > 0 else ""
+            if prefix and any(hint in prefix for hint in _PREP_ACTION_HINTS):
+                piece = prefix
+                has_prep = True
+            else:
+                continue
+        if require_prep_hint and not has_prep:
+            continue
+        # Neutral prep notes from an explicit 备菜 section (e.g. "香菜备用")
+        # are allowed as long as they contain no cooking-stage action.
+        out.append(piece)
+    return out
+
+
+def prep_only_items(items: list[str] | tuple[str, ...]) -> list[str]:
+    """Normalize a prep list and enforce the prep-only project invariant."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for item in items or []:
+        for fragment in _prep_safe_fragments(str(item), require_prep_hint=False):
+            if fragment and fragment not in seen:
+                seen.add(fragment)
+                merged.append(fragment)
+    return merged
 
 
 def _prep_actions_from_cook_steps(recipe: dict[str, Any]) -> list[str]:
@@ -341,13 +408,7 @@ def _prep_actions_from_cook_steps(recipe: dict[str, Any]) -> list[str]:
         text = str(raw_step or "").strip()
         if not text:
             continue
-        for clause in re.split(r"[。；;！!]+", text):
-            clause = clause.strip(" ，,：:\t")
-            if not clause or not any(hint in clause for hint in _PREP_ACTION_HINTS):
-                continue
-            # Keep only reasonably short source clauses.  Long active cooking
-            # instructions may contain words such as '切段' incidentally and
-            # should not be copied wholesale into the prep screen.
+        for clause in _prep_safe_fragments(text, require_prep_hint=True):
             if len(clause) > 60:
                 continue
             if clause not in seen:
@@ -385,14 +446,10 @@ def _prep_items_for_recipe(recipe: dict[str, Any], entries: list[dict[str, Any]]
     # recipe's source steps; never guess missing preparation.
     recovered = _prep_actions_from_cook_steps(recipe)
 
-    merged: list[str] = []
-    seen: set[str] = set()
-    for item in list(recipe.get("prep_items") or []) + selected + recovered:
-        text = str(item).strip()
-        if text and text not in seen:
-            seen.add(text)
-            merged.append(text)
-    return merged
+    # Every source passes through the same prep-only sanitizer.  This also
+    # protects us from malformed AI-generated "备菜" bullets that accidentally
+    # continue into active cooking.
+    return prep_only_items(list(recipe.get("prep_items") or []) + selected + recovered)
 
 
 def _build_prep_step(recipe: dict[str, Any]) -> str:
@@ -414,6 +471,27 @@ def _build_prep_step(recipe: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _compact_overfine_cook_steps(steps: list[str], timers: list[dict[str, Any] | None], max_steps: int = 7) -> tuple[list[str], list[dict[str, Any] | None]]:
+    """Merge timerless micro-steps until a recipe is practical to operate.
+
+    Timed steps are kept as hard boundaries so countdown semantics are never
+    silently changed.  No text is dropped; merged actions are joined with a
+    semicolon.
+    """
+    clean_steps = [str(x).strip() for x in steps if str(x).strip()]
+    clean_timers = list(timers[:len(clean_steps)]) + [None] * max(0, len(clean_steps) - len(timers))
+    while len(clean_steps) > max_steps:
+        candidates = [i for i in range(len(clean_steps)-1) if clean_timers[i] is None and clean_timers[i+1] is None]
+        if not candidates:
+            break
+        i = min(candidates, key=lambda x: len(clean_steps[x]) + len(clean_steps[x+1]))
+        a = clean_steps[i].rstrip('。；;，, ')
+        b = clean_steps[i+1].lstrip('。；;，, ')
+        clean_steps[i:i+2] = [a + '；' + b]
+        clean_timers[i:i+2] = [None]
+    return clean_steps, clean_timers
+
+
 def ensure_recipe_prep_first(recipe: dict[str, Any]) -> dict[str, Any]:
     """Enforce the project invariant: recipe step 0 is always prep.
 
@@ -421,10 +499,20 @@ def ensure_recipe_prep_first(recipe: dict[str, Any]) -> dict[str, Any]:
     object, an older generated menu file, or a future alternate caller cannot
     bypass the prep-first rule.  The function is idempotent.
     """
+    # Sanitize before the idempotency shortcut as stale/in-memory recipes may
+    # already contain a prep step created by an older build.
+    recipe["prep_items"] = prep_only_items(list(recipe.get("prep_items") or []))
     steps = list(recipe.get("steps") or [])
     kinds = list(recipe.get("step_kinds") or [])
     timers = list(recipe.get("step_timers") or [])
     if steps and kinds and kinds[0] == "prep":
+        steps[0] = _build_prep_step(recipe)
+        if timers:
+            timers[0] = None
+        else:
+            timers = [None] + [None] * max(0, len(steps) - 1)
+        recipe["steps"] = steps
+        recipe["step_timers"] = timers
         recipe["prep_required"] = True
         return recipe
 
@@ -455,6 +543,9 @@ def parse_kitchen_menu(text: str, *, source: str = "") -> dict[str, Any]:
         recipe["prep_items"] = _prep_items_for_recipe(recipe, prep_entries)
         cook_steps = list(recipe.get("steps") or [])
         cook_timers = list(recipe.get("step_timers") or [])
+        cook_steps, cook_timers = _compact_overfine_cook_steps(cook_steps, cook_timers, max_steps=7)
+        recipe["steps"] = cook_steps
+        recipe["step_timers"] = cook_timers
         recipe["cook_steps"] = cook_steps
         recipe["cook_step_timers"] = cook_timers
         ensure_recipe_prep_first(recipe)

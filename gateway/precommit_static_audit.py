@@ -34,7 +34,7 @@ for p in ROOT.rglob('*'):
 for p in ROOT.glob('KITCHEN_A*.md'):
     errors.append(f'historical version note should be consolidated: {p.name}')
 
-for p in ROOT.glob('*.py'):
+for p in ROOT.rglob('*.py'):
     try:
         ast.parse(p.read_text(encoding='utf-8'), filename=str(p), feature_version=(3, 9))
     except Exception as exc:
@@ -82,8 +82,8 @@ if main.exists():
             if refs <= 1:
                 errors.append(f'unreferenced top-level definition: {node.name} line {node.lineno}')
 
-    if 'KITCHEN_UI_VERSION = "A3.0b FIX1 R16"' not in source:
-        errors.append('Kitchen UI version marker is not R16')
+    if 'KITCHEN_UI_VERSION = "A3.0b FIX1 R50.10 · 小K SHOPPING IDENTITY MATCH FIX"' not in source:
+        errors.append('Kitchen UI version marker is not R50.10 · 小K SHOPPING IDENTITY MATCH FIX')
 
 if errors:
     print('[STATIC-AUDIT] FAIL')
