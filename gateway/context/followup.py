@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +27,7 @@ class FollowUpState:
     armed: bool = False
     expires_at: float = 0.0
     arm_started_at: float = 0.0
+    arm_id: str = ""
     last_reason: str = "boot"
     max_turns: int = 4
 
@@ -34,12 +36,14 @@ class FollowUpState:
         self.armed = False
         self.expires_at = 0.0
         self.arm_started_at = 0.0
+        self.arm_id = ""
         self.last_reason = reason
 
     def close_window(self, reason: str = "closed") -> None:
         self.armed = False
         self.expires_at = 0.0
         self.arm_started_at = 0.0
+        self.arm_id = ""
         self.last_reason = reason
 
     def record_turn(self, user: str, assistant: str) -> None:
@@ -51,13 +55,52 @@ class FollowUpState:
         if len(self.turns) > max(1, int(self.max_turns)):
             del self.turns[: len(self.turns) - int(self.max_turns)]
 
-    def arm(self, timeout_sec: float, *, now: float | None = None) -> None:
+    def arm(
+        self,
+        timeout_sec: float,
+        *,
+        now: float | None = None,
+        arm_id: str | None = None,
+    ) -> str:
         current = time.monotonic() if now is None else float(now)
         timeout = max(0.0, float(timeout_sec))
         self.armed = bool(self.turns) and timeout > 0.0
         self.arm_started_at = current if self.armed else 0.0
         self.expires_at = current + timeout if self.armed else 0.0
+        token = str(arm_id or "").strip() or secrets.token_hex(8)
+        self.arm_id = token if self.armed else ""
         self.last_reason = "armed" if self.armed else "arm_skipped"
+        return self.arm_id
+
+    def authorize_latched_candidate(
+        self,
+        arm_id: str,
+        *,
+        arrival_grace_sec: float,
+        now: float | None = None,
+    ) -> tuple[bool, str]:
+        """Authorize a follow-up that was latched on-device before expiry.
+
+        The companion deliberately uploads only after Mic/I2S has stopped. A
+        long utterance can therefore reach Gateway after the 10-second *start*
+        window has expired. The one-shot arm id proves which window the device
+        latched locally; a bounded arrival grace prevents indefinitely stale
+        uploads from being accepted.
+        """
+        incoming = str(arm_id or "").strip()
+        if not self.armed or not self.arm_id:
+            return False, "not_armed"
+        if not incoming or incoming != self.arm_id:
+            return False, "arm_id_mismatch"
+
+        current = time.monotonic() if now is None else float(now)
+        grace = max(0.0, float(arrival_grace_sec))
+        if current > self.expires_at + grace:
+            self.close_window("latched_candidate_too_late")
+            return False, "arrival_grace_expired"
+
+        self.close_window("candidate_started")
+        return True, "latched_arm_match"
 
     def is_active(self, *, now: float | None = None) -> bool:
         if not self.armed:

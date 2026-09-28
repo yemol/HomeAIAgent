@@ -43,10 +43,15 @@ def test_judge_isolated_from_primary_voice_session() -> None:
 
 def test_ptt_gate_and_firmware_direct_input() -> None:
     require(GW, 'incoming_trigger == "follow_up"')
-    require(GW, "session.followup.is_active()")
+    require(GW, "authorize_latched_candidate")
+    require(GW, "FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC")
+    require(GW, 'msg.get("followup_arm_id")')
     require(GW, "followup_candidate_authorized")
 
     require(FW, 'else if (!strcmp(msgType, "followup.arm"))')
+    require(FW, 'doc["arm_id"]')
+    require(FW, 'doc["followup_arm_id"]')
+    require(FW, "autoFollowupArmId")
     require(FW, 'return autoFollowupCaptureActive ? "follow_up" : "wake_word";')
     require(FW, "startAutoCaptureFromFollowup")
     require(FW, "wakeLastFeedLevel >= currentAutoVadThreshold()")

@@ -456,6 +456,8 @@ static bool autoWakeCaptureActive = false;
 static bool autoFollowupCaptureActive = false;
 static bool followupWindowActive = false;
 static uint32_t followupWindowExpiresMs = 0;
+static String followupWindowArmId;
+static String autoFollowupArmId;
 static bool autoWakeSpeechStarted = false;
 static bool autoWakePttStartSent = false;
 static uint32_t autoWakeCaptureStartedMs = 0;
@@ -472,7 +474,7 @@ static constexpr uint32_t AUTO_WAKE_MIN_CAPTURE_MS = 700;
 static constexpr uint32_t AUTO_WAKE_PREROLL_MS = 300;
 static constexpr uint32_t AUTO_WAKE_MIN_VOICE_LEVEL = 450;
 
-static void armFollowupWindow(uint32_t timeoutMs);
+static void armFollowupWindow(uint32_t timeoutMs, const char* armId);
 static void cancelFollowupWindow(const char* reason);
 #endif
 #endif
@@ -2137,7 +2139,12 @@ static void addItemContext(JsonObject obj, const InfoItem& item) {
   obj["headline"] = item.headline.c_str();
 }
 
-static void sendJsonEvent(const char* type, size_t audioBytes = 0, const char* trigger = nullptr, const char* reason = nullptr) {
+static void sendJsonEvent(
+    const char* type,
+    size_t audioBytes = 0,
+    const char* trigger = nullptr,
+    const char* reason = nullptr,
+    const char* followupArmId = nullptr) {
   if (!gatewayConnected) return;
 
   JsonDocument doc;
@@ -2149,6 +2156,9 @@ static void sendJsonEvent(const char* type, size_t audioBytes = 0, const char* t
   }
   if (reason && reason[0] != '\0') {
     doc["reason"] = reason;
+  }
+  if (followupArmId && followupArmId[0] != '\0') {
+    doc["followup_arm_id"] = followupArmId;
   }
 
   JsonObject context = doc["context"].to<JsonObject>();
@@ -2764,7 +2774,8 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 #if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
       else if (!strcmp(msgType, "followup.arm")) {
         const uint32_t timeoutMs = doc["timeout_ms"] | 10000u;
-        armFollowupWindow(timeoutMs);
+        const char* armId = doc["arm_id"] | "";
+        armFollowupWindow(timeoutMs, armId);
       }
 #endif
 #if COMPANION_AUDIO_ENABLE
@@ -3538,18 +3549,23 @@ static bool startWakeListeningIfPossible() {
 }
 
 static void cancelFollowupWindow(const char* reason) {
-  if (!followupWindowActive) return;
+  if (!followupWindowActive && followupWindowArmId.isEmpty()) return;
   followupWindowActive = false;
   followupWindowExpiresMs = 0;
+  followupWindowArmId = "";
   Serial.printf("[FOLLOWUP] window closed reason=%s\n", reason ? reason : "unknown");
 }
 
-static void armFollowupWindow(uint32_t timeoutMs) {
+static void armFollowupWindow(uint32_t timeoutMs, const char* armId) {
   if (timeoutMs < 1000u) timeoutMs = 1000u;
   if (timeoutMs > 30000u) timeoutMs = 30000u;
   followupWindowActive = true;
   followupWindowExpiresMs = millis() + timeoutMs;
-  Serial.printf("[FOLLOWUP] window armed timeout=%ums\n", static_cast<unsigned>(timeoutMs));
+  followupWindowArmId = armId ? armId : "";
+  Serial.printf(
+      "[FOLLOWUP] window armed timeout=%ums arm_id=%s\n",
+      static_cast<unsigned>(timeoutMs),
+      followupWindowArmId.isEmpty() ? "legacy" : followupWindowArmId.c_str());
 }
 
 static bool followupWindowExpired(uint32_t now) {
@@ -3666,6 +3682,7 @@ static void updateWakeAudioFeed() {
 static void resetAutoWakeCaptureState() {
   autoWakeCaptureActive = false;
   autoFollowupCaptureActive = false;
+  autoFollowupArmId = "";
   autoWakeSpeechStarted = false;
   autoWakePttStartSent = false;
   autoWakeLongestSilenceMs = 0;
@@ -3991,11 +4008,23 @@ static bool startAutoCaptureFromWake() {
 
 static bool startAutoCaptureFromFollowup() {
   if (!followupWindowActive) return false;
+  if (followupWindowExpired(millis())) {
+    cancelFollowupWindow("timeout_before_capture");
+    return false;
+  }
+
+  // Latch the one-shot Gateway arm while the local 10-second window is still
+  // valid. No network traffic is sent here because Mic/I2S capture must remain
+  // radio-quiet. The token is uploaded only after recording has fully stopped.
+  autoFollowupArmId = followupWindowArmId;
   cancelFollowupWindow("speech_detected");
-  Serial.println("[TRG] follow_up");
+  Serial.printf(
+      "[TRG] follow_up arm_id=%s\n",
+      autoFollowupArmId.isEmpty() ? "legacy" : autoFollowupArmId.c_str());
 
   if (!startVoiceCaptureInternal(false, true)) {
     Serial.println("[FOLLOWUP] capture could not start");
+    autoFollowupArmId = "";
     return false;
   }
   return true;
@@ -4167,7 +4196,11 @@ static void finishPttCapture() {
 #if HOMEAI_WAKEWORD_ENABLE
   if (autoWakeCaptureActive && !autoWakePttStartSent) {
     diagCheckpoint(CP_PTT_EVENT_PRE, true);
-    sendJsonEvent("ptt.start", 0, automaticCaptureTrigger());
+    const char* followupArm =
+        autoFollowupCaptureActive && !autoFollowupArmId.isEmpty()
+            ? autoFollowupArmId.c_str()
+            : nullptr;
+    sendJsonEvent("ptt.start", 0, automaticCaptureTrigger(), nullptr, followupArm);
     autoWakePttStartSent = true;
     diagCheckpoint(CP_PTT_RUNNING, true);
   }
@@ -4191,7 +4224,11 @@ static void finishPttCapture() {
 #if HOMEAI_WAKEWORD_ENABLE
   if (autoWakeCaptureActive) stopTrigger = automaticCaptureTrigger();
 #endif
-  sendJsonEvent("ptt.stop", pttCaptureBytes, stopTrigger);
+  const char* stopFollowupArm =
+      autoFollowupCaptureActive && !autoFollowupArmId.isEmpty()
+          ? autoFollowupArmId.c_str()
+          : nullptr;
+  sendJsonEvent("ptt.stop", pttCaptureBytes, stopTrigger, nullptr, stopFollowupArm);
   diagCheckpoint(CP_PTT_STOP_SENT, true);
 
 #if HOMEAI_WAKEWORD_ENABLE

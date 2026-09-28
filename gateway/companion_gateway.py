@@ -212,6 +212,9 @@ FOLLOWUP_JUDGE_TIMEOUT_SEC = max(2.0, min(30.0, float(
 FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC = max(0.5, min(5.0, float(
     os.getenv("HOMEAI_FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC", "2")
 )))
+FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC = max(5.0, min(60.0, float(
+    os.getenv("HOMEAI_FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC", "30")
+)))
 FOLLOWUP_JUDGE_SESSION_CLEANUP = (
     os.getenv("HOMEAI_FOLLOWUP_JUDGE_SESSION_CLEANUP", "true").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -6881,15 +6884,17 @@ async def process_utterance(session: ClientSession) -> None:
             session.followup.record_turn(transcript, answer)
             if FOLLOWUP_AUDIO_FENCE_SEC > 0:
                 await asyncio.sleep(FOLLOWUP_AUDIO_FENCE_SEC)
-            session.followup.arm(FOLLOWUP_TIMEOUT_SEC)
+            arm_id = session.followup.arm(FOLLOWUP_TIMEOUT_SEC)
             if session.followup.is_active():
                 await send_json(session.ws, {
                     "type": "followup.arm",
                     "timeout_ms": int(FOLLOWUP_TIMEOUT_SEC * 1000),
+                    "arm_id": arm_id,
                 })
                 print(
                     f"[FOLLOWUP] armed device={session.device_id} "
                     f"timeout={FOLLOWUP_TIMEOUT_SEC:.1f}s "
+                    f"arm_id={arm_id} "
                     f"turns={len(session.followup.turns)}"
                 )
 
@@ -11260,20 +11265,36 @@ async def handle_connection(ws) -> None:
 
                 incoming_trigger = str(msg.get("trigger") or "unknown")
                 if incoming_trigger == "follow_up":
-                    if not session.followup.is_active():
+                    incoming_arm_id = str(msg.get("followup_arm_id") or "").strip()
+                    if incoming_arm_id:
+                        accepted, accept_reason = session.followup.authorize_latched_candidate(
+                            incoming_arm_id,
+                            arrival_grace_sec=FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC,
+                        )
+                    else:
+                        # Backward-compatible path for an older companion during
+                        # staggered deployment. It retains the old short-utterance
+                        # behavior until that device firmware is updated.
+                        accepted = session.followup.is_active()
+                        accept_reason = "legacy_active_window" if accepted else "legacy_window_expired"
+                        if accepted:
+                            session.followup.close_window("candidate_started")
+
+                    if not accepted:
                         session.followup_candidate_authorized = False
                         session.recording = False
                         print(
-                            f"[FOLLOWUP] candidate rejected outside window "
-                            f"device={session.device_id}"
+                            f"[FOLLOWUP] candidate rejected reason={accept_reason} "
+                            f"device={session.device_id} arm_id={incoming_arm_id or '-'}"
                         )
                         await send_state(ws, "idle")
                         continue
-                    # Reserve the one-shot window immediately. The recent turn
-                    # history remains available to the Context Judge, but a
-                    # second concurrent no-wake candidate cannot enter.
-                    session.followup.close_window("candidate_started")
+
                     session.followup_candidate_authorized = True
+                    print(
+                        f"[FOLLOWUP] candidate accepted reason={accept_reason} "
+                        f"device={session.device_id} arm_id={incoming_arm_id or 'legacy'}"
+                    )
                 else:
                     # An explicit wake/button turn is a deliberate fresh entry.
                     # It must never inherit a stale no-wake gate.
@@ -11424,6 +11445,7 @@ async def preflight(*, require_openclaw: bool = True) -> int:
         f"fence={FOLLOWUP_AUDIO_FENCE_SEC:.1f}s "
         f"judge_timeout={FOLLOWUP_JUDGE_TIMEOUT_SEC:.1f}s "
         f"cleanup_timeout={FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC:.1f}s "
+        f"latched_arrival_grace={FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC:.1f}s "
         f"cleanup={FOLLOWUP_JUDGE_SESSION_CLEANUP}"
     )
     print(

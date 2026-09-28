@@ -1,3 +1,11 @@
+# HomeAIAgent A5.0.1 Follow-up Long Utterance Fix (2026-09-28)
+
+- Fix long no-wake follow-up utterances being rejected when `ptt.start` reaches Gateway after the original 10-second window.
+- Keep the 10-second rule as a **speech-start window**, not a whole-utterance deadline.
+- Gateway now issues a one-shot `arm_id`; StickS3 latches it only when speech begins inside the local window and uploads it after Mic/I2S capture stops.
+- Gateway accepts the matching latched arm within a bounded 30-second arrival grace, then consumes it one-shot. Wrong, replayed, or overly stale arm ids are rejected.
+- Preserve the existing 20-second automatic capture ceiling, Wake/VAD thresholds, Context Judge behavior, NetworkSpeaker routing, OpenClaw session semantics and KitchenTerminal behavior.
+
 # HomeAIAgent Current Baseline Cleanup (2026-09-27)
 
 - Freeze the real-device verified A5.0-GW-R1 Selective Follow-up behavior.

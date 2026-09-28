@@ -6,6 +6,7 @@
 
 - **语音主链路**：Wake / PTT → ASR → OpenClaw → TTS → Audio Route → playback ACK
 - **A5.0 Selective Follow-up**：回答真实播放完成后，开放 10 秒当前上下文追问窗口
+- **A5.0.1 Long Utterance Fix**：10 秒只限制“开始说话”，窗口内开口后可继续录制到现有 20 秒语音上限再上传
 - **Context Judge**：仅允许当前上下文的自然延续进入原 OpenClaw 会话；新话题、歧义或环境语音静默忽略
 - **NetworkSpeaker**：只负责网络音频输出，不持有 AI / Session 状态
 - **Wake phrase**：`逐光同学`
@@ -68,6 +69,7 @@ HOMEAI_FOLLOWUP_TIMEOUT_SEC=10
 HOMEAI_FOLLOWUP_AUDIO_FENCE_SEC=0.5
 HOMEAI_FOLLOWUP_JUDGE_TIMEOUT_SEC=12
 HOMEAI_FOLLOWUP_JUDGE_CLEANUP_TIMEOUT_SEC=2
+HOMEAI_FOLLOWUP_LATCHED_ARRIVAL_GRACE_SEC=30
 HOMEAI_FOLLOWUP_JUDGE_SESSION_CLEANUP=true
 ```
 
@@ -140,6 +142,9 @@ cd /Volumes/yemol_HDDisk/HomeAIAgent/gateway
 ```
 
 A5.0 关键日志：
+
+A5.0.1 起，每个追问窗口会带一次性 `arm_id`。StickS3 只要在本地 10 秒窗口内检测到开口，就锁定该 `arm_id`；录音结束后再上传。Gateway 因此不会把 10 秒误解为“整句话必须在 10 秒内说完”。当前自动语音捕获仍沿用 `AUDIO_MAX_PTT_MS=20000`，即单句最长约 20 秒。
+
 
 ```text
 [AUDIO] device playback done

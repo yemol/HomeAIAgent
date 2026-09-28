@@ -27,6 +27,56 @@ def test_state_window_and_history() -> None:
     assert not state.armed
 
 
+
+def test_latched_long_utterance_authorization() -> None:
+    state = FollowUpState()
+    state.record_turn("今天金价怎么样？", "今天金价……")
+    arm_id = state.arm(10.0, now=100.0, arm_id="arm-long-1")
+    assert arm_id == "arm-long-1"
+
+    # The user started speaking inside the device's 10-second window, but the
+    # device uploads only after an 18-second utterance finishes. Gateway must
+    # accept the latched one-shot arm after the original start window expired.
+    accepted, reason = state.authorize_latched_candidate(
+        "arm-long-1", arrival_grace_sec=30.0, now=128.0
+    )
+    assert accepted, reason
+    assert reason == "latched_arm_match"
+    assert not state.armed
+
+    # The arm is one-shot. A replay of the same token must fail closed.
+    accepted, reason = state.authorize_latched_candidate(
+        "arm-long-1", arrival_grace_sec=30.0, now=128.5
+    )
+    assert not accepted
+    assert reason == "not_armed"
+
+    short = FollowUpState()
+    short.record_turn("A", "B")
+    short.arm(10.0, now=150.0, arm_id="arm-short")
+    accepted, reason = short.authorize_latched_candidate(
+        "arm-short", arrival_grace_sec=30.0, now=155.0
+    )
+    assert accepted, reason
+
+    wrong = FollowUpState()
+    wrong.record_turn("A", "B")
+    wrong.arm(10.0, now=200.0, arm_id="arm-2")
+    accepted, reason = wrong.authorize_latched_candidate(
+        "old-arm", arrival_grace_sec=30.0, now=205.0
+    )
+    assert not accepted
+    assert reason == "arm_id_mismatch"
+
+    stale = FollowUpState()
+    stale.record_turn("A", "B")
+    stale.arm(10.0, now=300.0, arm_id="arm-3")
+    accepted, reason = stale.authorize_latched_candidate(
+        "arm-3", arrival_grace_sec=30.0, now=341.0
+    )
+    assert not accepted
+    assert reason == "arrival_grace_expired"
+
 def test_decision_parser_fail_closed() -> None:
     assert parse_followup_decision('{"decision":"continue","reason":"same topic"}')[0] == "continue"
     assert parse_followup_decision('```json\n{"decision":"ignore","reason":"new topic"}\n```')[0] == "ignore"
@@ -48,6 +98,7 @@ def test_prompt_is_strict_context_gate() -> None:
 
 if __name__ == "__main__":
     test_state_window_and_history()
+    test_latched_long_utterance_authorization()
     test_decision_parser_fail_closed()
     test_prompt_is_strict_context_gate()
     print("[PASS] follow-up context state/judge helpers")
