@@ -32,6 +32,8 @@
   #include <WiFi.h>
   #include <WebSocketsClient.h>
   #include <ArduinoJson.h>
+  #include <mbedtls/base64.h>
+  #include <mbedtls/md.h>
 
   // Local secrets are optional; provisioned devices use persistent NVS.
   #if __has_include("secrets.h")
@@ -58,6 +60,12 @@ struct InfoItem {
 };
 
 #if COMPANION_GATEWAY_ENABLE
+// A6.1.1: auth helpers are defined before the transport globals below.
+// Forward declarations keep the existing global layout unchanged while making
+// the authentication client compile cleanly.
+extern WebSocketsClient webSocket;
+extern bool gatewayConnected;
+
 struct RuntimeDeviceConfig {
   String wifiSsid;
   String wifiPassword;
@@ -70,9 +78,15 @@ struct RuntimeDeviceConfig {
 
 static RuntimeDeviceConfig deviceConfig;
 static Preferences configPrefs;
+static Preferences authPrefs;
 static String serialConfigLine;
+static String deviceAuthSecret;
+static bool deviceAuthProvisioned = false;
+static bool gatewayAuthenticated = false;
 static constexpr uint32_t kDeviceConfigSchema = 1;
 static constexpr char kDeviceConfigNamespace[] = "homeai_cfg";
+static constexpr uint32_t kDeviceAuthSchema = 1;
+static constexpr char kDeviceAuthNamespace[] = "homeai_auth";
 
 static bool looksLikePlaceholder(const String& value) {
   return value.isEmpty() ||
@@ -115,6 +129,191 @@ static bool persistDeviceConfig(const RuntimeDeviceConfig& cfg) {
   configPrefs.putUShort("gateway_port", cfg.gatewayPort);
   configPrefs.putString("gateway_path", cfg.gatewayPath);
   configPrefs.putString("device_name", cfg.deviceName);
+  return true;
+}
+
+static bool decodeBase64Url(const String& value, uint8_t* out, size_t outCapacity, size_t& outLen) {
+  String normalized = value;
+  normalized.trim();
+  normalized.replace("-", "+");
+  normalized.replace("_", "/");
+  while ((normalized.length() % 4) != 0) normalized += "=";
+
+  size_t decoded = 0;
+  const int rc = mbedtls_base64_decode(
+      out,
+      outCapacity,
+      &decoded,
+      reinterpret_cast<const unsigned char*>(normalized.c_str()),
+      normalized.length());
+  if (rc != 0) return false;
+  outLen = decoded;
+  return true;
+}
+
+static bool encodeBase64Url(const uint8_t* value, size_t valueLen, String& out) {
+  unsigned char encoded[128] = {};
+  size_t encodedLen = 0;
+  const int rc = mbedtls_base64_encode(
+      encoded,
+      sizeof(encoded) - 1,
+      &encodedLen,
+      value,
+      valueLen);
+  if (rc != 0 || encodedLen >= sizeof(encoded)) return false;
+  encoded[encodedLen] = '\0';
+  out = String(reinterpret_cast<const char*>(encoded));
+  out.replace("+", "-");
+  out.replace("/", "_");
+  while (out.endsWith("=")) out.remove(out.length() - 1);
+  return !out.isEmpty();
+}
+
+static bool validateDeviceAuthSecret(const String& secret) {
+  uint8_t decoded[48] = {};
+  size_t decodedLen = 0;
+  return decodeBase64Url(secret, decoded, sizeof(decoded), decodedLen) && decodedLen == 32;
+}
+
+static void printDeviceAuthConfig() {
+  Serial.println("[AUTH] HomeAgent device credential:");
+  Serial.printf("[AUTH]   device_id=%s\n", HOMEAI_DEVICE_ID);
+  Serial.printf("[AUTH]   role=%s\n", HOMEAI_DEVICE_ROLE);
+  Serial.printf("[AUTH]   protocol=%s\n", HOMEAI_AUTH_PROTOCOL);
+  Serial.printf("[AUTH]   secret=%s\n", deviceAuthProvisioned ? "SET" : "MISSING");
+  Serial.printf("[AUTH]   session=%s\n", gatewayAuthenticated ? "AUTHENTICATED" : "NOT_AUTHENTICATED");
+}
+
+static void loadPersistentDeviceAuth() {
+  if (!authPrefs.begin(kDeviceAuthNamespace, false)) {
+    deviceAuthSecret = "";
+    deviceAuthProvisioned = false;
+    Serial.println("[AUTH] NVS namespace open failed");
+    return;
+  }
+
+  const uint32_t schema = authPrefs.getUInt("schema", 0);
+  const String stored = authPrefs.getString("secret", "");
+  if (schema == kDeviceAuthSchema && validateDeviceAuthSecret(stored)) {
+    deviceAuthSecret = stored;
+    deviceAuthProvisioned = true;
+    Serial.println("[AUTH] device credential loaded from NVS");
+  } else {
+    deviceAuthSecret = "";
+    deviceAuthProvisioned = false;
+    Serial.println("[AUTH] device credential not provisioned");
+  }
+  printDeviceAuthConfig();
+}
+
+static bool persistDeviceAuthSecret(const String& secret) {
+  String normalized = secret;
+  normalized.trim();
+  if (!validateDeviceAuthSecret(normalized)) return false;
+  if (authPrefs.putUInt("schema", kDeviceAuthSchema) == 0) return false;
+  if (authPrefs.putString("secret", normalized) == 0) return false;
+  deviceAuthSecret = normalized;
+  deviceAuthProvisioned = true;
+  gatewayAuthenticated = false;
+  return true;
+}
+
+static void clearDeviceAuthSecret() {
+  authPrefs.clear();
+  deviceAuthSecret = "";
+  deviceAuthProvisioned = false;
+  gatewayAuthenticated = false;
+}
+
+static bool computeDeviceAuthProof(
+    const String& challengeId,
+    const String& serverNonce,
+    const String& clientNonce,
+    String& proofOut) {
+  if (!deviceAuthProvisioned) return false;
+
+  uint8_t key[48] = {};
+  size_t keyLen = 0;
+  if (!decodeBase64Url(deviceAuthSecret, key, sizeof(key), keyLen) || keyLen != 32) {
+    return false;
+  }
+
+  String message;
+  message.reserve(
+      strlen(HOMEAI_AUTH_PROTOCOL) + strlen(HOMEAI_DEVICE_ID) +
+      challengeId.length() + serverNonce.length() + clientNonce.length() + 8);
+  message += HOMEAI_AUTH_PROTOCOL;
+  message += '\n';
+  message += HOMEAI_DEVICE_ID;
+  message += '\n';
+  message += challengeId;
+  message += '\n';
+  message += serverNonce;
+  message += '\n';
+  message += clientNonce;
+
+  const mbedtls_md_info_t* mdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!mdInfo) return false;
+
+  uint8_t digest[32] = {};
+  const int rc = mbedtls_md_hmac(
+      mdInfo,
+      key,
+      keyLen,
+      reinterpret_cast<const unsigned char*>(message.c_str()),
+      message.length(),
+      digest);
+  if (rc != 0) return false;
+  return encodeBase64Url(digest, sizeof(digest), proofOut);
+}
+
+static bool sendDeviceAuthResponse(JsonDocument& challenge) {
+  if (!gatewayConnected) return false;
+  if (!deviceAuthProvisioned) {
+    Serial.println("[AUTH] challenge received but device secret is missing; observe mode can continue");
+    return false;
+  }
+
+  const char* protocol = challenge["protocol"] | "";
+  const char* deviceId = challenge["device_id"] | "";
+  const char* challengeId = challenge["challenge_id"] | "";
+  const char* serverNonce = challenge["server_nonce"] | "";
+  const char* algorithm = challenge["algorithm"] | "";
+
+  if (strcmp(protocol, HOMEAI_AUTH_PROTOCOL) != 0 ||
+      strcmp(deviceId, HOMEAI_DEVICE_ID) != 0 ||
+      strcmp(algorithm, "HMAC-SHA256") != 0 ||
+      !challengeId[0] || !serverNonce[0]) {
+    Serial.println("[AUTH] rejected malformed or mismatched security challenge");
+    return false;
+  }
+
+  uint8_t nonceBytes[24] = {};
+  esp_fill_random(nonceBytes, sizeof(nonceBytes));
+  String clientNonce;
+  if (!encodeBase64Url(nonceBytes, sizeof(nonceBytes), clientNonce)) {
+    Serial.println("[AUTH] client nonce generation failed");
+    return false;
+  }
+
+  String proof;
+  if (!computeDeviceAuthProof(challengeId, serverNonce, clientNonce, proof)) {
+    Serial.println("[AUTH] HMAC proof generation failed");
+    return false;
+  }
+
+  JsonDocument reply;
+  reply["type"] = "security.auth";
+  reply["protocol"] = HOMEAI_AUTH_PROTOCOL;
+  reply["device_id"] = HOMEAI_DEVICE_ID;
+  reply["challenge_id"] = challengeId;
+  reply["client_nonce"] = clientNonce;
+  reply["proof"] = proof;
+
+  String payload;
+  serializeJson(reply, payload);
+  webSocket.sendTXT(payload);
+  Serial.println("[AUTH] challenge answered");
   return true;
 }
 
@@ -217,7 +416,24 @@ static void handleSerialConfig() {
     }
 
     serialConfigLine.trim();
-    if (serialConfigLine == "CFG SHOW") {
+    if (serialConfigLine == "AUTH SHOW") {
+      printDeviceAuthConfig();
+    }
+    else if (serialConfigLine == "AUTH CLEAR") {
+      clearDeviceAuthSecret();
+      Serial.println("[AUTH] credential cleared");
+      printDeviceAuthConfig();
+    }
+    else if (serialConfigLine.startsWith("AUTH SET ")) {
+      const String secret = serialConfigLine.substring(9);
+      if (persistDeviceAuthSecret(secret)) {
+        Serial.println("[AUTH] credential saved; reconnect or reboot to authenticate");
+      } else {
+        Serial.println("[AUTH] invalid credential; expected a 256-bit base64url secret");
+      }
+      printDeviceAuthConfig();
+    }
+    else if (serialConfigLine == "CFG SHOW") {
       printDeviceConfig();
     }
     else if (serialConfigLine == "CFG RESET") {
@@ -232,7 +448,7 @@ static void handleSerialConfig() {
       handleConfigJson(serialConfigLine.substring(4));
     }
     else if (!serialConfigLine.isEmpty()) {
-      Serial.println("[CONFIG] commands: CFG SHOW | CFG {json} | CFG RESET");
+      Serial.println("[CONFIG] commands: CFG SHOW | CFG {json} | CFG RESET | AUTH SHOW | AUTH SET <secret> | AUTH CLEAR");
     }
     serialConfigLine = "";
   }
@@ -2151,6 +2367,13 @@ static void sendJsonEvent(
   doc["type"] = type;
   doc["protocol"] = 2;
   doc["diag_glass_mode"] = glassDiagLabel();
+  if (!strcmp(type, "device.hello")) {
+    doc["device_id"] = HOMEAI_DEVICE_ID;
+    doc["device_role"] = HOMEAI_DEVICE_ROLE;
+    doc["device_name"] = deviceConfig.deviceName.c_str();
+    JsonObject capabilities = doc["capabilities"].to<JsonObject>();
+    capabilities["device_auth"] = HOMEAI_AUTH_PROTOCOL;
+  }
   if (trigger && trigger[0] != '\0') {
     doc["trigger"] = trigger;
   }
@@ -2649,6 +2872,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
       gatewayConnected = true;
+      gatewayAuthenticated = false;
       Serial.println("[WS] connected");
 
       // A reconnect clears only transport-originated Error so wake listening can re-arm.
@@ -2664,6 +2888,7 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
     case WStype_DISCONNECTED:
       gatewayConnected = false;
+      gatewayAuthenticated = false;
       gatewayTransportFault = true;
       Serial.println("[WS] disconnected");
 #if COMPANION_AUDIO_ENABLE && HOMEAI_WAKEWORD_ENABLE
@@ -2693,7 +2918,24 @@ static void onWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       if (err) break;
       const char* msgType = doc["type"] | "";
 
-      if (!strcmp(msgType, "info.begin")) {
+      if (!strcmp(msgType, "security.challenge")) {
+        sendDeviceAuthResponse(doc);
+      }
+      else if (!strcmp(msgType, "security.auth.ok")) {
+        gatewayAuthenticated = true;
+        Serial.println("[AUTH] authenticated with Gateway");
+      }
+      else if (!strcmp(msgType, "security.auth.failed")) {
+        gatewayAuthenticated = false;
+        const char* reason = doc["reason"] | "unknown";
+        Serial.printf("[AUTH] authentication failed reason=%s\n", reason);
+      }
+      else if (!strcmp(msgType, "security.denied")) {
+        gatewayAuthenticated = false;
+        const char* reason = doc["reason"] | "denied";
+        Serial.printf("[AUTH] Gateway denied device reason=%s\n", reason);
+      }
+      else if (!strcmp(msgType, "info.begin")) {
         const size_t count = doc["count"] | 0;
         const char* revision = doc["revision"] | "";
         beginInfoSync(count, revision);
@@ -4399,7 +4641,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println();
-  Serial.println("=== HomeAIAgent Wake A5.2 / 逐光同学 Observation / Wake=逐光同学 ===");
+  Serial.println("=== HomeAIAgent A6.1 / Device Auth Client / Wake=逐光同学 ===");
 
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -4408,6 +4650,7 @@ void setup() {
 
 #if COMPANION_GATEWAY_ENABLE
   loadPersistentDeviceConfig();
+  loadPersistentDeviceAuth();
 #endif
 
   // Native USB monitor may still be reconnecting during the first few hundred ms.

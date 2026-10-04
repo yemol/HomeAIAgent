@@ -9,8 +9,16 @@ the SSH path is unavailable.
 from __future__ import annotations
 
 import asyncio
+import warnings
 from dataclasses import dataclass
 from typing import Any
+
+# AsyncSSH 2.14.2 is intentionally pinned for the current Python 3.9 runtime.
+# Newer cryptography releases emit deprecation notices for legacy ciphers which
+# HomeAIAgent never selects. Suppress only those two third-party notices while
+# keeping all other warnings visible.
+warnings.filterwarnings("ignore", message=r"ARC4 has been moved.*")
+warnings.filterwarnings("ignore", message=r"TripleDES has been moved.*")
 
 try:
     import asyncssh  # type: ignore

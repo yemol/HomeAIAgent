@@ -1,3 +1,16 @@
+
+### A6.1.1 Agent auth compile fix
+- Fixed declaration order for `webSocket` and `gatewayConnected` used by the A6.1 auth response helper.
+- No authentication protocol, NVS, audio, wake-word, or routing behavior changed.
+# HomeAIAgent A6.1 Agent Device Auth Client (2026-09-30)
+
+- Give the primary StickS3 an explicit authenticated identity: `homeai-agent-main-01` / `companion`.
+- Store the per-device 256-bit secret only in the ESP32-S3 `homeai_auth` NVS namespace; no production secret is compiled into source.
+- Add `homeai-auth/1` HMAC-SHA256 challenge/response support with a fresh 24-byte client nonce on every challenge.
+- Add local serial maintenance commands `AUTH SHOW`, `AUTH SET <secret>`, and `AUTH CLEAR`; `AUTH SHOW` never reveals the secret.
+- Keep migration fail-safe: Gateway remains in Observe mode until real-device authentication is verified.
+- Preserve Wake, Follow-up, Audio, Glass2, NetworkSpeaker routing and KitchenTerminal behavior.
+
 # HomeAIAgent A5.0.1 Follow-up Long Utterance Fix (2026-09-28)
 
 - Fix long no-wake follow-up utterances being rejected when `ptt.start` reaches Gateway after the original 10-second window.

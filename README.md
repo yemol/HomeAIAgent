@@ -1,3 +1,7 @@
+
+### A6.1.1 Agent auth compile fix
+- Fixed declaration order for `webSocket` and `gatewayConnected` used by the A6.1 auth response helper.
+- No authentication protocol, NVS, audio, wake-word, or routing behavior changed.
 # HomeAIAgent
 
 当前正式源码基线，包含桌面 HomeAIAgent、Gateway、NetworkSpeaker 路由、Glass2、KitchenTerminal（小K）以及 A5.0 Selective Follow-up 连续追问能力。
@@ -173,9 +177,38 @@ pio device monitor
 不要 Erase Flash。当前启动关键日志：
 
 ```text
-=== HomeAIAgent Wake A5.2 / 逐光同学 Observation / Wake=逐光同学 ===
+=== HomeAIAgent A6.1 / Device Auth Client / Wake=逐光同学 ===
+[AUTH]   device_id=homeai-agent-main-01
+[AUTH]   secret=SET|MISSING
 [WAKE] local keyword engine ready: 逐光同学
 ```
+
+### A6.1 主 Agent 设备认证
+
+主 Agent 的公开身份固定为 `homeai-agent-main-01`，角色为 `companion`。设备密钥不写入源码，存放在 ESP32-S3 的 `homeai_auth` NVS namespace。
+
+串口本地维护命令：
+
+```text
+AUTH SHOW
+AUTH SET <Gateway 为该设备生成的 256-bit base64url secret>
+AUTH CLEAR
+```
+
+`AUTH SHOW` 只显示密钥是否已配置及当前会话是否已认证，不输出密钥本身。写入密钥后重启或重连设备。收到 Gateway 的 `security.challenge` 后，StickS3 使用 HMAC-SHA256 回应；成功日志为：
+
+```text
+[AUTH] challenge answered
+[AUTH] authenticated with Gateway
+```
+
+Gateway 侧可随时查看所有设备状态：
+
+```bash
+~/.local/share/HomeAIAgent/venv/bin/python gateway/security_cli.py devices
+```
+
+迁移期间保持 `HOMEAI_SECURITY_MODE=observe`；只有所有正式设备均显示 `AUTHENTICATED` 或曾验证后的 `OFFLINE_VERIFIED`，才进入 enforce 阶段。
 
 ## 7. 关键硬件与音频参数
 

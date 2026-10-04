@@ -96,10 +96,22 @@ def main():
     finally:
         cg.ACTIVE_SESSIONS[:] = old
 
-    # Only primary companion can consume main notification queue.
-    assert cg._reminder_session_available(main_session)
-    assert not cg._reminder_session_available(mini)
-    assert not cg._reminder_session_available(mini_dock)
+    # Reminder availability is target-aware: Main reminders stay on Main, Mini
+    # reminders stay on Mini and then use the existing bound-speaker router.
+    assert cg._reminder_session_available(main_session, cg.HOMEAI_PRIMARY_DEVICE_ID)
+    assert not cg._reminder_session_available(mini, cg.HOMEAI_PRIMARY_DEVICE_ID)
+    assert cg._reminder_session_available(mini, cg.HOMEAI_MINI_DEVICE_ID)
+    assert not cg._reminder_session_available(main_session, cg.HOMEAI_MINI_DEVICE_ID)
+    assert not cg._reminder_session_available(mini_dock, cg.HOMEAI_MINI_DEVICE_ID)
+
+    targets = cg._notification_listener_targets()
+    target_map = {device_id: (session_key, user) for session_key, device_id, user in targets}
+    assert cg.HOMEAI_PRIMARY_DEVICE_ID in target_map
+    assert cg.HOMEAI_MINI_DEVICE_ID in target_map
+    assert cg.KITCHEN_DEVICE_ID in target_map
+    assert target_map[cg.HOMEAI_MINI_DEVICE_ID][1] == cg.OPENCLAW_MINI_USER
+    assert target_map[cg.KITCHEN_DEVICE_ID][1] == cg.OPENCLAW_KITCHEN_USER
+    assert len({target_map[cg.HOMEAI_PRIMARY_DEVICE_ID][0], target_map[cg.HOMEAI_MINI_DEVICE_ID][0], target_map[cg.KITCHEN_DEVICE_ID][0]}) == 3
 
     print("PASS: multi-device conversation and speaker routing")
 

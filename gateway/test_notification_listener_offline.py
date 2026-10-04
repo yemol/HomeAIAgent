@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Offline regression test for Notification A1 transcript reconciliation."""
+"""Offline regression for A5.0.2 multi-device Notification/Reminder routing."""
 
 import asyncio
+import json
 import tempfile
 from pathlib import Path
 
@@ -25,7 +26,7 @@ def _user_message(message_id: str, seq: int, text: str) -> dict:
 
 
 async def _run() -> None:
-    temp_root = Path(tempfile.mkdtemp(prefix="homeai-notify-test-"))
+    temp_root = Path(tempfile.mkdtemp(prefix="homeai-notify-multi-test-"))
     g.NOTIFICATION_STATE_FILE = temp_root / "listener-state.json"
     g.REMINDER_QUEUE_FILE = temp_root / "queue.json"
     g.REMINDER_LOCK = asyncio.Lock()
@@ -33,177 +34,155 @@ async def _run() -> None:
     g.REMINDER_PENDING.clear()
     g.REMINDER_DELIVERED.clear()
     g.REMINDER_DELIVERED_KEYS.clear()
-    g.NOTIFICATION_SEEN_KEYS.clear()
-    g.NOTIFICATION_SEEN_SET.clear()
-    g.NOTIFICATION_CURSOR_INITIALIZED = False
-    g.NOTIFICATION_CURSOR_SESSION_KEY = ""
-    g.NOTIFICATION_CURSOR_SESSION_ID = ""
-    g.VOICE_REPLY_SUPPRESSIONS.clear()
-    g.VOICE_TURN_FENCES.clear()
-    g.VOICE_OPENCLAW_INFLIGHT = 0
+    g.NOTIFICATION_SESSION_STATES.clear()
 
-    session_key = "agent:main:openai-user:home-ai-agent:main"
+    primary_key = g._openclaw_voice_session_key(g.OPENCLAW_USER)
+    mini_key = g._openclaw_voice_session_key(g.OPENCLAW_MINI_USER)
+    kitchen_key = g._openclaw_voice_session_key(g.OPENCLAW_KITCHEN_USER)
+    assert len({primary_key, mini_key, kitchen_key}) == 3
 
-    # First startup must baseline existing history without replaying it.
+    # First startup baselines both sessions independently without replaying history.
     await g._reconcile_voice_session_history(
-        {"sessionId": "session-a", "messages": [_message("m1", 1, "旧消息")]},
-        session_key,
+        {"sessionId": "primary-a", "messages": [_message("p1", 1, "主机旧消息")]},
+        primary_key,
+        source_device_id=g.HOMEAI_PRIMARY_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_USER,
+    )
+    await g._reconcile_voice_session_history(
+        {"sessionId": "mini-a", "messages": [_message("m1", 1, "Mini旧消息")]},
+        mini_key,
+        source_device_id=g.HOMEAI_MINI_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_MINI_USER,
+    )
+    await g._reconcile_voice_session_history(
+        {"sessionId": "kitchen-a", "messages": [_message("k1", 1, "小K旧消息")]},
+        kitchen_key,
+        source_device_id=g.KITCHEN_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_KITCHEN_USER,
     )
     assert not g.REMINDER_PENDING
 
-    # A later assistant append is an asynchronous notification and must persist.
-    async_message = _message("m2", 2, "提醒你，喝水")
+    # Mini async append must carry Mini as the durable delivery target.
+    mini_async = _message("m2", 2, "你设置的五分钟闹钟到了。")
     await g._reconcile_voice_session_history(
-        {
-            "sessionId": "session-a",
-            "messages": [_message("m1", 1, "旧消息"), async_message],
-        },
-        session_key,
+        {"sessionId": "mini-a", "messages": [_message("m1", 1, "Mini旧消息"), mini_async]},
+        mini_key,
+        source_device_id=g.HOMEAI_MINI_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_MINI_USER,
     )
     assert len(g.REMINDER_PENDING) == 1
-    assert g.REMINDER_PENDING[0].text == "提醒你，喝水"
-    assert g._reminder_spoken_text("喝水") == "喝水"
-    assert g._reminder_spoken_text("  喝水  ") == "喝水"
+    record = g.REMINDER_PENDING[0]
+    assert record.source_device_id == g.HOMEAI_MINI_DEVICE_ID
+    assert record.source_openclaw_user == g.OPENCLAW_MINI_USER
+    assert record.source_session_key == mini_key
     assert g.REMINDER_QUEUE_FILE.exists()
 
-    # The normal synchronous voice reply is present in the same transcript but
-    # must be consumed by the suppression fingerprint instead of spoken twice.
-    voice_reply = "好的，已经设置提醒。"
-    g._register_voice_reply_suppression(voice_reply)
+    # Suppression/fence state is isolated per session. Registering a primary
+    # synchronous reply must not consume the same text when it appears in Mini.
+    shared_text = "好的，已经设置提醒。"
+    g._register_voice_reply_suppression(shared_text, primary_key)
     await g._reconcile_voice_session_history(
         {
-            "sessionId": "session-a",
+            "sessionId": "mini-a",
             "messages": [
-                _message("m1", 1, "旧消息"),
-                async_message,
-                _message("m3", 3, voice_reply),
+                _message("m1", 1, "Mini旧消息"),
+                mini_async,
+                _message("m3", 3, shared_text),
             ],
         },
-        session_key,
+        mini_key,
+        source_device_id=g.HOMEAI_MINI_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_MINI_USER,
     )
-    assert len(g.REMINDER_PENDING) == 1
-    assert g.NOTIFICATION_STATE_FILE.exists()
+    assert len(g.REMINDER_PENDING) == 2
+    assert g.REMINDER_PENDING[-1].source_device_id == g.HOMEAI_MINI_DEVICE_ID
 
-    # One synchronous voice turn can append multiple assistant progress
-    # rows before its final HTTP reply. None of those progress rows may be
-    # replayed later as notifications. A truly earlier or later asynchronous
-    # assistant row must still be delivered.
-    pending_before_turn = _message("m4", 4, "这是语音请求前刚到的一条提醒。")
-    user_turn = _user_message("u5", 5, "用户本轮语音请求")
-    progress_1 = _message("m6", 6, "我先检查一下播放器状态。")
-    progress_2 = _message("m7", 7, "找到了控制菜单，正在点击播放。")
-    final_reply = _message("m8", 8, "音乐已经在放了，需要暂停随时喊我。")
-    later_async = _message("m9", 9, "你设置的定时提醒到了。")
+    # Kitchen async append is a third isolated route owned by the iPad terminal.
+    kitchen_async = _message("k2", 2, "小K提醒：时间到了。")
+    await g._reconcile_voice_session_history(
+        {"sessionId": "kitchen-a", "messages": [_message("k1", 1, "小K旧消息"), kitchen_async]},
+        kitchen_key,
+        source_device_id=g.KITCHEN_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_KITCHEN_USER,
+    )
+    assert g.REMINDER_PENDING[-1].source_device_id == g.KITCHEN_DEVICE_ID
+    assert g.REMINDER_PENDING[-1].source_openclaw_user == g.OPENCLAW_KITCHEN_USER
+    assert g.REMINDER_PENDING[-1].source_session_key == kitchen_key
 
-    final_text = "音乐已经在放了，需要暂停随时喊我。"
-    g._register_voice_reply_suppression(final_text)
-    g._register_voice_turn_fence(final_text)
+    # Primary synchronous progress rows remain fenced and never become reminders.
+    primary_state = g._notification_state(primary_key)
+    primary_state.voice_inflight = 0
+    pending_before = _message("p2", 2, "语音请求前的一条主机提醒。")
+    user_turn = _user_message("pu3", 3, "主机语音请求")
+    progress = _message("p4", 4, "处理中")
+    final = _message("p5", 5, "最终同步回答")
+    later = _message("p6", 6, "主机真正的异步提醒。")
+    g._register_voice_reply_suppression("最终同步回答", primary_key)
+    g._register_voice_turn_fence("最终同步回答", primary_key)
     await g._reconcile_voice_session_history(
         {
-            "sessionId": "session-a",
+            "sessionId": "primary-a",
             "messages": [
-                _message("m1", 1, "旧消息"),
-                async_message,
-                _message("m3", 3, voice_reply),
-                pending_before_turn,
+                _message("p1", 1, "主机旧消息"),
+                pending_before,
                 user_turn,
-                progress_1,
-                progress_2,
-                final_reply,
-                later_async,
+                progress,
+                final,
+                later,
             ],
         },
-        session_key,
+        primary_key,
+        source_device_id=g.HOMEAI_PRIMARY_DEVICE_ID,
+        source_openclaw_user=g.OPENCLAW_USER,
     )
-    assert len(g.REMINDER_PENDING) == 3
-    assert g.REMINDER_PENDING[-2].text == "这是语音请求前刚到的一条提醒。"
-    assert g.REMINDER_PENDING[-1].text == "你设置的定时提醒到了。"
-    assert not g.VOICE_TURN_FENCES
+    assert [x.text for x in g.REMINDER_PENDING[-2:]] == [
+        "语音请求前的一条主机提醒。",
+        "主机真正的异步提醒。",
+    ]
+    assert all(x.text != "处理中" for x in g.REMINDER_PENDING)
+    assert not g._notification_state(primary_key).turn_fences
 
-    # Reconciliation after reconnect must not resurrect the consumed progress
-    # rows from history.
-    await g._reconcile_voice_session_history(
-        {
-            "sessionId": "session-a",
-            "messages": [
-                _message("m1", 1, "旧消息"),
-                async_message,
-                _message("m3", 3, voice_reply),
-                pending_before_turn,
-                user_turn,
-                progress_1,
-                progress_2,
-                final_reply,
-                later_async,
-            ],
-        },
-        session_key,
+    # Persisted cursor file must contain independent Main + Mini + Kitchen entries.
+    saved = json.loads(g.NOTIFICATION_STATE_FILE.read_text(encoding="utf-8"))
+    assert saved["version"] == 2
+    assert primary_key in saved["sessions"]
+    assert mini_key in saved["sessions"]
+    assert kitchen_key in saved["sessions"]
+    assert saved["sessions"][mini_key]["source_device_id"] == g.HOMEAI_MINI_DEVICE_ID
+    assert saved["sessions"][kitchen_key]["source_device_id"] == g.KITCHEN_DEVICE_ID
+
+    # Re-load verifies durable per-session cursor restoration.
+    g.NOTIFICATION_SESSION_STATES.clear()
+    pstate = g.load_notification_listener_state(
+        primary_key,
+        source_device_id=g.HOMEAI_PRIMARY_DEVICE_ID,
+        openclaw_user=g.OPENCLAW_USER,
     )
-    assert len(g.REMINDER_PENDING) == 3
-
-    # If OpenClaw has not committed the final row yet, reconciliation must
-    # wait instead of prematurely queueing progress rows.
-    g._register_voice_reply_suppression("第二轮最终回答")
-    g._register_voice_turn_fence("第二轮最终回答")
-    second_user = _user_message("u10", 10, "第二轮请求")
-    second_progress = _message("m11", 11, "第二轮处理中")
-    await g._reconcile_voice_session_history(
-        {
-            "sessionId": "session-a",
-            "messages": [
-                _message("m1", 1, "旧消息"),
-                async_message,
-                _message("m3", 3, voice_reply),
-                pending_before_turn,
-                user_turn,
-                progress_1,
-                progress_2,
-                final_reply,
-                later_async,
-                second_user,
-                second_progress,
-            ],
-        },
-        session_key,
+    mstate = g.load_notification_listener_state(
+        mini_key,
+        source_device_id=g.HOMEAI_MINI_DEVICE_ID,
+        openclaw_user=g.OPENCLAW_MINI_USER,
     )
-    assert len(g.REMINDER_PENDING) == 3
-    assert g.VOICE_TURN_FENCES
-
-    second_final = _message("m12", 12, "第二轮最终回答")
-    await g._reconcile_voice_session_history(
-        {
-            "sessionId": "session-a",
-            "messages": [
-                _message("m1", 1, "旧消息"),
-                async_message,
-                _message("m3", 3, voice_reply),
-                pending_before_turn,
-                user_turn,
-                progress_1,
-                progress_2,
-                final_reply,
-                later_async,
-                second_user,
-                second_progress,
-                second_final,
-            ],
-        },
-        session_key,
+    kstate = g.load_notification_listener_state(
+        kitchen_key,
+        source_device_id=g.KITCHEN_DEVICE_ID,
+        openclaw_user=g.OPENCLAW_KITCHEN_USER,
     )
-    assert len(g.REMINDER_PENDING) == 3
-    assert not g.VOICE_TURN_FENCES
+    assert pstate.initialized and mstate.initialized and kstate.initialized
+    assert pstate.seen_message_set != mstate.seen_message_set
+    assert kstate.seen_message_set != mstate.seen_message_set
 
-    # Accept both top-level and nested transcript update targets.
+    # Accept nested transcript update targets.
     assert g._listener_event_targets_voice_session(
         {
             "type": "event",
             "event": "session.message",
-            "payload": {"target": {"sessionKey": session_key}},
+            "payload": {"target": {"sessionKey": mini_key}},
         },
-        session_key,
+        mini_key,
     )
 
-    print("HomeAIAgent Notification A1 offline regression: PASS")
+    print("PASS: A5.0.5 three-terminal notification listener + origin routing")
 
 
 if __name__ == "__main__":

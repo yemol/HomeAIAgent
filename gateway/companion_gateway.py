@@ -26,6 +26,7 @@ import gzip
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -58,6 +59,22 @@ from openclaw_transport import OpenClawTransportConfig, OpenClawTransportManager
 from kitchen_menu import KitchenMenuError, ensure_recipe_prep_first, load_kitchen_menu, match_recipe, parse_kitchen_menu, recipe_for
 from core.session import ClientSession
 from context.followup import build_followup_judge_prompt, parse_followup_decision
+from security.device_auth import AuthContext, DeviceAuthManager
+from ambient_sleep import (
+    AMBIENT_SAMPLE_RATE,
+    AmbientIntent,
+    AmbientAssetLoop,
+    ambient_asset_available,
+    ambient_asset_path,
+    format_duration_zh as ambient_format_duration_zh,
+    parse_ambient_intent,
+    sound_catalog_text as ambient_sound_catalog_text,
+    sound_catalog_numbered_text as ambient_sound_catalog_numbered_text,
+    sound_id_for_number as ambient_sound_id_for_number,
+    sound_label as ambient_sound_label,
+    sound_number as ambient_sound_number,
+    SOUNDS as AMBIENT_SOUNDS,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -126,6 +143,17 @@ HOMEAI_DATA_DIR = Path(
 # Runtime diagnostics stay outside the deployable source tree.
 HOMEAI_DEBUG_DIR = HOMEAI_DATA_DIR / "debug"
 
+# A6.0 Security Foundation. Observe mode is intentionally the default during
+# staged rollout: it measures authentication without cutting off legacy firmware.
+HOMEAI_SECURITY_ALLOW_ENFORCE = (
+    os.getenv("HOMEAI_SECURITY_ALLOW_ENFORCE", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEVICE_AUTH = DeviceAuthManager.from_environment(
+    config_dir=PERSISTENT_CONFIG_DIR,
+    data_dir=HOMEAI_DATA_DIR,
+)
+
 # Keep routine logs compact. Verbose transport/UI chatter and Python tracebacks
 # can be re-enabled temporarily from the persistent environment when diagnosing.
 HOMEAI_LOG_VERBOSE = os.getenv("HOMEAI_LOG_VERBOSE", "false").strip().lower() in {"1", "true", "yes", "on"}
@@ -138,6 +166,33 @@ def _vlog(message: str) -> None:
 def _log_traceback() -> None:
     if HOMEAI_LOG_TRACEBACK:
         traceback.print_exc()
+
+
+def _one_line_error(exc: BaseException) -> str:
+    """Compact transient provider errors without multi-line help chatter."""
+    raw = str(exc).strip()
+    message = raw.splitlines()[0] if raw else ""
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+class _BenignWebSocketHandshakeFilter(logging.Filter):
+    """Drop only empty/malformed pre-handshake probes on the shared 8765 port."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "websockets.server":
+            return True
+        if record.getMessage() != "opening handshake failed":
+            return True
+        if not record.exc_info or record.exc_info[1] is None:
+            return True
+        exc = record.exc_info[1]
+        return not (
+            type(exc).__name__ == "InvalidMessage"
+            and "did not receive a valid HTTP request" in str(exc)
+        )
+
+
+logging.getLogger("websockets.server").addFilter(_BenignWebSocketHandshakeFilter())
 
 INFO_SKILL_PROTOCOL = "homeai-info/1.1"
 INFO_MAX_ITEMS = 20
@@ -177,6 +232,37 @@ DISPLAY_STATUS_RECHECK_SEC = 300
 # 10-point step so "大声一点 / 轻一点" is predictable instead of model-dependent.
 SPEAKER_VOLUME_STEP_PERCENT = 10
 SPEAKER_VOLUME_ACK_TIMEOUT_SEC = 2.5
+
+# Gateway-side Sleep Ambient. Dock firmware stays unchanged: ambient audio
+# uses the existing authenticated PCM transport and Jitter Buffer.
+AMBIENT_DEFAULT_DURATION_SEC = max(60, int(
+    os.getenv("HOMEAI_AMBIENT_DEFAULT_DURATION_SEC", "3600")
+))
+AMBIENT_MAX_DURATION_SEC = max(AMBIENT_DEFAULT_DURATION_SEC, int(
+    os.getenv("HOMEAI_AMBIENT_MAX_DURATION_SEC", str(8 * 3600))
+))
+AMBIENT_DEFAULT_VOLUME_PERCENT = max(0, min(100, int(
+    os.getenv("HOMEAI_AMBIENT_DEFAULT_VOLUME_PERCENT", "5")
+)))
+# One-second source segments keep stop/interruption latency low while the C3's
+# 64 KiB stereo Jitter Buffer smooths Wi-Fi jitter.
+AMBIENT_SEGMENT_SEC = max(0.5, min(2.0, float(
+    os.getenv("HOMEAI_AMBIENT_SEGMENT_SEC", "1.0")
+)))
+AMBIENT_FADE_IN_SEC = max(0.0, min(10.0, float(
+    os.getenv("HOMEAI_AMBIENT_FADE_IN_SEC", "2.0")
+)))
+AMBIENT_FADE_OUT_SEC = max(0.0, min(15.0, float(
+    os.getenv("HOMEAI_AMBIENT_FADE_OUT_SEC", "5.0")
+)))
+AMBIENT_FINAL_SILENCE_SEC = 0.04
+# Keep two Dock playback slots filled, matching the proven gapless TTS path.
+# This uses the existing C3 Jitter Buffer; no Dock firmware change is required.
+AMBIENT_PREFILL_SEGMENTS = max(1, min(2, int(
+    os.getenv("HOMEAI_AMBIENT_PREFILL_SEGMENTS", "2")
+)))
+AMBIENT_STREAM_TOTAL_SENTINEL = 2_000_000_000
+AMBIENT_STOP_TIMEOUT_SEC = 8.0
 
 # Audio-output routing. HomeAgent may switch between its own speaker and
 # a bound NetworkSpeaker. HomeAgentMini is intentionally NetworkSpeaker-only.
@@ -239,6 +325,20 @@ GOLD_REFRESH_SEC = max(
     60,
     int(os.getenv("HOMEAI_GOLD_REFRESH_SEC", "300")),
 )
+# Provider failures must not turn a 5-minute status refresh into a request storm.
+# 429 gets a long cool-down; transport failures use bounded exponential backoff.
+GOLD_RATE_LIMIT_BACKOFF_SEC = max(
+    GOLD_REFRESH_SEC,
+    int(os.getenv("HOMEAI_GOLD_RATE_LIMIT_BACKOFF_SEC", "1800")),
+)
+GOLD_FAILURE_BACKOFF_BASE_SEC = max(
+    GOLD_REFRESH_SEC,
+    int(os.getenv("HOMEAI_GOLD_FAILURE_BACKOFF_BASE_SEC", "600")),
+)
+GOLD_FAILURE_BACKOFF_MAX_SEC = max(
+    GOLD_FAILURE_BACKOFF_BASE_SEC,
+    int(os.getenv("HOMEAI_GOLD_FAILURE_BACKOFF_MAX_SEC", "1800")),
+)
 GOLD_QUOTE_CACHE_FILE = HOMEAI_DATA_DIR / "gold_quote_cache.json"
 GOLD_CNY_PER_GRAM: float | None = None
 GOLD_QUOTE_UPDATED_AT = ""
@@ -267,12 +367,59 @@ class ReminderRecord:
     scheduled_at: str = ""
     fired_at: str = ""
     received_at: str = ""
+    # A5.0.2: preserve the companion that created this asynchronous reminder.
+    # Delivery must return to that companion so its normal audio router selects
+    # the matching NetworkSpeaker/Dock Speaker instead of the primary device.
+    source_device_id: str = ""
+    source_openclaw_user: str = ""
+    source_session_key: str = ""
     attempts: int = 0
     next_attempt_at: float = 0.0
     last_error: str = ""
 
 
+@dataclass
+class NotificationSessionState:
+    session_key: str
+    source_device_id: str = ""
+    openclaw_user: str = ""
+    seen_message_keys: list[str] = field(default_factory=list)
+    seen_message_set: set[str] = field(default_factory=set)
+    initialized: bool = False
+    session_id: str = ""
+    voice_inflight: int = 0
+    reply_suppressions: list[dict[str, Any]] = field(default_factory=list)
+    turn_fences: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AmbientSnapshot:
+    sound_id: str
+    remaining_sec: int
+    ambient_volume: int
+    deadline_monotonic: float = 0.0
+
+
+@dataclass
+class AmbientPlayback:
+    source_device_id: str
+    speaker_device_id: str
+    parent_device_id: str
+    sound_id: str
+    ambient_volume: int
+    normal_volume: int
+    end_monotonic: float
+    started_monotonic: float
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    task: Any = None
+    stop_reason: str = ""
+
+
 ACTIVE_SESSIONS: list["ClientSession"] = []
+# One ambient player per companion.  The Mini normally owns one entry bound to
+# speaker-mini-dock-01, but the implementation remains source-device generic.
+AMBIENT_PLAYBACKS: dict[str, AmbientPlayback] = {}
 REMINDER_PENDING: list[ReminderRecord] = []
 REMINDER_DELIVERED: list[dict[str, str]] = []
 REMINDER_DELIVERED_KEYS: set[str] = set()
@@ -341,11 +488,12 @@ KITCHEN_PRIVATE_RECIPE_DIR = Path(
 ).expanduser()
 
 
-# HomeAIAgent Notification A1. OpenClaw background reminders already land in
-# the same stable voice session used by /v1/chat/completions. Instead of opening
-# a reverse webhook port, the Mac mini keeps one outbound Gateway WebSocket over
-# the existing 127.0.0.1:18790 SSH/Tailscale tunnel and subscribes to that exact
-# session. The authoritative transcript is reconciled through chat.history.
+# HomeAIAgent Notification A1/A5.0.2. OpenClaw background reminders land in
+# each companion's stable voice session used by /v1/chat/completions. The Mac
+# mini keeps one outbound Gateway WebSocket over the existing tunnel and
+# subscribes to all configured companion sessions. Each transcript has its own
+# cursor/fence state, while ReminderRecord remembers the originating device so
+# asynchronous delivery returns to the correct speaker route.
 NOTIFICATION_LISTENER_ENABLED = (
     os.getenv("HOMEAI_NOTIFICATION_LISTENER_ENABLED", "true").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -360,6 +508,16 @@ NOTIFICATION_RECONNECT_MIN_SEC = max(
 NOTIFICATION_RECONNECT_MAX_SEC = max(
     NOTIFICATION_RECONNECT_MIN_SEC,
     float(os.getenv("HOMEAI_NOTIFICATION_RECONNECT_MAX_SEC", "30")),
+)
+# OpenClaw can spend well over a minute inside one tool-heavy turn. A 20/20s
+# WebSocket keepalive falsely declared the notification channel dead during those
+# turns. Keep detection, but make it tolerant of long inference/tool execution.
+NOTIFICATION_PING_INTERVAL_SEC = max(
+    30.0, float(os.getenv("HOMEAI_NOTIFICATION_PING_INTERVAL_SEC", "60"))
+)
+NOTIFICATION_PING_TIMEOUT_SEC = max(
+    NOTIFICATION_PING_INTERVAL_SEC,
+    float(os.getenv("HOMEAI_NOTIFICATION_PING_TIMEOUT_SEC", "180")),
 )
 NOTIFICATION_SEEN_HISTORY = max(
     100, int(os.getenv("HOMEAI_NOTIFICATION_SEEN_HISTORY", "500"))
@@ -539,79 +697,126 @@ def _is_user_visible_async_assistant_message(message: Any) -> bool:
     return True
 
 
-NOTIFICATION_SEEN_KEYS: list[str] = []
-NOTIFICATION_SEEN_SET: set[str] = set()
-NOTIFICATION_CURSOR_INITIALIZED = False
-NOTIFICATION_CURSOR_SESSION_KEY = ""
-NOTIFICATION_CURSOR_SESSION_ID = ""
-VOICE_OPENCLAW_INFLIGHT = 0
-VOICE_REPLY_SUPPRESSIONS: list[dict[str, Any]] = []
-# Voice Turn Fence. OpenClaw may append multiple assistant progress rows
-# to the same voice session while one synchronous /v1/chat/completions request
-# is running. The HTTP response is the authoritative spoken answer. Keep a
-# fence for each completed synchronous turn so transcript reconciliation marks
-# every unseen assistant row up to and including that exact final reply as
-# consumed instead of replaying progress rows later as notifications.
-VOICE_TURN_FENCES: list[dict[str, Any]] = []
+NOTIFICATION_SESSION_STATES: dict[str, NotificationSessionState] = {}
+# Voice Turn Fence. OpenClaw may append multiple assistant progress rows to a
+# stable session while one synchronous /v1/chat/completions request is running.
+# State is isolated per session so a Main turn can never suppress a Mini reminder
+# (and vice versa).
 VOICE_TURN_FENCE_TTL_SEC = 600.0
 VOICE_TURN_FENCE_MAX = 12
 
 
-def _remember_notification_seen(key: str) -> None:
-    if not key or key in NOTIFICATION_SEEN_SET:
+def _notification_state(
+    session_key: str,
+    *,
+    source_device_id: str = "",
+    openclaw_user: str = "",
+) -> NotificationSessionState:
+    key = str(session_key or "").strip()
+    if not key:
+        raise ValueError("notification session key is empty")
+    state = NOTIFICATION_SESSION_STATES.get(key)
+    if state is None:
+        state = NotificationSessionState(
+            session_key=key,
+            source_device_id=str(source_device_id or "").strip(),
+            openclaw_user=str(openclaw_user or "").strip(),
+        )
+        NOTIFICATION_SESSION_STATES[key] = state
+    else:
+        if source_device_id:
+            state.source_device_id = str(source_device_id).strip()
+        if openclaw_user:
+            state.openclaw_user = str(openclaw_user).strip()
+    return state
+
+
+def _remember_notification_seen(state: NotificationSessionState, key: str) -> None:
+    if not key or key in state.seen_message_set:
         return
-    NOTIFICATION_SEEN_KEYS.append(key)
-    NOTIFICATION_SEEN_SET.add(key)
-    while len(NOTIFICATION_SEEN_KEYS) > NOTIFICATION_SEEN_HISTORY:
-        old = NOTIFICATION_SEEN_KEYS.pop(0)
-        NOTIFICATION_SEEN_SET.discard(old)
+    state.seen_message_keys.append(key)
+    state.seen_message_set.add(key)
+    while len(state.seen_message_keys) > NOTIFICATION_SEEN_HISTORY:
+        old = state.seen_message_keys.pop(0)
+        state.seen_message_set.discard(old)
 
 
-def load_notification_listener_state(session_key: str) -> None:
-    global NOTIFICATION_CURSOR_INITIALIZED
-    global NOTIFICATION_CURSOR_SESSION_KEY
-    global NOTIFICATION_CURSOR_SESSION_ID
-
-    NOTIFICATION_SEEN_KEYS.clear()
-    NOTIFICATION_SEEN_SET.clear()
-    NOTIFICATION_CURSOR_INITIALIZED = False
-    NOTIFICATION_CURSOR_SESSION_KEY = session_key
-    NOTIFICATION_CURSOR_SESSION_ID = ""
+def load_notification_listener_state(
+    session_key: str,
+    *,
+    source_device_id: str = "",
+    openclaw_user: str = "",
+) -> NotificationSessionState:
+    state = _notification_state(
+        session_key,
+        source_device_id=source_device_id,
+        openclaw_user=openclaw_user,
+    )
+    state.seen_message_keys.clear()
+    state.seen_message_set.clear()
+    state.initialized = False
+    state.session_id = ""
+    state.voice_inflight = 0
+    state.reply_suppressions.clear()
+    state.turn_fences.clear()
 
     if not NOTIFICATION_STATE_FILE.exists():
-        return
+        return state
     try:
         body = json.loads(NOTIFICATION_STATE_FILE.read_text(encoding="utf-8"))
-        if str(body.get("session_key") or "") != session_key:
-            print("[NOTIFY] listener state belongs to another session; new baseline required")
-            return
-        for raw in body.get("seen_message_keys") or []:
-            key = str(raw or "").strip()
+        raw: dict[str, Any] | None = None
+        sessions = body.get("sessions") if isinstance(body, dict) else None
+        if isinstance(sessions, dict):
+            candidate = sessions.get(session_key)
+            if isinstance(candidate, dict):
+                raw = candidate
+        # Backward-compatible migration from Notification A1's single-session
+        # state file. Only the matching legacy primary session is imported.
+        elif isinstance(body, dict) and str(body.get("session_key") or "") == session_key:
+            raw = body
+
+        if raw is None:
+            print(f"[NOTIFY] no saved cursor for session={session_key}; new baseline required")
+            return state
+
+        for value in raw.get("seen_message_keys") or []:
+            key = str(value or "").strip()
             if key:
-                _remember_notification_seen(key)
-        NOTIFICATION_CURSOR_INITIALIZED = bool(body.get("initialized", False))
-        NOTIFICATION_CURSOR_SESSION_ID = str(body.get("session_id") or "")
+                _remember_notification_seen(state, key)
+        state.initialized = bool(raw.get("initialized", False))
+        state.session_id = str(raw.get("session_id") or "")
+        if raw.get("source_device_id") and not state.source_device_id:
+            state.source_device_id = str(raw.get("source_device_id") or "")
+        if raw.get("openclaw_user") and not state.openclaw_user:
+            state.openclaw_user = str(raw.get("openclaw_user") or "")
         print(
-            f"[NOTIFY] listener state loaded initialized={NOTIFICATION_CURSOR_INITIALIZED} "
-            f"seen={len(NOTIFICATION_SEEN_KEYS)}"
+            f"[NOTIFY] listener state loaded session={session_key} "
+            f"initialized={state.initialized} seen={len(state.seen_message_keys)}"
         )
     except Exception as exc:
         print(
-            f"[NOTIFY-WARN] listener state read failed; new baseline required: "
-            f"{type(exc).__name__}: {exc}"
+            f"[NOTIFY-WARN] listener state read failed session={session_key}; "
+            f"new baseline required: {type(exc).__name__}: {exc}"
         )
+    return state
 
 
-def save_notification_listener_state() -> bool:
+def save_notification_listener_state(session_key: str | None = None) -> bool:
     try:
         HOMEAI_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        sessions: dict[str, Any] = {}
+        for key, state in sorted(NOTIFICATION_SESSION_STATES.items()):
+            sessions[key] = {
+                "source_device_id": state.source_device_id,
+                "openclaw_user": state.openclaw_user,
+                "session_id": state.session_id,
+                "initialized": state.initialized,
+                "seen_message_keys": state.seen_message_keys[-NOTIFICATION_SEEN_HISTORY:],
+            }
         body = {
-            "version": 1,
+            "version": 2,
             "saved_at": _iso_now(),
-            "session_key": NOTIFICATION_CURSOR_SESSION_KEY,
-            "session_id": NOTIFICATION_CURSOR_SESSION_ID,
-            "initialized": NOTIFICATION_CURSOR_INITIALIZED,
-            "seen_message_keys": NOTIFICATION_SEEN_KEYS[-NOTIFICATION_SEEN_HISTORY:],
+            "sessions": sessions,
         }
         tmp = NOTIFICATION_STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -623,23 +828,33 @@ def save_notification_listener_state() -> bool:
         return False
 
 
-def _register_voice_reply_suppression(text: str) -> None:
+def _register_voice_reply_suppression(
+    text: str,
+    session_key: str | None = None,
+) -> None:
+    key = str(session_key or _openclaw_voice_session_key()).strip()
+    state = _notification_state(key)
     normalized = _normalize_notification_compare_text(text)
     if not normalized:
         return
     now = time.time()
-    VOICE_REPLY_SUPPRESSIONS[:] = [
-        item for item in VOICE_REPLY_SUPPRESSIONS
+    state.reply_suppressions[:] = [
+        item for item in state.reply_suppressions
         if float(item.get("expires_at") or 0.0) > now
     ]
-    VOICE_REPLY_SUPPRESSIONS.append({
+    state.reply_suppressions.append({
         "digest": _notification_text_digest(normalized),
         "expires_at": now + 600.0,
     })
-    del VOICE_REPLY_SUPPRESSIONS[:-24]
+    del state.reply_suppressions[:-24]
 
 
-def _consume_voice_reply_suppression(text: str) -> bool:
+def _consume_voice_reply_suppression(
+    text: str,
+    session_key: str | None = None,
+) -> bool:
+    key = str(session_key or _openclaw_voice_session_key()).strip()
+    state = _notification_state(key)
     normalized = _normalize_notification_compare_text(text)
     if not normalized:
         return False
@@ -647,60 +862,59 @@ def _consume_voice_reply_suppression(text: str) -> bool:
     now = time.time()
     kept: list[dict[str, Any]] = []
     consumed = False
-    for item in VOICE_REPLY_SUPPRESSIONS:
+    for item in state.reply_suppressions:
         if float(item.get("expires_at") or 0.0) <= now:
             continue
         if not consumed and str(item.get("digest") or "") == digest:
             consumed = True
             continue
         kept.append(item)
-    VOICE_REPLY_SUPPRESSIONS[:] = kept
+    state.reply_suppressions[:] = kept
     return consumed
 
 
-def _prune_voice_turn_fences() -> None:
+def _prune_voice_turn_fences(session_key: str | None = None) -> NotificationSessionState:
+    key = str(session_key or _openclaw_voice_session_key()).strip()
+    state = _notification_state(key)
     now = time.time()
-    VOICE_TURN_FENCES[:] = [
-        item for item in VOICE_TURN_FENCES
+    state.turn_fences[:] = [
+        item for item in state.turn_fences
         if float(item.get("expires_at") or 0.0) > now
     ][-VOICE_TURN_FENCE_MAX:]
+    return state
 
 
-def _register_voice_turn_fence(final_text: str) -> None:
+def _register_voice_turn_fence(
+    final_text: str,
+    session_key: str | None = None,
+) -> None:
+    key = str(session_key or _openclaw_voice_session_key()).strip()
     normalized = _normalize_notification_compare_text(final_text)
     if not normalized:
         return
-    _prune_voice_turn_fences()
-    VOICE_TURN_FENCES.append({
+    state = _prune_voice_turn_fences(key)
+    state.turn_fences.append({
         "final_digest": _notification_text_digest(normalized),
         "expires_at": time.time() + VOICE_TURN_FENCE_TTL_SEC,
     })
-    del VOICE_TURN_FENCES[:-VOICE_TURN_FENCE_MAX]
-    print("[VOICE-FENCE] armed for synchronous turn completion")
+    del state.turn_fences[:-VOICE_TURN_FENCE_MAX]
+    print(f"[VOICE-FENCE] armed session={key} for synchronous turn completion")
 
 
-def _resolve_voice_turn_fences(messages: list[Any]) -> set[str] | None:
-    """Resolve completed synchronous voice turns against chat.history.
-
-    Returns a set of assistant message identities which belong to synchronous
-    voice-turn progress/final output and therefore must be marked seen without
-    entering the async notification queue. If the active fence's exact final
-    reply is not present in history yet, return None to hold reconciliation
-    until OpenClaw has committed the complete turn.
-
-    The boundary is transcript-native: find the exact final assistant reply,
-    then walk backward to the nearest user row. Only assistant rows between
-    that user row and the final reply are suppressed. This preserves genuinely
-    asynchronous assistant messages which arrived before the voice turn.
-    """
-    _prune_voice_turn_fences()
-    if not VOICE_TURN_FENCES:
+def _resolve_voice_turn_fences(
+    messages: list[Any],
+    session_key: str | None = None,
+) -> set[str] | None:
+    """Resolve synchronous voice-turn rows inside exactly one OpenClaw session."""
+    key = str(session_key or _openclaw_voice_session_key()).strip()
+    state = _prune_voice_turn_fences(key)
+    if not state.turn_fences:
         return set()
 
     suppressed: set[str] = set()
     resolved_count = 0
 
-    for fence in list(VOICE_TURN_FENCES):
+    for fence in list(state.turn_fences):
         final_digest = str(fence.get("final_digest") or "")
         if not final_digest:
             resolved_count += 1
@@ -719,9 +933,6 @@ def _resolve_voice_turn_fences(messages: list[Any]) -> set[str] | None:
                 break
 
         if final_idx < 0:
-            # The HTTP response can return a fraction before the session
-            # transcript has committed its final row. Do not queue any new
-            # assistant rows in this tiny window; retry on the next event/poll.
             return None
 
         user_idx = -1
@@ -732,11 +943,11 @@ def _resolve_voice_turn_fences(messages: list[Any]) -> set[str] | None:
                 break
 
         if user_idx < 0:
-            # A very small chat.history window could omit the preceding user
-            # row. Fall back to the beginning of the returned window rather
-            # than replaying known voice-turn progress as reminders.
             user_idx = -1
-            print("[VOICE-FENCE-WARN] preceding user row missing; using history-window boundary")
+            print(
+                f"[VOICE-FENCE] preceding user row missing session={key}; "
+                "using safe history-window boundary"
+            )
 
         rows = 0
         final_text = ""
@@ -748,26 +959,32 @@ def _resolve_voice_turn_fences(messages: list[Any]) -> set[str] | None:
                 continue
             if not _is_user_visible_async_assistant_message(row):
                 continue
-            key = _history_message_identity(row)
-            if key:
-                suppressed.add(key)
+            identity = _history_message_identity(row)
+            if identity:
+                suppressed.add(identity)
                 rows += 1
             if idx == final_idx:
                 final_text = _history_message_text(row)
 
         if final_text:
-            _consume_voice_reply_suppression(final_text)
+            _consume_voice_reply_suppression(final_text, key)
         resolved_count += 1
-        print(f"[VOICE-FENCE] closed at synchronous reply; suppressed_rows={rows}")
+        print(
+            f"[VOICE-FENCE] closed session={key} at synchronous reply; "
+            f"suppressed_rows={rows}"
+        )
 
     if resolved_count:
-        del VOICE_TURN_FENCES[:resolved_count]
+        del state.turn_fences[:resolved_count]
     return suppressed
 
 
 def _notification_record_from_history_message(
     session_key: str,
     message: dict[str, Any],
+    *,
+    source_device_id: str = "",
+    source_openclaw_user: str = "",
 ) -> ReminderRecord | None:
     text = _normalize_reminder_text(_history_message_text(message))
     if not text:
@@ -784,6 +1001,9 @@ def _notification_record_from_history_message(
         title="提醒",
         fired_at=_iso_now(),
         received_at=_iso_now(),
+        source_device_id=str(source_device_id or "").strip(),
+        source_openclaw_user=str(source_openclaw_user or "").strip(),
+        source_session_key=str(session_key or "").strip(),
     )
 
 
@@ -811,6 +1031,9 @@ def load_reminder_queue() -> None:
                     scheduled_at=str(raw.get("scheduled_at") or ""),
                     fired_at=str(raw.get("fired_at") or ""),
                     received_at=str(raw.get("received_at") or ""),
+                    source_device_id=str(raw.get("source_device_id") or ""),
+                    source_openclaw_user=str(raw.get("source_openclaw_user") or ""),
+                    source_session_key=str(raw.get("source_session_key") or ""),
                     attempts=max(0, int(raw.get("attempts") or 0)),
                     next_attempt_at=max(0.0, float(raw.get("next_attempt_at") or 0.0)),
                     last_error=str(raw.get("last_error") or ""),
@@ -830,6 +1053,7 @@ def load_reminder_queue() -> None:
                 "dedup_key": key,
                 "reminder_id": str(raw.get("reminder_id") or ""),
                 "delivered_at": str(raw.get("delivered_at") or ""),
+                "source_device_id": str(raw.get("source_device_id") or ""),
             }
             REMINDER_DELIVERED.append(item)
             REMINDER_DELIVERED_KEYS.add(key)
@@ -871,6 +1095,14 @@ OPENCLAW_BASE_URL = os.getenv("OPENCLAW_BASE_URL", "http://127.0.0.1:18790").rst
 OPENCLAW_TOKEN = os.getenv("OPENCLAW_TOKEN", "")
 OPENCLAW_MODEL = os.getenv("OPENCLAW_MODEL", "openclaw/default")
 OPENCLAW_USER = os.getenv("OPENCLAW_USER", "home-ai-agent:main")
+OPENCLAW_KITCHEN_USER = (
+    os.getenv("HOMEAI_KITCHEN_OPENCLAW_USER", "home-ai-kitchen:main").strip()
+    or "home-ai-kitchen:main"
+)
+OPENCLAW_KITCHEN_TOOL_USER = (
+    os.getenv("HOMEAI_KITCHEN_TOOL_OPENCLAW_USER", "home-ai-kitchen-tool:main").strip()
+    or "home-ai-kitchen-tool:main"
+)
 OPENCLAW_VOICE_AGENT_ID = os.getenv("OPENCLAW_VOICE_AGENT_ID", "main").strip() or "main"
 OPENCLAW_CHAT_TIMEOUT_SEC = max(30.0, float(os.getenv("OPENCLAW_CHAT_TIMEOUT_SEC", "180")))
 OPENCLAW_KITCHEN_TIMEOUT_SEC = max(30.0, float(os.getenv("OPENCLAW_KITCHEN_TIMEOUT_SEC", "180")))
@@ -938,6 +1170,18 @@ def _load_device_openclaw_users() -> dict[str, str]:
     if not HOMEAI_DEVICE_OPENCLAW_USERS_JSON:
         return mapping
 
+    reserved_devices = {
+        HOMEAI_PRIMARY_DEVICE_ID,
+        HOMEAI_MINI_DEVICE_ID,
+        KITCHEN_DEVICE_ID,
+    }
+    reserved_users = {
+        OPENCLAW_USER,
+        OPENCLAW_MINI_USER,
+        OPENCLAW_KITCHEN_USER,
+        OPENCLAW_KITCHEN_TOOL_USER,
+    }
+
     try:
         raw = json.loads(HOMEAI_DEVICE_OPENCLAW_USERS_JSON)
         if not isinstance(raw, dict):
@@ -945,14 +1189,28 @@ def _load_device_openclaw_users() -> dict[str, str]:
         for device_id, user in raw.items():
             did = str(device_id or "").strip()
             target = str(user or "").strip()
-            if did and target:
-                mapping[did] = target
+            if not did or not target:
+                continue
+            if did in reserved_devices:
+                print(
+                    f"[CONFIG-WARN] reserved terminal mapping ignored "
+                    f"device={did} user={target}"
+                )
+                continue
+            if target in reserved_users or target in mapping.values():
+                print(
+                    f"[CONFIG-WARN] shared OpenClaw user rejected "
+                    f"device={did} user={target}"
+                )
+                continue
+            mapping[did] = target
     except Exception as exc:
         print(
             "[CONFIG-WARN] HOMEAI_DEVICE_OPENCLAW_USERS_JSON ignored: "
             f"{type(exc).__name__}: {exc}"
         )
     return mapping
+
 
 
 DEVICE_OPENCLAW_USERS = _load_device_openclaw_users()
@@ -1087,6 +1345,47 @@ def _openclaw_voice_session_key(openclaw_user: str | None = None) -> str:
     return f"agent:{OPENCLAW_VOICE_AGENT_ID}:openai-user:{user}"
 
 
+def _notification_listener_targets() -> list[tuple[str, str, str]]:
+    """Return configured companion sessions that own asynchronous reminders.
+
+    One OpenClaw user/session may map to only one target device here. The built-in
+    Main + Mini mappings are always first; additional explicit device mappings are
+    accepted when they use a distinct OpenClaw user. Auto-isolated unknown devices
+    are intentionally not subscribed until explicitly configured.
+    """
+    ordered: list[tuple[str, str, str]] = []
+    seen_sessions: set[str] = set()
+    preferred = [
+        (HOMEAI_PRIMARY_DEVICE_ID, OPENCLAW_USER),
+        (HOMEAI_MINI_DEVICE_ID, OPENCLAW_MINI_USER),
+        (KITCHEN_DEVICE_ID, OPENCLAW_KITCHEN_USER),
+    ]
+    extras = [
+        (device_id, user)
+        for device_id, user in DEVICE_OPENCLAW_USERS.items()
+        if (device_id, user) not in preferred
+    ]
+    for device_id, user in preferred + extras:
+        did = str(device_id or "").strip()
+        openclaw_user = str(user or "").strip()
+        if not did or not openclaw_user:
+            continue
+        session_key = _openclaw_voice_session_key(openclaw_user)
+        if session_key in seen_sessions:
+            continue
+        seen_sessions.add(session_key)
+        ordered.append((session_key, did, openclaw_user))
+    return ordered
+
+
+def _notification_target_for_user(openclaw_user: str) -> tuple[str, str, str] | None:
+    user = str(openclaw_user or "").strip()
+    for target in _notification_listener_targets():
+        if target[2] == user:
+            return target
+    return None
+
+
 # Info Skill session lifecycle. Each background request gets one exact,
 # unique OpenClaw session key so it never shares history with another refresh.
 # Cleanup is performed through the OpenClaw Gateway WebSocket RPC itself, not
@@ -1107,6 +1406,9 @@ MIC_RATE = 16000
 MIC_SAMPLE_WIDTH = 2
 TTS_CHUNK_BYTES = 8192
 MAX_INPUT_BYTES = MIC_RATE * MIC_SAMPLE_WIDTH * 20  # 20 s hard server guard
+MAX_WAKE_PROBE_BYTES = MIC_RATE * MIC_SAMPLE_WIDTH * 5  # wake phrase only
+MIN_WAKE_PROBE_BYTES = int(MIC_RATE * MIC_SAMPLE_WIDTH * 0.25)
+MINI_WAKE_PHRASE = "逐光同学"
 
 # StickS3 firmware currently rejects a single TTS payload above 1.5 MiB.
 # Keep each playback segment comfortably below that hard limit.
@@ -1731,8 +2033,8 @@ async def _openclaw_listener_connect(*, timeout: float = 15.0) -> Any:
         open_timeout=min(timeout, 8.0),
         close_timeout=3,
         max_size=2 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=20,
+        ping_interval=NOTIFICATION_PING_INTERVAL_SEC,
+        ping_timeout=NOTIFICATION_PING_TIMEOUT_SEC,
     )
     try:
         challenge_deadline = asyncio.get_running_loop().time() + min(timeout, 8.0)
@@ -1820,9 +2122,9 @@ async def _listener_rpc(
     method: str,
     params: dict[str, Any],
     *,
-    session_key: str,
+    session_keys: tuple[str, ...],
     timeout: float = 15.0,
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], set[str]]:
     request_id = uuid.uuid4().hex
     await ws.send(json.dumps({
         "type": "req",
@@ -1831,7 +2133,7 @@ async def _listener_rpc(
         "params": params,
     }, ensure_ascii=False))
 
-    dirty = False
+    dirty: set[str] = set()
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -1841,8 +2143,9 @@ async def _listener_rpc(
         frame = json.loads(raw)
         if not isinstance(frame, dict):
             continue
-        if _listener_event_targets_voice_session(frame, session_key):
-            dirty = True
+        for session_key in session_keys:
+            if _listener_event_targets_voice_session(frame, session_key):
+                dirty.add(session_key)
         if frame.get("type") == "res" and str(frame.get("id") or "") == request_id:
             if not bool(frame.get("ok")):
                 raise RuntimeError(
@@ -1855,8 +2158,16 @@ async def _listener_rpc(
 async def _enqueue_async_notification(
     session_key: str,
     message: dict[str, Any],
+    *,
+    source_device_id: str = "",
+    source_openclaw_user: str = "",
 ) -> bool:
-    record = _notification_record_from_history_message(session_key, message)
+    record = _notification_record_from_history_message(
+        session_key,
+        message,
+        source_device_id=source_device_id,
+        source_openclaw_user=source_openclaw_user,
+    )
     if record is None:
         return True
 
@@ -1879,7 +2190,8 @@ async def _enqueue_async_notification(
 
     print(
         f"[NOTIFY] async assistant queued id={record.reminder_id} "
-        f"text={record.text!r}"
+        f"source={record.source_device_id or 'legacy-primary'} "
+        f"session={session_key} text={record.text!r}"
     )
     return True
 
@@ -1887,44 +2199,50 @@ async def _enqueue_async_notification(
 async def _reconcile_voice_session_history(
     history: dict[str, Any],
     session_key: str,
+    *,
+    source_device_id: str = "",
+    source_openclaw_user: str = "",
 ) -> None:
-    global NOTIFICATION_CURSOR_INITIALIZED
-    global NOTIFICATION_CURSOR_SESSION_KEY
-    global NOTIFICATION_CURSOR_SESSION_ID
-
+    state = _notification_state(
+        session_key,
+        source_device_id=source_device_id,
+        openclaw_user=source_openclaw_user,
+    )
     messages = history.get("messages")
     if not isinstance(messages, list):
         messages = []
     session_id = str(history.get("sessionId") or history.get("session_id") or "")
-    NOTIFICATION_CURSOR_SESSION_KEY = session_key
     if session_id:
-        NOTIFICATION_CURSOR_SESSION_ID = session_id
+        state.session_id = session_id
 
     assistant_rows = [
         item for item in messages
         if _is_user_visible_async_assistant_message(item)
     ]
 
-    if not NOTIFICATION_CURSOR_INITIALIZED:
+    if not state.initialized:
         for message in assistant_rows:
-            _remember_notification_seen(_history_message_identity(message))
-        NOTIFICATION_CURSOR_INITIALIZED = True
-        save_notification_listener_state()
+            _remember_notification_seen(state, _history_message_identity(message))
+        state.initialized = True
+        save_notification_listener_state(session_key)
         print(
             f"[NOTIFY] baseline established session={session_key} "
-            f"assistant_rows={len(assistant_rows)}; old history will not be spoken"
+            f"device={state.source_device_id or '-'} assistant_rows={len(assistant_rows)}; "
+            "old history will not be spoken"
         )
         return
 
-    # Never classify the synchronous HTTP response as an async notification.
-    # The event can arrive before /v1/chat/completions returns, so wait until the
-    # current voice request has registered its exact response suppression hash.
-    if VOICE_OPENCLAW_INFLIGHT > 0:
+    # Never classify a synchronous HTTP response as an async notification. Each
+    # OpenClaw voice session has an independent in-flight gate and fence state.
+    if state.voice_inflight > 0:
         return
 
-    fenced_keys = _resolve_voice_turn_fences(messages)
+    fenced_keys = _resolve_voice_turn_fences(messages, session_key)
     if fenced_keys is None:
-        print("[VOICE-FENCE] waiting for synchronous reply commit; reconciliation deferred")
+        print(
+            f"[VOICE-FENCE] waiting for synchronous reply commit "
+            f"session={session_key}; reconciliation deferred"
+        )
         return
 
     changed = False
@@ -1932,31 +2250,39 @@ async def _reconcile_voice_session_history(
         if not isinstance(raw, dict):
             continue
         key = _history_message_identity(raw)
-        if not key or key in NOTIFICATION_SEEN_SET:
+        if not key or key in state.seen_message_set:
             continue
         text = _history_message_text(raw)
 
         if key in fenced_keys:
-            _remember_notification_seen(key)
+            _remember_notification_seen(state, key)
             changed = True
-            print("[VOICE-FENCE] synchronous progress/final row consumed")
+            print(f"[VOICE-FENCE] synchronous progress/final row consumed session={session_key}")
             continue
 
-        if _consume_voice_reply_suppression(text):
-            _remember_notification_seen(key)
+        if _consume_voice_reply_suppression(text, session_key):
+            _remember_notification_seen(state, key)
             changed = True
-            print("[NOTIFY] synchronous voice reply observed and suppressed")
+            print(f"[NOTIFY] synchronous voice reply observed and suppressed session={session_key}")
             continue
 
-        queued = await _enqueue_async_notification(session_key, raw)
+        queued = await _enqueue_async_notification(
+            session_key,
+            raw,
+            source_device_id=state.source_device_id,
+            source_openclaw_user=state.openclaw_user,
+        )
         if not queued:
-            print("[NOTIFY-WARN] queue persistence failed; transcript cursor not advanced")
+            print(
+                f"[NOTIFY-WARN] queue persistence failed session={session_key}; "
+                "transcript cursor not advanced"
+            )
             break
-        _remember_notification_seen(key)
+        _remember_notification_seen(state, key)
         changed = True
 
     if changed:
-        save_notification_listener_state()
+        save_notification_listener_state(session_key)
 
 
 async def openclaw_voice_session_listener_loop() -> None:
@@ -1964,8 +2290,18 @@ async def openclaw_voice_session_listener_loop() -> None:
         print("[NOTIFY] OpenClaw session listener disabled")
         return
 
-    session_key = _openclaw_voice_session_key()
-    load_notification_listener_state(session_key)
+    targets = _notification_listener_targets()
+    if not targets:
+        print("[NOTIFY-WARN] no configured companion notification sessions")
+        return
+    session_keys = tuple(target[0] for target in targets)
+    target_by_key = {target[0]: target for target in targets}
+    for session_key, device_id, openclaw_user in targets:
+        load_notification_listener_state(
+            session_key,
+            source_device_id=device_id,
+            openclaw_user=openclaw_user,
+        )
     reconnect_delay = NOTIFICATION_RECONNECT_MIN_SEC
 
     while True:
@@ -1976,75 +2312,99 @@ async def openclaw_voice_session_listener_loop() -> None:
             ws = await _openclaw_listener_connect()
             print(
                 f"[NOTIFY] OpenClaw listener connected ws={_openclaw_gateway_ws_url()} "
-                f"session={session_key}"
+                f"sessions={len(targets)}"
             )
 
-            _, dirty = await _listener_rpc(
-                ws,
-                "sessions.messages.subscribe",
-                {"key": session_key, "agentId": OPENCLAW_VOICE_AGENT_ID},
-                session_key=session_key,
-            )
-            print(f"[NOTIFY] subscribed session={session_key}")
+            dirty: set[str] = set()
+            for session_key, device_id, _openclaw_user in targets:
+                _, saw = await _listener_rpc(
+                    ws,
+                    "sessions.messages.subscribe",
+                    {"key": session_key, "agentId": OPENCLAW_VOICE_AGENT_ID},
+                    session_keys=session_keys,
+                )
+                dirty.update(saw)
+                print(f"[NOTIFY] subscribed session={session_key} device={device_id}")
 
-            # A one-time session-index subscription gives us a second invalidation
-            # signal across reset/compaction without polling.
             try:
-                _, saw_change = await _listener_rpc(
+                _, saw = await _listener_rpc(
                     ws,
                     "sessions.subscribe",
                     {},
-                    session_key=session_key,
+                    session_keys=session_keys,
                 )
-                dirty = dirty or saw_change
+                dirty.update(saw)
             except Exception as exc:
                 print(
                     f"[NOTIFY-WARN] sessions.subscribe unavailable; "
-                    f"message subscription remains active: {type(exc).__name__}: {exc}"
+                    f"message subscriptions remain active: {type(exc).__name__}: {exc}"
                 )
 
-            history, saw_event = await _listener_rpc(
-                ws,
-                "chat.history",
-                {
-                    "sessionKey": session_key,
-                    "agentId": OPENCLAW_VOICE_AGENT_ID,
-                    "limit": NOTIFICATION_HISTORY_LIMIT,
-                    "maxChars": 12000,
-                },
-                session_key=session_key,
-            )
-            dirty = dirty or saw_event
-            await _reconcile_voice_session_history(history, session_key)
+            for session_key, device_id, openclaw_user in targets:
+                history, saw = await _listener_rpc(
+                    ws,
+                    "chat.history",
+                    {
+                        "sessionKey": session_key,
+                        "agentId": OPENCLAW_VOICE_AGENT_ID,
+                        "limit": NOTIFICATION_HISTORY_LIMIT,
+                        "maxChars": 12000,
+                    },
+                    session_keys=session_keys,
+                )
+                dirty.update(saw)
+                await _reconcile_voice_session_history(
+                    history,
+                    session_key,
+                    source_device_id=device_id,
+                    source_openclaw_user=openclaw_user,
+                )
+
             reconnect_delay = NOTIFICATION_RECONNECT_MIN_SEC
 
             while True:
-                # If a session event raced the synchronous /v1/chat/completions
-                # voice turn, do not block on the next WebSocket event. Recheck
-                # locally until openclaw_chat() has registered the exact reply
-                # suppression hash and released the in-flight gate.
-                if dirty and VOICE_OPENCLAW_INFLIGHT > 0:
-                    await asyncio.sleep(0.10)
-                    continue
-
-                if dirty and VOICE_OPENCLAW_INFLIGHT == 0:
+                # Reconcile any dirty session whose synchronous turn has fully
+                # released its own gate. A busy Main session does not stall Mini.
+                ready = [
+                    key for key in list(dirty)
+                    if _notification_state(key).voice_inflight == 0
+                ]
+                if ready:
                     await asyncio.sleep(0.12)
-                    history, saw_event = await _listener_rpc(
-                        ws,
-                        "chat.history",
-                        {
-                            "sessionKey": session_key,
-                            "agentId": OPENCLAW_VOICE_AGENT_ID,
-                            "limit": NOTIFICATION_HISTORY_LIMIT,
-                            "maxChars": 12000,
-                        },
-                        session_key=session_key,
-                    )
-                    dirty = saw_event
-                    await _reconcile_voice_session_history(history, session_key)
+                    for session_key in ready:
+                        target = target_by_key[session_key]
+                        dirty.discard(session_key)
+                        history, saw = await _listener_rpc(
+                            ws,
+                            "chat.history",
+                            {
+                                "sessionKey": session_key,
+                                "agentId": OPENCLAW_VOICE_AGENT_ID,
+                                "limit": NOTIFICATION_HISTORY_LIMIT,
+                                "maxChars": 12000,
+                            },
+                            session_keys=session_keys,
+                        )
+                        dirty.update(saw)
+                        await _reconcile_voice_session_history(
+                            history,
+                            session_key,
+                            source_device_id=target[1],
+                            source_openclaw_user=target[2],
+                        )
                     continue
 
-                raw = await ws.recv()
+                # If every dirty session is still inside a synchronous turn, use
+                # a short recv timeout so the loop rechecks the per-session gate
+                # without creating a polling/background task.
+                if dirty:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.10)
+                    except asyncio.TimeoutError:
+                        continue
+                else:
+                    raw = await ws.recv()
+
                 frame = json.loads(raw)
                 if not isinstance(frame, dict):
                     continue
@@ -2053,17 +2413,22 @@ async def openclaw_voice_session_listener_loop() -> None:
                 event_name = str(frame.get("event") or "")
                 if event_name == "shutdown":
                     raise RuntimeError("OpenClaw Gateway announced shutdown")
-                if _listener_event_targets_voice_session(frame, session_key):
-                    dirty = True
+                for session_key in session_keys:
+                    if _listener_event_targets_voice_session(frame, session_key):
+                        dirty.add(session_key)
 
         except asyncio.CancelledError:
             if ws is not None:
                 await ws.close()
             raise
         except Exception as exc:
+            # Transport resets are recoverable by design. Keep one compact line
+            # instead of presenting an automatically recovered WebSocket close as
+            # an application error. Unexpected exceptions still retain WARN.
+            prefix = "[NOTIFY]" if isinstance(exc, ConnectionClosed) else "[NOTIFY-WARN]"
             print(
-                f"[NOTIFY-WARN] OpenClaw listener disconnected: "
-                f"{type(exc).__name__}: {exc}; retry_in={reconnect_delay:.0f}s"
+                f"{prefix} listener transport reset: {_one_line_error(exc)}; "
+                f"retry_in={reconnect_delay:.0f}s"
             )
             if ws is not None:
                 try:
@@ -2652,25 +3017,26 @@ async def _fetch_info_category_with_retries(
             raise
         except Exception as exc:
             last_error = exc
+            compact_error = _one_line_error(exc)
             _write_startup_snapshot_text(
                 f"{category}_attempt{index:02d}_error.txt",
-                f"{type(exc).__name__}: {exc}\n",
+                compact_error + "\n",
             )
-            print(
-                f"[INFO-SKILL-WARN] category={category} "
-                f"attempt={index}/{attempts} failed: "
-                f"{type(exc).__name__}: {exc}"
+            # Intermediate provider failures are retained in snapshots and
+            # verbose logs; normal runtime prints one final fallback line only.
+            _vlog(
+                f"[INFO-SKILL] category={category} "
+                f"attempt={index}/{attempts} failed: {compact_error}"
             )
 
     error_text = (
-        f"{type(last_error).__name__}: {last_error}"
+        _one_line_error(last_error)
         if last_error is not None
         else "unknown error"
     )
     print(
-        f"[INFO-SKILL-ERROR] category={category} FAILED "
-        f"after={attempts} attempts; keeping category last-good: "
-        f"{error_text}"
+        f"[INFO-SKILL-WARN] category={category} unavailable "
+        f"after={attempts} attempts; last-good retained: {error_text}"
     )
     return False, FEED_CATEGORY_ITEMS[category], error_text
 
@@ -2832,6 +3198,12 @@ def save_gold_quote_cache() -> None:
         print(f"[GOLD-WARN] cache write failed: {exc}")
 
 
+class GoldRateLimitError(RuntimeError):
+    def __init__(self, retry_after_sec: int | None = None) -> None:
+        super().__init__("gold quote provider rate-limited (HTTP 429)")
+        self.retry_after_sec = retry_after_sec
+
+
 async def fetch_gold_quote() -> tuple[float, str]:
     async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
         response = await client.get(
@@ -2841,6 +3213,12 @@ async def fetch_gold_quote() -> tuple[float, str]:
                 "User-Agent": "HomeAIAgent/0.4.1.3",
             },
         )
+        if response.status_code == 429:
+            retry_after: int | None = None
+            raw_retry = str(response.headers.get("Retry-After") or "").strip()
+            if raw_retry.isdigit():
+                retry_after = max(1, int(raw_retry))
+            raise GoldRateLimitError(retry_after)
         response.raise_for_status()
         body = response.json()
 
@@ -2890,20 +3268,50 @@ async def refresh_gold_quote(*, force_sync: bool = False) -> bool:
 
 async def gold_quote_loop() -> None:
     # Fetch once immediately, then keep the status current independently of
-    # the 2-hour news schedule (including the 01:00-09:00 news quiet window).
+    # the 2-hour news schedule. Provider failures use backoff while the cached
+    # last-good price stays visible, preventing the old 5-minute 429 storm.
+    failure_streak = 0
     while True:
+        next_delay = GOLD_REFRESH_SEC
         try:
             await refresh_gold_quote()
+            failure_streak = 0
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            # Keep last-good quote on transient provider/network failure.
+        except GoldRateLimitError as exc:
+            failure_streak += 1
+            # Honor an explicit Retry-After from the provider. Without one,
+            # use our conservative 30-minute cool-down.
+            if exc.retry_after_sec is not None:
+                next_delay = max(GOLD_REFRESH_SEC, min(int(exc.retry_after_sec), 86400))
+            else:
+                next_delay = GOLD_RATE_LIMIT_BACKOFF_SEC
             print(
-                f"[GOLD-WARN] refresh failed, keeping last-good quote: "
-                f"{type(exc).__name__}: {exc}"
+                f"[GOLD] provider rate-limited; last-good retained; "
+                f"retry_in={next_delay}s"
+            )
+        except (httpx.TransportError, asyncio.TimeoutError, ConnectionError, OSError) as exc:
+            failure_streak += 1
+            next_delay = min(
+                GOLD_FAILURE_BACKOFF_MAX_SEC,
+                GOLD_FAILURE_BACKOFF_BASE_SEC * (2 ** min(failure_streak - 1, 3)),
+            )
+            print(
+                f"[GOLD] provider temporarily unavailable; last-good retained; "
+                f"retry_in={int(next_delay)}s error={_one_line_error(exc)}"
+            )
+        except Exception as exc:
+            failure_streak += 1
+            next_delay = min(
+                GOLD_FAILURE_BACKOFF_MAX_SEC,
+                GOLD_FAILURE_BACKOFF_BASE_SEC * (2 ** min(failure_streak - 1, 3)),
+            )
+            print(
+                f"[GOLD-WARN] refresh failed; last-good retained; "
+                f"retry_in={int(next_delay)}s error={_one_line_error(exc)}"
             )
 
-        await asyncio.sleep(GOLD_REFRESH_SEC)
+        await asyncio.sleep(next_delay)
 
 
 def _info_schedule_tz() -> ZoneInfo:
@@ -3078,7 +3486,8 @@ async def ensure_display_policy(
                 await asyncio.sleep(1.0)
                 continue
 
-            print(
+            display_log = _vlog if reason == "periodic_reconcile" else print
+            display_log(
                 f"[DISPLAY] command sent requested={requested} "
                 f"command_id={command_id} "
                 f"attempt={attempt}/{DISPLAY_COMMAND_MAX_ATTEMPTS}"
@@ -3105,7 +3514,8 @@ async def ensure_display_policy(
             if status == "applied":
                 if actual_sleeping == desired_sleeping:
                     session.display_last_confirmed_sleeping = actual_sleeping
-                    print(
+                    display_log = _vlog if reason == "periodic_reconcile" else print
+                    display_log(
                         f"[DISPLAY] ACK confirmed requested={requested} "
                         f"sleeping={actual_sleeping} "
                         f"command_id={command_id}"
@@ -3154,7 +3564,8 @@ async def ensure_display_policy(
                     and final_sleeping == desired_sleeping
                 ):
                     session.display_last_confirmed_sleeping = final_sleeping
-                    print(
+                    display_log = _vlog if reason == "periodic_reconcile" else print
+                    display_log(
                         f"[DISPLAY] ACK confirmed after pending "
                         f"requested={requested} sleeping={final_sleeping} "
                         f"command_id={command_id}"
@@ -3695,6 +4106,7 @@ class KitchenSession:
     device_id: str = KITCHEN_DEVICE_ID
     hello_received: bool = False
     connected_at: float = field(default_factory=time.time)
+    security: AuthContext = field(default_factory=AuthContext)
     current_view: str = "idle"
     current_item: str = ""
     current_step: int = 0
@@ -4987,6 +5399,63 @@ async def _wait_speaker_volume_ack(
         )
 
 
+async def _speaker_volume_request(
+    sink: ClientSession,
+    operation: str,
+    value: int = 0,
+) -> int:
+    """Issue one NetworkSpeaker volume command and return the acknowledged level."""
+    if not _speaker_supports_volume_control(sink):
+        raise RuntimeError(f"speaker {sink.device_id} does not support volume control")
+
+    request_id = f"volume-{uuid.uuid4()}"
+    payload: dict[str, Any] = {
+        "request_id": request_id,
+        "device_id": sink.device_id,
+    }
+    if operation == "set":
+        payload.update({
+            "type": "speaker.volume.set",
+            "volume_percent": max(0, min(100, int(value))),
+        })
+    elif operation == "adjust":
+        payload.update({
+            "type": "speaker.volume.adjust",
+            "delta_percent": int(value),
+        })
+    elif operation == "get":
+        payload["type"] = "speaker.volume.get"
+    else:
+        raise ValueError(f"unsupported speaker volume operation: {operation}")
+
+    await send_json(sink.ws, payload)
+    ack = await _wait_speaker_volume_ack(sink, request_id)
+    status = str(ack.get("status") or "")
+    if status not in {"applied", "applied_not_persisted"}:
+        raise RuntimeError(f"speaker rejected volume command status={status!r}")
+    try:
+        level = max(0, min(100, int(ack.get("volume_percent"))))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("speaker returned invalid volume_percent") from exc
+    sink.capabilities["volume_percent"] = level
+    return level
+
+
+async def _speaker_get_volume(sink: ClientSession) -> int:
+    try:
+        return await _speaker_volume_request(sink, "get")
+    except Exception:
+        cached = sink.capabilities.get("volume_percent")
+        try:
+            return max(0, min(100, int(cached)))
+        except (TypeError, ValueError):
+            raise
+
+
+async def _speaker_set_volume(sink: ClientSession, level: int) -> int:
+    return await _speaker_volume_request(sink, "set", level)
+
+
 async def _apply_speaker_volume_voice_command(
     source: ClientSession,
     transcript: str,
@@ -5000,40 +5469,16 @@ async def _apply_speaker_volume_voice_command(
         print(f"[VOLUME] command requested but no controllable speaker source={source.device_id}")
         return "现在没有连接可调音量的网络喇叭。"
 
-    request_id = f"volume-{uuid.uuid4()}"
-    payload: dict[str, Any] = {
-        "request_id": request_id,
-        "device_id": sink.device_id,
-    }
-    if intent.operation == "set":
-        payload.update({
-            "type": "speaker.volume.set",
-            "volume_percent": max(0, min(100, intent.value)),
-        })
-    elif intent.operation == "adjust":
-        payload.update({
-            "type": "speaker.volume.adjust",
-            "delta_percent": intent.value,
-        })
-    else:
-        payload["type"] = "speaker.volume.get"
-
     try:
-        await send_json(sink.ws, payload)
-        ack = await _wait_speaker_volume_ack(sink, request_id)
+        if intent.operation == "set":
+            level = await _speaker_volume_request(sink, "set", intent.value)
+        elif intent.operation == "adjust":
+            level = await _speaker_volume_request(sink, "adjust", intent.value)
+        else:
+            level = await _speaker_volume_request(sink, "get")
     except Exception as exc:
         print(f"[VOLUME-ERROR] {type(exc).__name__}: {exc}")
         return "网络喇叭这次没有响应音量调整。"
-
-    status = str(ack.get("status") or "")
-    try:
-        level = max(0, min(100, int(ack.get("volume_percent"))))
-    except (TypeError, ValueError):
-        return "网络喇叭返回的音量状态不正确。"
-
-    sink.capabilities["volume_percent"] = level
-    if status not in {"applied", "applied_not_persisted"}:
-        return "网络喇叭没有接受这次音量调整。"
 
     if intent.operation == "get":
         return f"网络喇叭现在音量是百分之{level}。"
@@ -5043,12 +5488,510 @@ async def _apply_speaker_volume_voice_command(
     return f"好的，网络喇叭音量已经调到百分之{level}。"
 
 
+
+def _active_ambient(source_device_id: str) -> AmbientPlayback | None:
+    playback = AMBIENT_PLAYBACKS.get(str(source_device_id or "").strip())
+    if playback is None:
+        return None
+    if playback.task is not None and playback.task.done():
+        if AMBIENT_PLAYBACKS.get(playback.source_device_id) is playback:
+            AMBIENT_PLAYBACKS.pop(playback.source_device_id, None)
+        return None
+    return playback
+
+
+def _ambient_snapshot(playback: AmbientPlayback) -> AmbientSnapshot:
+    remaining = max(0, int(math.ceil(playback.end_monotonic - asyncio.get_running_loop().time())))
+    return AmbientSnapshot(
+        sound_id=playback.sound_id,
+        remaining_sec=remaining,
+        ambient_volume=playback.ambient_volume,
+        deadline_monotonic=playback.end_monotonic,
+    )
+
+
+def _find_speaker_session(device_id: str, parent_device_id: str) -> ClientSession | None:
+    matches = [
+        item for item in ACTIVE_SESSIONS
+        if (
+            _is_speaker_session(item)
+            and item.hello_received
+            and item.device_id == device_id
+            and item.parent_device_id == parent_device_id
+        )
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.connected_at, reverse=True)
+    return matches[0]
+
+
+async def _ambient_resolve_speaker(
+    playback: AmbientPlayback,
+    current: ClientSession | None = None,
+) -> ClientSession | None:
+    live = _find_speaker_session(playback.speaker_device_id, playback.parent_device_id)
+    if live is not None:
+        return live
+    if current is None:
+        return None
+    return await _wait_for_bound_speaker_reconnect(
+        device_id=playback.speaker_device_id,
+        parent_device_id=playback.parent_device_id,
+        previous=current,
+        timeout=AUDIO_ROUTE_RECONNECT_GRACE_SEC,
+    )
+
+
+async def _ambient_finalize_sequence(speaker: ClientSession, segment_index: int) -> None:
+    """Close a long ambient sequence after a real Dock queue slot is free."""
+    # With double buffering there can still be two ambient segments queued when
+    # a manual stop/timer boundary is noticed.  Reuse the Dock's slot_ready
+    # handshake instead of blindly pushing a final marker into a full queue.
+    if not speaker.playback_slot_ready_event.is_set():
+        await _wait_tts_event(speaker, "slot", 6.0)
+    speaker.playback_slot_ready_event.clear()
+
+    speaker.playback_total_segments = segment_index
+    speaker.playback_done_event.clear()
+    speaker.playback_error_event.clear()
+    final_pcm = b"\x00\x00" * max(
+        1, int(round(AMBIENT_SAMPLE_RATE * AMBIENT_FINAL_SILENCE_SEC))
+    )
+    await _send_pcm_segment(
+        speaker,
+        final_pcm,
+        AMBIENT_SAMPLE_RATE,
+        index=segment_index,
+        total=segment_index,
+        chunk_bytes=NETWORK_SPEAKER_TTS_CHUNK_BYTES,
+        pace_every_chunks=NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS,
+        pace_sec=NETWORK_SPEAKER_TTS_PACE_SEC,
+    )
+    await _wait_tts_event(speaker, "done", 10.0)
+
+
+def _ambient_render_next_segment(
+    source_loop: AmbientAssetLoop,
+    playback: AmbientPlayback,
+    *,
+    stream_started_at: float,
+    now: float,
+) -> bytes | None:
+    remaining = playback.end_monotonic - now
+    if remaining <= 0:
+        return None
+
+    duration = min(AMBIENT_SEGMENT_SEC, max(0.02, remaining))
+    elapsed0 = max(0.0, now - stream_started_at)
+    elapsed1 = elapsed0 + duration
+    if AMBIENT_FADE_IN_SEC > 0:
+        fade_in0 = min(1.0, elapsed0 / AMBIENT_FADE_IN_SEC)
+        fade_in1 = min(1.0, elapsed1 / AMBIENT_FADE_IN_SEC)
+    else:
+        fade_in0 = fade_in1 = 1.0
+
+    remaining1 = max(0.0, remaining - duration)
+    if AMBIENT_FADE_OUT_SEC > 0:
+        fade_out0 = min(1.0, remaining / AMBIENT_FADE_OUT_SEC)
+        fade_out1 = min(1.0, remaining1 / AMBIENT_FADE_OUT_SEC)
+    else:
+        fade_out0 = fade_out1 = 1.0
+
+    return source_loop.render(
+        duration,
+        gain_start=min(fade_in0, fade_out0),
+        gain_end=min(fade_in1, fade_out1),
+    )
+
+
+async def _ambient_stream_task(playback: AmbientPlayback) -> None:
+    """Continuously stream ambient PCM while keeping both Dock slots primed.
+
+    The stream keeps both Dock playback slots primed, matching the proven
+    gapless TTS pipeline. One slot is refilled as soon as the Dock releases it
+    so routine Python/WebSocket/Wi-Fi jitter is absorbed before it is audible.
+    """
+    loop = asyncio.get_running_loop()
+    source_loop = AmbientAssetLoop(
+        playback.sound_id,
+        sample_rate=AMBIENT_SAMPLE_RATE,
+    )
+    speaker: ClientSession | None = None
+    segment_index = 1  # next segment index to send
+    stream_started_at = loop.time()
+    reconnects_used = 0
+    error: Exception | None = None
+    needs_prefill = True
+
+    try:
+        while True:
+            if playback.stop_event.is_set():
+                break
+
+            speaker = await _ambient_resolve_speaker(playback, speaker)
+            if speaker is None:
+                raise RuntimeError("ambient Dock Speaker is offline")
+
+            # A reconnect starts with an empty C3 playback state. Re-prime both
+            # slots rather than resuming with the old one-segment cadence.
+            if not speaker.playback_sequence_active:
+                speaker.playback_sequence_active = True
+                speaker.playback_total_segments = AMBIENT_STREAM_TOTAL_SENTINEL
+                speaker.playback_completed_segments = 0
+                speaker.playback_done_event.clear()
+                speaker.playback_error_event.clear()
+                speaker.playback_slot_ready_event.clear()
+                segment_index = 1
+                needs_prefill = True
+
+            try:
+                if needs_prefill:
+                    sent = 0
+                    while sent < AMBIENT_PREFILL_SEGMENTS:
+                        if playback.stop_event.is_set():
+                            break
+                        now = loop.time()
+                        pcm = _ambient_render_next_segment(
+                            source_loop,
+                            playback,
+                            stream_started_at=stream_started_at,
+                            now=now,
+                        )
+                        if pcm is None:
+                            playback.stop_reason = playback.stop_reason or "timer"
+                            break
+                        await _send_pcm_segment(
+                            speaker,
+                            pcm,
+                            AMBIENT_SAMPLE_RATE,
+                            index=segment_index,
+                            total=AMBIENT_STREAM_TOTAL_SENTINEL,
+                            chunk_bytes=NETWORK_SPEAKER_TTS_CHUNK_BYTES,
+                            pace_every_chunks=NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS,
+                            pace_sec=NETWORK_SPEAKER_TTS_PACE_SEC,
+                        )
+                        segment_index += 1
+                        sent += 1
+
+                    needs_prefill = False
+                    reconnects_used = 0
+                    print(
+                        f"[AMBIENT-BUFFER] primed={sent}/{AMBIENT_PREFILL_SEGMENTS} "
+                        f"speaker={speaker.device_id} segment={AMBIENT_SEGMENT_SEC:.2f}s"
+                    )
+                    if sent == 0 or playback.stop_event.is_set():
+                        break
+
+                # Exactly like normal long TTS: one queued segment finishes,
+                # leaving the other one playing. Refill the released slot now.
+                await _wait_tts_event(speaker, "slot", 6.0)
+
+                # If stop/timer became true while waiting, preserve the set
+                # slot_ready event so _ambient_finalize_sequence can use it.
+                if playback.stop_event.is_set():
+                    break
+                now = loop.time()
+                if playback.end_monotonic - now <= 0:
+                    playback.stop_reason = playback.stop_reason or "timer"
+                    break
+
+                speaker.playback_slot_ready_event.clear()
+                pcm = _ambient_render_next_segment(
+                    source_loop,
+                    playback,
+                    stream_started_at=stream_started_at,
+                    now=now,
+                )
+                if pcm is None:
+                    playback.stop_reason = playback.stop_reason or "timer"
+                    break
+
+                await _send_pcm_segment(
+                    speaker,
+                    pcm,
+                    AMBIENT_SAMPLE_RATE,
+                    index=segment_index,
+                    total=AMBIENT_STREAM_TOTAL_SENTINEL,
+                    chunk_bytes=NETWORK_SPEAKER_TTS_CHUNK_BYTES,
+                    pace_every_chunks=NETWORK_SPEAKER_TTS_PACE_EVERY_CHUNKS,
+                    pace_sec=NETWORK_SPEAKER_TTS_PACE_SEC,
+                )
+                segment_index += 1
+                reconnects_used = 0
+
+            except Exception as exc:
+                previous = speaker
+                previous.playback_sequence_active = False
+                reconnects_used += 1
+                if reconnects_used > AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS:
+                    raise
+                print(
+                    f"[AMBIENT-HOLD] speaker={previous.device_id} reconnect="
+                    f"{reconnects_used}/{AUDIO_ROUTE_RECONNECT_MAX_ATTEMPTS} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                replacement = await _wait_for_bound_speaker_reconnect(
+                    device_id=playback.speaker_device_id,
+                    parent_device_id=playback.parent_device_id,
+                    previous=previous,
+                    timeout=AUDIO_ROUTE_RECONNECT_GRACE_SEC,
+                )
+                if replacement is None:
+                    raise RuntimeError(
+                        f"ambient speaker reconnect timeout after "
+                        f"{AUDIO_ROUTE_RECONNECT_GRACE_SEC:.1f}s"
+                    ) from exc
+                speaker = replacement
+                segment_index = 1
+                needs_prefill = True
+                print(
+                    f"[AMBIENT-RECOVER] speaker={speaker.device_id} "
+                    f"remaining={max(0, int(playback.end_monotonic-loop.time()))}s"
+                )
+
+        if speaker is not None and speaker.playback_sequence_active and segment_index > 1:
+            await _ambient_finalize_sequence(speaker, segment_index)
+
+    except asyncio.CancelledError:
+        playback.stop_reason = playback.stop_reason or "cancelled"
+        raise
+    except Exception as exc:
+        error = exc
+        playback.stop_reason = playback.stop_reason or "error"
+        print(
+            f"[AMBIENT-ERROR] source={playback.source_device_id} "
+            f"speaker={playback.speaker_device_id} "
+            f"sound={playback.sound_id} error={type(exc).__name__}: {exc}"
+        )
+    finally:
+        if speaker is not None:
+            speaker.playback_sequence_active = False
+        # Always restore the pre-ambient normal speaker level, including timer
+        # completion, manual stop and transport failure.
+        restore_speaker = await _ambient_resolve_speaker(playback, speaker)
+        if restore_speaker is not None:
+            try:
+                await _speaker_set_volume(restore_speaker, playback.normal_volume)
+            except Exception as exc:
+                print(f"[AMBIENT-WARN] volume restore failed: {type(exc).__name__}: {exc}")
+        if AMBIENT_PLAYBACKS.get(playback.source_device_id) is playback:
+            AMBIENT_PLAYBACKS.pop(playback.source_device_id, None)
+        playback.done_event.set()
+        print(
+            f"[AMBIENT] stopped source={playback.source_device_id} "
+            f"sound={playback.sound_id} reason={playback.stop_reason or 'complete'} "
+            f"error={type(error).__name__ if error else 'none'}"
+        )
+
+
+async def _start_ambient(
+    source: ClientSession,
+    snapshot: AmbientSnapshot,
+) -> AmbientPlayback:
+    existing = _active_ambient(source.device_id)
+    if existing is not None:
+        await _stop_ambient(source.device_id, reason="replace", immediate_mute=True)
+
+    sink = _select_audio_sink(source)
+    if sink is source or not _speaker_supports_volume_control(sink):
+        raise RuntimeError("没有连接可播放助眠声音的 Dock Speaker")
+    if not ambient_asset_available(snapshot.sound_id):
+        raise RuntimeError(
+            f"助眠素材尚未安装: {ambient_asset_path(snapshot.sound_id)}; "
+            "请先运行 python3 tools/fetch_ambient_assets.py"
+        )
+
+    normal_volume = await _speaker_get_volume(sink)
+    ambient_volume = max(0, min(100, int(snapshot.ambient_volume)))
+    await _speaker_set_volume(sink, ambient_volume)
+
+    now = asyncio.get_running_loop().time()
+    if snapshot.deadline_monotonic > 0:
+        if snapshot.deadline_monotonic <= now:
+            raise RuntimeError("ambient timer already expired")
+        duration = max(1, min(
+            int(math.ceil(snapshot.deadline_monotonic - now)),
+            AMBIENT_MAX_DURATION_SEC,
+        ))
+        end_monotonic = snapshot.deadline_monotonic
+    else:
+        duration = max(1, min(int(snapshot.remaining_sec), AMBIENT_MAX_DURATION_SEC))
+        end_monotonic = now + duration
+    playback = AmbientPlayback(
+        source_device_id=source.device_id,
+        speaker_device_id=sink.device_id,
+        parent_device_id=sink.parent_device_id,
+        sound_id=snapshot.sound_id,
+        ambient_volume=ambient_volume,
+        normal_volume=normal_volume,
+        end_monotonic=end_monotonic,
+        started_monotonic=now,
+    )
+    AMBIENT_PLAYBACKS[source.device_id] = playback
+    playback.task = asyncio.create_task(_ambient_stream_task(playback))
+    print(
+        f"[AMBIENT] start source={source.device_id} speaker={sink.device_id} "
+        f"sound={snapshot.sound_id} duration={duration}s "
+        f"volume={ambient_volume}% restore={normal_volume}%"
+    )
+    return playback
+
+
+async def _stop_ambient(
+    source_device_id: str,
+    *,
+    reason: str,
+    immediate_mute: bool = True,
+) -> AmbientSnapshot | None:
+    playback = _active_ambient(source_device_id)
+    if playback is None:
+        return None
+    snapshot = _ambient_snapshot(playback)
+    playback.stop_reason = reason
+
+    speaker = await _ambient_resolve_speaker(playback)
+    if immediate_mute and speaker is not None:
+        try:
+            # Perceived stop is immediate even though the final ~1 s buffered
+            # PCM still drains in the background before normal volume restores.
+            await _speaker_set_volume(speaker, 0)
+        except Exception as exc:
+            print(f"[AMBIENT-WARN] mute-before-stop failed: {type(exc).__name__}: {exc}")
+
+    playback.stop_event.set()
+    try:
+        await asyncio.wait_for(playback.done_event.wait(), timeout=AMBIENT_STOP_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        print(
+            f"[AMBIENT-WARN] stop timeout source={source_device_id}; cancelling task"
+        )
+        if playback.task is not None:
+            playback.task.cancel()
+            try:
+                await playback.task
+            except BaseException:
+                pass
+    return snapshot
+
+
+async def _suspend_ambient_for_turn(source: ClientSession) -> AmbientSnapshot | None:
+    playback = _active_ambient(source.device_id)
+    if playback is None:
+        return None
+    print(
+        f"[AMBIENT] suspend-for-turn source={source.device_id} "
+        f"sound={playback.sound_id}"
+    )
+    return await _stop_ambient(source.device_id, reason="foreground_turn", immediate_mute=True)
+
+
+def _ambient_reply_for_intent(
+    intent: AmbientIntent,
+    prior: AmbientSnapshot | None,
+) -> tuple[str, AmbientSnapshot | None]:
+    """Return spoken confirmation and post-TTS ambient state to start/resume."""
+    if intent.operation == "list":
+        return (
+            f"有{len(AMBIENT_SOUNDS)}种助眠声音。" + ambient_sound_catalog_numbered_text() +
+            "。你可以直接说，播放第3个30分钟。",
+            prior,
+        )
+
+    if intent.operation == "invalid_selection":
+        return (
+            f"助眠声音编号是1到{len(AMBIENT_SOUNDS)}。"
+            "你可以说，有哪些助眠声音。",
+            prior,
+        )
+
+    if intent.operation == "stop":
+        if prior is None:
+            return "现在没有在播放助眠声音。", None
+        return f"好的，已经停止{ambient_sound_label(prior.sound_id)}。", None
+
+    if intent.operation == "start":
+        duration = intent.duration_sec or AMBIENT_DEFAULT_DURATION_SEC
+        duration = max(60, min(duration, AMBIENT_MAX_DURATION_SEC))
+        sound_id = intent.sound_id
+        if not ambient_asset_available(sound_id):
+            return (
+                f"{ambient_sound_label(sound_id)}的真实音频素材还没有安装。"
+                "请先运行助眠素材安装器。",
+                prior,
+            )
+        pending = AmbientSnapshot(sound_id, duration, AMBIENT_DEFAULT_VOLUME_PERCENT)
+        return (
+            f"好的，{ambient_sound_label(sound_id)}播放{ambient_format_duration_zh(duration)}。",
+            pending,
+        )
+
+    if prior is None:
+        return "现在没有在播放助眠声音。", None
+
+    if intent.operation == "next":
+        current_no = ambient_sound_number(prior.sound_id) or 1
+        next_no = 1 if current_no >= len(AMBIENT_SOUNDS) else current_no + 1
+        next_id = ambient_sound_id_for_number(next_no)
+        if not ambient_asset_available(next_id):
+            return f"第{next_no}个素材还没有安装，继续播放现在的声音。", prior
+        pending = AmbientSnapshot(
+            next_id, prior.remaining_sec, prior.ambient_volume, prior.deadline_monotonic
+        )
+        return (
+            f"好的，换成第{next_no}个，{ambient_sound_label(next_id)}，剩余时间不变。",
+            pending,
+        )
+
+    if intent.operation == "switch":
+        if not ambient_asset_available(intent.sound_id):
+            return f"{ambient_sound_label(intent.sound_id)}的素材还没有安装，继续播放现在的声音。", prior
+        pending = AmbientSnapshot(
+            intent.sound_id, prior.remaining_sec, prior.ambient_volume, prior.deadline_monotonic
+        )
+        return (
+            f"好的，换成{ambient_sound_label(intent.sound_id)}，剩余时间不变。",
+            pending,
+        )
+
+    if intent.operation == "extend":
+        extra = max(60, min(int(intent.duration_sec or 0), AMBIENT_MAX_DURATION_SEC))
+        duration = min(AMBIENT_MAX_DURATION_SEC, prior.remaining_sec + extra)
+        deadline = (prior.deadline_monotonic + extra) if prior.deadline_monotonic > 0 else 0.0
+        pending = AmbientSnapshot(prior.sound_id, duration, prior.ambient_volume, deadline)
+        return f"好的，再延长{ambient_format_duration_zh(extra)}。", pending
+
+    if intent.operation == "volume":
+        if intent.volume_percent is not None:
+            level = max(0, min(100, int(intent.volume_percent)))
+        else:
+            level = max(0, min(100, prior.ambient_volume + int(intent.volume_delta)))
+        pending = AmbientSnapshot(
+            prior.sound_id, prior.remaining_sec, level, prior.deadline_monotonic
+        )
+        return f"好的，助眠音量调到百分之{level}。", pending
+
+    if intent.operation == "status":
+        pending = prior
+        return (
+            f"现在播放的是{ambient_sound_label(prior.sound_id)}，"
+            f"还剩{ambient_format_duration_zh(prior.remaining_sec)}。",
+            pending,
+        )
+
+    return "你可以选择" + ambient_sound_catalog_text() + "。", prior
+
+
 def _device_ready_payload(session: ClientSession) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": "gateway.ready",
         "mode": MODE,
         "device_id": session.device_id,
         "device_role": session.device_role,
+        "security": {
+            "mode": DEVICE_AUTH.mode,
+            "authenticated": session.security.authenticated,
+        },
     }
     if _is_speaker_session(session):
         payload["parent_device_id"] = session.parent_device_id
@@ -5805,16 +6748,33 @@ async def openai_transcribe(wav_bytes: bytes) -> str:
         return str(r.json().get("text", "")).strip()
 
 
-def build_agent_prompt(transcript: str, context: dict[str, Any]) -> str:
-    current = context.get("current") or {}
-    previous = context.get("previous") or {}
-    nxt = context.get("next") or {}
-    kitchen_context = _kitchen_agent_context_text()
-    return f"""你正在作为一个屏幕挂件形态的家庭AI助手与用户语音交流。
+def build_agent_prompt(
+    transcript: str,
+    context: dict[str, Any],
+    *,
+    device_id: str = HOMEAI_PRIMARY_DEVICE_ID,
+) -> str:
+    did = str(device_id or "").strip() or HOMEAI_PRIMARY_DEVICE_ID
+    base = """你正在作为家庭AI助手“逐光”与用户语音交流。
 回答以自然中文口语为主，适合直接TTS播报。
 默认只回答 1～3 句，优先控制在 120 个中文字符左右；用户明确要求详细说明时才展开。
 不要复述系统说明，也不要说“根据你提供的上下文”。
 不要使用 Markdown 表格、标题符号或长列表，输出就是要直接说给用户听的话。
+
+终端隔离规则：
+- 当前请求只属于发起它的这个终端和它自己的会话。
+- 不继承 KitchenTerminal / 小K 的当前菜谱、步骤、计时器或对话上下文。
+- 不把当前回答改送到其他终端；实际音频输出由 Gateway 按当前终端的固定路由处理。
+- 如果用户明确要求操作另一个终端，不要假装已经跨终端执行。
+"""
+
+    if did != HOMEAI_PRIMARY_DEVICE_ID:
+        return base + f"\n当前终端没有 Glass2 资讯指代上下文。\n\n用户说：{transcript}\n"
+
+    current = context.get("current") or {}
+    previous = context.get("previous") or {}
+    nxt = context.get("next") or {}
+    info = f"""
 
 Glass2 当前资讯上下文：
 - 当前：[{current.get('category','')}] {current.get('headline','')} (id={current.get('item_id','')})
@@ -5823,7 +6783,7 @@ Glass2 当前资讯上下文：
 - 上一条：[{previous.get('category','')}] {previous.get('headline','')} (id={previous.get('item_id','')})
 - 下一条：[{nxt.get('category','')}] {nxt.get('headline','')} (id={nxt.get('item_id','')})
 
-指代规则：
+Glass2 指代规则：
 - “这个 / 这条 / 当前这个”默认指当前资讯。
 - “上一条 / 刚才那条”优先指上一条资讯。
 - “下一条”指下一条资讯。
@@ -5831,16 +6791,8 @@ Glass2 当前资讯上下文：
 - 对 get_item 的固定调用语义是：tool=homeai_info.get_item，protocol=homeai-info/1.1，item_id=当前被指代资讯的 item_id。
 - 不要只凭屏幕标题或短摘要推测细节。
 - 如果用户不是在询问资讯，就按普通家庭助手请求处理，并可使用 OpenClaw 已配置的其他工具。
-
-{kitchen_context}
-
-KitchenTerminal 指代规则：
-- 当 KitchenTerminal 正在显示某道菜时，“这个 / 这道菜 / 现在这个”优先指当前菜品。
-- 当 KitchenTerminal 正在显示某一步时，“这个要多久 / 现在要怎么做 / 为什么这样做”等追问优先结合当前步骤和该菜完整做法回答。
-- 不要声称已经操作 KitchenTerminal，除非 Gateway 本地命令已经实际完成；普通知识问答只负责回答。
-
-用户说：{transcript}
 """
+    return base + info + f"\n用户说：{transcript}\n"
 
 
 
@@ -5943,14 +6895,22 @@ async def openclaw_chat(
     context: dict[str, Any],
     *,
     openclaw_user: str = OPENCLAW_USER,
+    device_id: str = HOMEAI_PRIMARY_DEVICE_ID,
 ) -> str:
-    global VOICE_OPENCLAW_INFLIGHT
-
-    # The notification listener subscribes only to the primary HomeAIAgent
-    # session. Mini/other companion turns must not pause or alter that listener.
-    notification_tracked = openclaw_user == OPENCLAW_USER
-    if notification_tracked:
-        VOICE_OPENCLAW_INFLIGHT += 1
+    notification_target = _notification_target_for_user(openclaw_user)
+    session_key = (
+        notification_target[0]
+        if notification_target is not None
+        else _openclaw_voice_session_key(openclaw_user)
+    )
+    notification_state = None
+    if notification_target is not None:
+        notification_state = _notification_state(
+            session_key,
+            source_device_id=notification_target[1],
+            openclaw_user=notification_target[2],
+        )
+        notification_state.voice_inflight += 1
     try:
         headers = {"Content-Type": "application/json"}
         if OPENCLAW_TOKEN:
@@ -5961,7 +6921,14 @@ async def openclaw_chat(
             "user": openclaw_user,
             "stream": False,
             "messages": [
-                {"role": "user", "content": build_agent_prompt(transcript, enrich_info_context(context))}
+                {
+                    "role": "user",
+                    "content": build_agent_prompt(
+                        transcript,
+                        enrich_info_context(context),
+                        device_id=device_id,
+                    ),
+                }
             ],
         }
         async with _openclaw_http_client(OPENCLAW_CHAT_TIMEOUT_SEC) as client:
@@ -5982,20 +6949,20 @@ async def openclaw_chat(
         if not full_text:
             raise RuntimeError("OpenClaw returned empty assistant text")
 
-        # Only the primary HomeAIAgent conversation is subscribed by the
-        # notification listener. Mini and future isolated companion sessions
-        # therefore do not participate in the primary suppression/fence state.
-        if notification_tracked:
-            _register_voice_reply_suppression(full_text)
-            _register_voice_turn_fence(full_text)
+        # Every subscribed companion owns an independent notification fence.
+        # This prevents a synchronous Mini answer from later being replayed as
+        # a Dock Speaker reminder, while never suppressing Main notifications.
+        if notification_target is not None:
+            _register_voice_reply_suppression(full_text, session_key)
+            _register_voice_turn_fence(full_text, session_key)
 
         text = full_text
         if len(text) > MAX_AGENT_CHARS:
             text = text[:MAX_AGENT_CHARS].rstrip() + "。"
         return text
     finally:
-        if notification_tracked:
-            VOICE_OPENCLAW_INFLIGHT = max(0, VOICE_OPENCLAW_INFLIGHT - 1)
+        if notification_state is not None:
+            notification_state.voice_inflight = max(0, notification_state.voice_inflight - 1)
 
 
 async def openai_tts_wav(text: str) -> bytes:
@@ -6485,8 +7452,14 @@ async def send_pcm_to_routed_sink(
         return source
 
 
-def _reminder_session_available(session: ClientSession) -> bool:
-    if not _is_primary_companion_session(session):
+def _reminder_session_available(
+    session: ClientSession,
+    target_device_id: str | None = None,
+) -> bool:
+    if not _is_companion_session(session):
+        return False
+    target = str(target_device_id or "").strip()
+    if target and session.device_id != target:
         return False
     return not (
         session.recording
@@ -6542,12 +7515,20 @@ async def _deliver_reminder_to_device(
 ) -> None:
     session.processing = True
     overlay_sent = False
+    ambient_snapshot: AmbientSnapshot | None = None
 
     try:
+        if _active_ambient(session.device_id) is not None:
+            ambient_snapshot = await _suspend_ambient_for_turn(session)
+
         # Prevent a new PTT turn while the reminder TTS is being prepared.
         await send_state(session.ws, "thinking")
-        await _send_reminder_overlay(session, record)
-        overlay_sent = True
+        # The primary HomeAgent has the legacy Glass2 info overlay. Agent Mini
+        # does not advertise info_feed, so its reminder stays audio-only and is
+        # routed to the bound Dock Speaker without sending unsupported frames.
+        if _supports_info_feed(session):
+            await _send_reminder_overlay(session, record)
+            overlay_sent = True
 
         spoken = _reminder_spoken_text(record.text)
         tts_started = time.perf_counter()
@@ -6580,6 +7561,37 @@ async def _deliver_reminder_to_device(
         except Exception:
             pass
         session.processing = False
+        if ambient_snapshot is not None and _active_ambient(session.device_id) is None:
+            try:
+                await _start_ambient(session, ambient_snapshot)
+            except Exception as exc:
+                print(
+                    f"[AMBIENT-WARN] reminder resume skipped source={session.device_id} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+
+
+def _kitchen_reminder_available() -> bool:
+    if not any(getattr(s, "hello_received", False) for s in KITCHEN_SESSIONS):
+        return False
+    return str(KITCHEN_QA_STATE.get("status") or "idle") not in {
+        "recording", "recognizing", "thinking", "speaking"
+    }
+
+
+async def _deliver_reminder_to_kitchen(record: ReminderRecord) -> None:
+    spoken = _reminder_spoken_text(record.text)
+    event = await _kitchen_speak(
+        spoken,
+        kind="timer",
+        source_id=record.reminder_id,
+    )
+    if event is None:
+        raise RuntimeError("KitchenTerminal reminder TTS could not be queued")
+    print(
+        f"[NOTIFY] KitchenTerminal reminder queued id={record.reminder_id} "
+        f"audio={event.get('event_id')}"
+    )
 
 
 async def reminder_dispatch_loop() -> None:
@@ -6599,23 +7611,46 @@ async def reminder_dispatch_loop() -> None:
                 await asyncio.sleep(0.5)
                 continue
 
-            # Prefer the newest live device connection. Reconnect races can
-            # briefly leave an older session in the list. Never broadcast a
-            # user reminder to multiple terminals.
-            session = next(
-                (s for s in reversed(ACTIVE_SESSIONS) if _reminder_session_available(s)),
-                None,
+            # A5.0.2 keeps the originating companion identity in the durable
+            # queue. Old A1 records have no source_device_id and intentionally
+            # migrate to the primary HomeAgent instead of being guessed/broadcast.
+            target_device_id = (
+                str(record.source_device_id or "").strip()
+                or HOMEAI_PRIMARY_DEVICE_ID
             )
-            if session is None:
-                await asyncio.sleep(0.5)
-                continue
+            # Route by terminal ownership, not by semantic content. Main/Mini
+            # reminders return to their exact companion. Kitchen reminders are
+            # queued only on KitchenTerminal's own iPad audio path.
+            session: ClientSession | None = None
+            if target_device_id == KITCHEN_DEVICE_ID:
+                if not _kitchen_reminder_available():
+                    await asyncio.sleep(0.5)
+                    continue
+            else:
+                # Prefer the newest live connection for exactly that companion.
+                # Reconnect races can briefly leave an older session in the list.
+                session = next(
+                    (
+                        s for s in reversed(ACTIVE_SESSIONS)
+                        if _reminder_session_available(s, target_device_id)
+                    ),
+                    None,
+                )
+                if session is None:
+                    await asyncio.sleep(0.5)
+                    continue
 
             try:
                 print(
                     f"[NOTIFY] deliver begin id={record.reminder_id} "
-                    f"attempt={record.attempts + 1} text={record.text!r}"
+                    f"target={target_device_id} attempt={record.attempts + 1} "
+                    f"text={record.text!r}"
                 )
-                await _deliver_reminder_to_device(session, record)
+                if target_device_id == KITCHEN_DEVICE_ID:
+                    await _deliver_reminder_to_kitchen(record)
+                else:
+                    assert session is not None
+                    await _deliver_reminder_to_device(session, record)
 
                 async with REMINDER_LOCK:
                     REMINDER_PENDING[:] = [
@@ -6626,6 +7661,7 @@ async def reminder_dispatch_loop() -> None:
                         "dedup_key": record.dedup_key,
                         "reminder_id": record.reminder_id,
                         "delivered_at": _iso_now(),
+                        "source_device_id": target_device_id,
                     }
                     REMINDER_DELIVERED.append(delivered)
                     del REMINDER_DELIVERED[:-REMINDER_DELIVERED_HISTORY]
@@ -6656,7 +7692,7 @@ async def reminder_dispatch_loop() -> None:
                     f"error={record.last_error}"
                 )
                 try:
-                    if session.ws:
+                    if session is not None and session.ws:
                         await send_state(session.ws, "idle")
                 except Exception:
                     pass
@@ -6670,15 +7706,72 @@ async def reminder_dispatch_loop() -> None:
             await asyncio.sleep(1.0)
 
 
-def _is_kitchen_related_utterance(transcript: str, *, local_command: str = "") -> bool:
+def _is_global_alarm_or_reminder_utterance(transcript: str) -> bool:
+    """Identify timer/reminder wording that belongs to the general Agent.
+
+    Bare cooking-context commands such as “计时五分钟” may still be handled by
+    Kitchen when a recipe is active. Explicit alarm/reminder nouns are global
+    unless the utterance names Kitchen/小K or originates from KitchenTerminal.
+    """
+    text = str(transcript or "").strip()
+    if not text:
+        return False
+    compact = re.sub(r"[\s，。！？、,.!?：:；;（）()]+", "", text)
+    if "闹钟" in compact or "定时器" in compact:
+        return True
+    if any(token in compact for token in (
+        "提醒我", "到时候提醒", "到点提醒", "到时提醒",
+        "记得提醒", "叫我一下", "到时候叫我", "到点叫我",
+    )):
+        return True
+    return False
+
+
+def _kitchen_source_can_inherit_active_context(session: "ClientSession | KitchenSession | None") -> bool:
+    """Only KitchenTerminal itself may inherit its active recipe/timer context.
+
+    Main HomeAgent and Agent Mini are separate terminal domains. Their active
+    conversation and timer semantics never inherit KitchenTerminal state, even
+    when Kitchen currently has a recipe open.
+    """
+    return _kitchen_voice_source_is_terminal(session)
+
+
+def _is_kitchen_related_utterance(
+    transcript: str,
+    *,
+    local_command: str = "",
+    session: "ClientSession | KitchenSession | None" = None,
+) -> bool:
     if str(local_command or "").startswith("kitchen"):
         return True
     text = str(transcript or "").strip()
     if not text:
         return False
+
+    _, kitchen_namespace = _kitchen_voice_namespace(text)
+    terminal_source = _kitchen_voice_source_is_terminal(session)
+    kitchen_named = kitchen_namespace or ("小K" in text) or ("小 k" in text) or ("厨房终端" in text) or ("厨房屏" in text)
+    inherits_active = _kitchen_source_can_inherit_active_context(session)
+
+    # Source-bound terminal isolation: companion utterances are never Kitchen
+    # audio/domain utterances, even if they contain the words 厨房 or 小K.
+    if session is not None and not terminal_source:
+        return False
+
+    # A general alarm/reminder always belongs to its originating Agent unless
+    # Kitchen was explicitly named or the request came from KitchenTerminal.
+    if _is_global_alarm_or_reminder_utterance(text) and not (kitchen_named or terminal_source):
+        return False
+
+    # Cross-device isolation: Mini/unknown companions never inherit the global
+    # Kitchen screen/menu merely because the iPad currently has a recipe open.
+    if not (kitchen_named or terminal_source or inherits_active):
+        return False
+
     if any(token in text for token in (
-        "厨房终端", "厨房屏", "今天的菜单", "今日菜单", "晚餐菜单", "菜谱", "购物清单",
-        "烧菜顺序", "烹饪顺序", "计时", "定时", "下一步", "上一步", "返回菜单",
+        "小K", "小 k", "厨房", "厨房终端", "厨房屏", "今天的菜单", "今日菜单", "晚餐菜单",
+        "菜谱", "购物清单", "烧菜顺序", "烹饪顺序", "下一步", "上一步", "返回菜单",
         "结束今日烹饪", "结束今天的烹饪", "今天做完了", "私房菜", "保存菜谱",
     )):
         return True
@@ -6697,9 +7790,72 @@ def _is_kitchen_related_utterance(transcript: str, *, local_command: str = "") -
     deictic = any(token in text for token in ("这个", "这道菜", "这一步", "现在这个", "当前这个"))
     cooking = any(token in text for token in (
         "多久", "怎么做", "怎么烧", "怎么煮", "怎么炒", "怎么烤", "怎么炖", "火候", "大火", "小火",
-        "中火", "几分钟", "几秒", "熟", "咸", "淡", "调味", "加盐", "放多少", "食材", "步骤",
+        "中火", "几分钟", "几秒", "计时", "定时", "暂停计时", "继续计时", "熟", "咸", "淡",
+        "调味", "加盐", "放多少", "食材", "步骤",
     ))
     return deictic or cooking
+
+
+def _normalize_mini_wake_text(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", str(text or "")).strip()
+
+
+def _is_mini_wake_phrase(text: str) -> bool:
+    """Strict canonical wake phrase check for Agent Mini.
+
+    Punctuation/spacing is ignored, but the spoken phrase itself remains
+    exactly “逐光同学”. We intentionally do not accept the old “逐光” shortcut.
+    """
+    normalized = _normalize_mini_wake_text(text)
+    return normalized == MINI_WAKE_PHRASE
+
+
+async def process_mini_wake_probe(session: ClientSession, pcm: bytes) -> None:
+    """ASR-gate one dock wake candidate without touching OpenClaw/session history."""
+    if session.wake_probe_processing:
+        return
+    session.wake_probe_processing = True
+    try:
+        if session.device_id != HOMEAI_MINI_DEVICE_ID or _is_speaker_session(session):
+            return
+        if len(pcm) < MIN_WAKE_PROBE_BYTES:
+            print(f"[WAKE-PROBE] too short device={session.device_id} bytes={len(pcm)}")
+            await send_json(session.ws, {"type": "wake.rejected", "text": ""})
+            return
+        if len(pcm) > MAX_WAKE_PROBE_BYTES:
+            pcm = pcm[:MAX_WAKE_PROBE_BYTES]
+
+        wav_bytes = pcm_to_wav_bytes(pcm)
+        try:
+            transcript, asr_used = await transcribe_audio(wav_bytes)
+        except RuntimeError as exc:
+            if "Volcengine ASR returned empty transcript" in str(exc):
+                print(f"[WAKE-PROBE] no speech device={session.device_id}")
+                await send_json(session.ws, {"type": "wake.rejected", "text": ""})
+                return
+            raise
+
+        accepted = _is_mini_wake_phrase(transcript)
+        print(
+            f"[WAKE-PROBE] device={session.device_id} asr={asr_used} "
+            f"accepted={accepted} transcript={transcript!r}"
+        )
+        await send_json(session.ws, {
+            "type": "wake.accepted" if accepted else "wake.rejected",
+            "phrase": MINI_WAKE_PHRASE,
+            "text": transcript,
+            "listen_timeout_ms": 5000 if accepted else 0,
+        })
+    except Exception as exc:
+        # Wake monitoring is opportunistic. A transient ASR/network fault must
+        # never poison the Mini conversation or surface as a normal assistant error.
+        print(f"[WAKE-PROBE] transient failure {type(exc).__name__}: {exc}")
+        try:
+            await send_json(session.ws, {"type": "wake.rejected", "text": ""})
+        except Exception:
+            pass
+    finally:
+        session.wake_probe_processing = False
 
 
 async def process_utterance(session: ClientSession) -> None:
@@ -6709,6 +7865,9 @@ async def process_utterance(session: ClientSession) -> None:
     is_followup = session.ptt_trigger == "follow_up"
     followup_validated = not is_followup
     pending_glass2_target: bool | None = None
+    pending_ambient: AmbientSnapshot | None = None
+    suspended_ambient: AmbientSnapshot | None = None
+    ambient_intent: AmbientIntent | None = None
     try:
         if is_followup and not session.followup_candidate_authorized:
             print("[FOLLOWUP] stale/unarmed candidate ignored before ASR")
@@ -6763,11 +7922,29 @@ async def process_utterance(session: ClientSession) -> None:
         turn_started = time.perf_counter()
 
         asr_started = time.perf_counter()
-        transcript, asr_used = await transcribe_audio(wav_bytes)
+        try:
+            transcript, asr_used = await transcribe_audio(wav_bytes)
+        except RuntimeError as exc:
+            if "Volcengine ASR returned empty transcript" not in str(exc):
+                raise
+            # Short/noisy captures are normal in a room microphone. Treat an
+            # empty recognizer result as "nothing said", not a system failure.
+            if is_followup:
+                print(f"[FOLLOWUP] empty/no-speech candidate ignored device={session.device_id}")
+                session.followup.reset_chain("empty_asr")
+            else:
+                print(f"[ASR] empty/no-speech capture ignored device={session.device_id}")
+            session.followup_candidate_authorized = False
+            session.processing = False
+            await send_state(session.ws, "idle")
+            return
         asr_ms = int((time.perf_counter() - asr_started) * 1000)
         print(f"[ASR:{asr_used}] {transcript}")
         if not transcript:
-            raise RuntimeError("ASR returned empty text")
+            session.followup_candidate_authorized = False
+            session.processing = False
+            await send_state(session.ws, "idle")
+            return
         _best_effort_write_text(HOMEAI_DEBUG_DIR / "latest_transcript.txt", transcript + "\n")
 
         await send_json(session.ws, {"type": "asr.result", "text": transcript})
@@ -6786,9 +7963,37 @@ async def process_utterance(session: ClientSession) -> None:
                 return
             followup_validated = True
 
+        # Ambient commands are Gateway-local and are resolved before
+        # generic speaker-volume/OpenClaw handling. Any foreground turn pauses
+        # the long-running ambient stream first so the same Dock can speak the
+        # response, then resumes it with the original remaining time.
+        ambient_enabled_for_source = session.device_id == HOMEAI_MINI_DEVICE_ID
+        ambient_was_active = (
+            ambient_enabled_for_source
+            and _active_ambient(session.device_id) is not None
+        )
+        ambient_intent = (
+            parse_ambient_intent(transcript, active=ambient_was_active)
+            if ambient_enabled_for_source
+            else None
+        )
+        if ambient_was_active:
+            suspended_ambient = await _suspend_ambient_for_turn(session)
+
         agent_started = time.perf_counter()
-        answer = await _apply_audio_output_voice_command(session, transcript)
-        local_command = "audio-route" if answer is not None else ""
+        answer = None
+        local_command = ""
+        if ambient_intent is not None:
+            answer, pending_ambient = _ambient_reply_for_intent(
+                ambient_intent, suspended_ambient
+            )
+            local_command = "ambient"
+        else:
+            # A non-ambient foreground turn temporarily suspends ambient audio
+            # and restores the same sound after the spoken response.
+            pending_ambient = suspended_ambient
+            answer = await _apply_audio_output_voice_command(session, transcript)
+            local_command = "audio-route" if answer is not None else ""
         if answer is None:
             answer = await _apply_speaker_volume_voice_command(session, transcript)
             if answer is not None:
@@ -6799,40 +8004,24 @@ async def process_utterance(session: ClientSession) -> None:
                 answer, pending_glass2_target = glass2_result
                 local_command = "glass2-display"
         if answer is None:
-            answer = await _apply_kitchen_voice_command(session, transcript)
-            if answer is not None:
-                local_command = "kitchen"
-        if answer is None:
             print(
                 f"[STAGE] OpenClaw begin url={OPENCLAW_BASE_URL}/v1/chat/completions "
                 f"model={OPENCLAW_MODEL} device={session.device_id} "
                 f"user={session.openclaw_user}"
             )
-            try:
-                answer = await openclaw_chat(
-                    transcript,
-                    session.context,
-                    openclaw_user=session.openclaw_user,
-                )
-                print("[STAGE] OpenClaw returned")
-            except Exception as exc:
-                fallback = _kitchen_offline_fallback(transcript) if _is_kitchen_related_utterance(transcript) else None
-                if fallback is None:
-                    raise
-                answer = fallback
-                local_command = "kitchen-offline"
-                print(
-                    f"[KITCHEN-OFFLINE] OpenClaw unavailable; local fallback used "
-                    f"error={type(exc).__name__}: {exc}"
-                )
+            answer = await openclaw_chat(
+                transcript,
+                session.context,
+                openclaw_user=session.openclaw_user,
+                device_id=session.device_id,
+            )
+            print("[STAGE] OpenClaw returned")
         elif local_command == "audio-route":
             print(f"[AUDIO-ROUTE-VOICE] handled locally transcript={transcript!r}")
         elif local_command == "glass2-display":
             print(f"[GLASS2-VOICE] handled locally transcript={transcript!r}")
-        elif local_command == "kitchen":
-            print(f"[KITCHEN-VOICE] handled locally transcript={transcript!r}")
-        elif local_command == "kitchen-offline":
-            print(f"[KITCHEN-VOICE] OpenClaw offline fallback transcript={transcript!r}")
+        elif local_command == "ambient":
+            print(f"[AMBIENT-VOICE] handled locally transcript={transcript!r}")
         else:
             print(f"[VOLUME-VOICE] handled locally transcript={transcript!r}")
         agent_ms = int((time.perf_counter() - agent_started) * 1000)
@@ -6841,8 +8030,11 @@ async def process_utterance(session: ClientSession) -> None:
         _best_effort_write_text(HOMEAI_DEBUG_DIR / "latest_answer.txt", answer + "\n")
         await send_json(session.ws, {"type": "assistant.text", "text": answer})
 
-        kitchen_audio = _is_kitchen_related_utterance(transcript, local_command=local_command)
-        print(f"[STAGE] TTS begin provider={TTS_PROVIDER} target={'kitchen-ipad' if kitchen_audio else 'routed-sink'}")
+        # Terminal ownership is source-bound, never semantic-domain-bound:
+        # Main replies use Main's selected local/network route; Mini replies use
+        # its Dock Speaker. Only KitchenTerminal's own Q&A path writes Kitchen
+        # audio events. A word such as “厨房” can never reroute a companion TTS.
+        print(f"[STAGE] TTS begin provider={TTS_PROVIDER} target=routed-sink")
         tts_started = time.perf_counter()
         pcm_out, sample_rate, tts_used = await synthesize_speech(answer)
         print("[STAGE] TTS returned")
@@ -6856,32 +8048,31 @@ async def process_utterance(session: ClientSession) -> None:
             f"[LATENCY] asr={asr_ms}ms agent={agent_ms}ms "
             f"tts={tts_ms}ms total_before_playback={total_ms}ms"
         )
-        if kitchen_audio:
-            event_id = "ka-" + uuid.uuid4().hex[:16]
-            now = time.time()
-            KITCHEN_AUDIO_CACHE[event_id] = wav_out
-            KITCHEN_AUDIO_ORDER.append(event_id)
-            while len(KITCHEN_AUDIO_ORDER) > KITCHEN_AUDIO_CACHE_MAX:
-                old_id = KITCHEN_AUDIO_ORDER.pop(0)
-                KITCHEN_AUDIO_CACHE.pop(old_id, None)
-            KITCHEN_LATEST_AUDIO.update({
-                "event_id": event_id, "text": answer, "kind": "assistant",
-                "created_at": now, "expires_at": now + KITCHEN_AUDIO_TTL_SEC, "provider": tts_used, "source_id": "",
-            })
-            # Kitchen audio playback is owned by the iPad and has no device-side
-            # playback.done ACK on this companion socket, so do not guess when a
-            # no-wake window should begin.
-            session.followup.reset_chain("kitchen_audio_external_playback")
-            print(f"[KITCHEN-AUDIO] routed reply to iPad id={event_id} source={session.device_id}")
-        else:
-            sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
-            print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
+        sink = await send_pcm_to_routed_sink(session, pcm_out, sample_rate)
+        print(f"[AUDIO-ROUTE] reply complete source={session.device_id} sink={sink.device_id}")
 
-            # A5.0: only a successfully spoken, user-originated turn may arm the
-            # no-wake continuation window. Keep the short history in Gateway
-            # memory; the real OpenClaw conversation remains the existing stable
-            # per-device session.
-            session.followup.record_turn(transcript, answer)
+        if pending_ambient is not None and pending_ambient.remaining_sec > 0:
+            try:
+                await _start_ambient(session, pending_ambient)
+            except Exception as exc:
+                print(
+                    f"[AMBIENT-ERROR] post-reply start failed source={session.device_id} "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                pending_ambient = None
+
+        # A5.0: only a successfully spoken, user-originated turn may arm the
+        # no-wake continuation window. Keep the short history in Gateway
+        # memory; the real OpenClaw conversation remains the existing stable
+        # per-device session.
+        session.followup.record_turn(transcript, answer)
+        # Continuous ambient audio can be heard by Mini's microphone and is a
+        # poor VAD source for no-wake follow-up. While ambient is active, keep
+        # explicit A-button PTT but do not arm the automatic continuation gate.
+        if _active_ambient(session.device_id) is not None:
+            session.followup.reset_chain("ambient_playing")
+            print(f"[FOLLOWUP] not armed while ambient plays device={session.device_id}")
+        else:
             if FOLLOWUP_AUDIO_FENCE_SEC > 0:
                 await asyncio.sleep(FOLLOWUP_AUDIO_FENCE_SEC)
             arm_id = session.followup.arm(FOLLOWUP_TIMEOUT_SEC)
@@ -6936,6 +8127,19 @@ async def process_utterance(session: ClientSession) -> None:
             await send_state(session.ws, "idle")
         except Exception:
             pass
+        # If a foreground turn failed after suspending ambient audio, restore
+        # the requested/preserved ambient state rather than silently losing the
+        # user's sleep sound.
+        resume_after_error = pending_ambient or suspended_ambient
+        if resume_after_error is not None and resume_after_error.remaining_sec > 0:
+            try:
+                if _active_ambient(session.device_id) is None:
+                    await _start_ambient(session, resume_after_error)
+            except Exception as ambient_exc:
+                print(
+                    f"[AMBIENT-WARN] error-path resume failed source={session.device_id} "
+                    f"error={type(ambient_exc).__name__}: {ambient_exc}"
+                )
         session.followup_candidate_authorized = False
         session.processing = False
         if pending_glass2_target is not None:
@@ -7683,15 +8887,44 @@ def _kitchen_clear_all_timers() -> int:
 
 
 async def _kitchen_speak(text: str, *, kind: str = "assistant", source_id: str = "") -> dict[str, Any] | None:
-    """Synthesize one KitchenTerminal voice event for playback on the iPad."""
+    """Synthesize one KitchenTerminal voice event for playback on the iPad.
+
+    Short provider resets are retried here so the 250 ms timer loop doesn't
+    hammer TTS and print one ERROR per tick while the provider reconnects.
+    """
     spoken = str(text or "").strip()
     if not spoken:
         return None
-    try:
-        pcm, sample_rate, provider = await synthesize_speech(spoken)
-        wav = pcm_to_wav_bytes(pcm, sample_rate)
-    except Exception as exc:
-        print(f"[KITCHEN-AUDIO-ERROR] synthesize failed: {type(exc).__name__}: {exc}")
+
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            pcm, sample_rate, provider = await synthesize_speech(spoken)
+            wav = pcm_to_wav_bytes(pcm, sample_rate)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            transient = isinstance(
+                exc,
+                (ConnectionResetError, ConnectionError, OSError, asyncio.TimeoutError,
+                 httpx.TransportError, ConnectionClosed),
+            )
+            if not transient or attempt >= 3:
+                print(
+                    f"[KITCHEN-AUDIO-WARN] synthesize unavailable after "
+                    f"{attempt} attempt(s): {_one_line_error(exc)}"
+                )
+                return None
+            _vlog(
+                f"[KITCHEN-AUDIO] transient synthesize retry "
+                f"attempt={attempt}/3 error={_one_line_error(exc)}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+    else:
+        if last_exc is not None:
+            print(f"[KITCHEN-AUDIO-WARN] synthesize failed: {_one_line_error(last_exc)}")
         return None
 
     event_id = "ka-" + uuid.uuid4().hex[:16]
@@ -8667,6 +9900,34 @@ async def gateway_http_request(connection: Any, request: Any) -> Response | None
     query = parse_qs(parsed.query, keep_blank_values=True)
     if path in {WS_PATH, KITCHEN_WS_PATH, KITCHEN_CONTROL_PATH}:
         return None
+
+    if path == KITCHEN_HTTP_PATH or path.startswith(KITCHEN_HTTP_PATH + "/"):
+        peer = _security_peer_label(connection)
+        if DEVICE_AUTH.mode == "observe":
+            DEVICE_AUTH.audit_throttled(
+                f"kitchen-http:{peer}",
+                "AUTH_HTTP_LEGACY_ALLOWED",
+                peer=peer,
+                role="kitchen-http",
+                reason=path,
+                every_sec=300.0,
+            )
+        elif DEVICE_AUTH.mode == "enforce":
+            DEVICE_AUTH.audit_throttled(
+                f"kitchen-http-denied:{peer}",
+                "AUTH_HTTP_DENIED",
+                peer=peer,
+                role="kitchen-http",
+                reason=path,
+                every_sec=30.0,
+            )
+            return _http_response(
+                401,
+                "Unauthorized",
+                b"HomeAIAgent web-terminal authentication required",
+                "text/plain; charset=utf-8",
+            )
+
     if path in {KITCHEN_HTTP_PATH, KITCHEN_HTTP_PATH + "/"}:
         return _http_response(200, "OK", _kitchen_html(), "text/html; charset=utf-8")
     if path == KITCHEN_HTTP_PATH + "/assets/home_hero.jpg":
@@ -9522,10 +10783,9 @@ JSON格式必须严格为：
     headers = {"Content-Type": "application/json"}
     if OPENCLAW_TOKEN:
         headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
-    kitchen_user = os.getenv("HOMEAI_KITCHEN_OPENCLAW_USER", "home-ai-kitchen:main").strip() or "home-ai-kitchen:main"
     payload = {
         "model": OPENCLAW_MODEL,
-        "user": kitchen_user,
+        "user": OPENCLAW_KITCHEN_TOOL_USER,
         "stream": False,
         "messages": [{"role": "user", "content": prompt}],
     }
@@ -10286,18 +11546,22 @@ def _kitchen_agent_context_text() -> str:
 
 
 def _kitchen_voice_namespace(transcript: str) -> tuple[str, bool]:
-    """Return text with wake-word/domain prefixes removed and whether 厨房 was explicit."""
+    """Return text with wake-word/domain prefixes removed and whether Kitchen was explicit."""
     text = str(transcript or "").strip()
     text = re.sub(r"^逐光[，,、\s]*", "", text).strip()
     named = False
-    m = re.match(r"^(?:请)?(?:在)?厨房(?:终端|屏)?[，,、：:\s]*", text)
+    m = re.match(
+        r"^(?:(?:请)?(?:在)?厨房(?:终端|屏)?|小\s*[KkＫｋ])[，,、：:\s]*",
+        text,
+        flags=re.IGNORECASE,
+    )
     if m:
         named = True
         text = text[m.end():].strip()
     return text, named
 
 
-def _kitchen_voice_source_is_terminal(session: ClientSession | None) -> bool:
+def _kitchen_voice_source_is_terminal(session: ClientSession | KitchenSession | None) -> bool:
     if session is None:
         return False
     return str(getattr(session, "device_id", "") or "").lower().startswith("kitchenterminal")
@@ -10388,16 +11652,35 @@ def _kitchen_offline_fallback(transcript: str) -> str | None:
     return None
 
 
-async def _apply_kitchen_voice_command(session: ClientSession | None, transcript: str) -> str | None:
+async def _apply_kitchen_voice_command(session: ClientSession | KitchenSession | None, transcript: str) -> str | None:
     text = transcript.strip()
     compact = re.sub(r"[\s，。！？、,.!?]", "", text)
     _, kitchen_namespace = _kitchen_voice_namespace(text)
     terminal_source = _kitchen_voice_source_is_terminal(session)
-    kitchen_named = kitchen_namespace or ("厨房终端" in text) or ("厨房屏" in text)
+    kitchen_named = kitchen_namespace or ("小K" in text) or ("小 k" in text) or ("厨房终端" in text) or ("厨房屏" in text)
+    inherits_active = _kitchen_source_can_inherit_active_context(session)
+
+    # A5.0.5 terminal-domain firewall: Kitchen voice controls are owned by the
+    # KitchenTerminal input path. Companion terminals never mutate Kitchen state,
+    # even if their transcript explicitly says “厨房” or “小K”.
+    if session is not None and not terminal_source:
+        return None
+
+    # Device-domain firewall. Mini and future secondary companions do not inherit
+    # KitchenTerminal's globally active recipe/timer state. They enter Kitchen
+    # only when the utterance explicitly names 小K/厨房.
+    if session is not None and not (terminal_source or kitchen_named or inherits_active):
+        return None
+
+    global_alarm = (
+        _is_global_alarm_or_reminder_utterance(text)
+        and not (kitchen_named or terminal_source)
+    )
     fast_intent = _kitchen_fast_control_intent(text)
-    if fast_intent and not (kitchen_named or terminal_source):
+    if fast_intent and (global_alarm or not (kitchen_named or terminal_source)):
         # A3.0b keeps 厨房 as the domain namespace on other HomeAI devices.
         # Future iPad PTT is already a KitchenTerminal source, so it may omit the prefix.
+        # Explicit general alarms/reminders must remain with the originating Agent.
         fast_intent = None
     if fast_intent:
         print(f"[KITCHEN-INTENT] intent={fast_intent} source=local-fastpath namespace={'kitchen-terminal' if terminal_source else '厨房'} transcript={text!r}")
@@ -10497,9 +11780,24 @@ async def _apply_kitchen_voice_command(session: ClientSession | None, transcript
                     return "已经把" + "、".join(saved) + "保存到私房菜。今天的烹饪也结束了，辛苦了。"
             return "我没有确定你想保存哪道菜。可以直接说，比如，保存河虾。"
 
-    # Kitchen timers are local Gateway state, so common voice controls do not
-    # need an OpenClaw round-trip. Current recipe/step is the default target.
-    timer_context = kitchen_named or active or ("计时" in text) or ("定时" in text)
+    # Kitchen timers are local Gateway state and are owned only by the
+    # KitchenTerminal source. If no recipe step is active, a spoken duration
+    # creates the standalone Kitchen timer. Explicit 闹钟/定时器/提醒 wording
+    # also selects the standalone timer even while a recipe is open.
+    duration = _kitchen_duration_from_voice(text)
+    standalone_words = any(token in text for token in (
+        "闹钟", "定时器", "提醒我", "到时候提醒", "到点提醒", "到时提醒",
+        "记得提醒", "叫我一下", "到时候叫我", "到点叫我",
+    ))
+    standalone_start = terminal_source and duration is not None and (
+        standalone_words
+        or (not active and ("计时" in text or "定时" in text))
+    )
+    if standalone_start:
+        timer = _kitchen_timer_start_standalone(duration)
+        return f"好的，小K开始独立计时{_kitchen_format_duration(timer.duration_sec)}。"
+
+    timer_context = terminal_source
     if timer_context and any(phrase in text for phrase in ("还有多久", "还剩多久", "剩多久", "剩多长时间")):
         timer = _kitchen_pick_timer(text)
         if timer is None:
@@ -10532,7 +11830,6 @@ async def _apply_kitchen_voice_command(session: ClientSession | None, transcript
         _kitchen_timer_remove(timer)
         return f"已经取消{dish}的计时。"
 
-    duration = _kitchen_duration_from_voice(text)
     if timer_context and duration is not None and any(word in text for word in ("再加", "加上", "增加", "延长")):
         timer = _kitchen_pick_timer(text)
         if timer is None:
@@ -10707,34 +12004,61 @@ def build_kitchen_agent_prompt(transcript: str) -> str:
 
 
 async def openclaw_kitchen_chat(transcript: str) -> str:
-    headers = {"Content-Type": "application/json"}
-    if OPENCLAW_TOKEN:
-        headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
-    kitchen_user = os.getenv("HOMEAI_KITCHEN_OPENCLAW_USER", "home-ai-kitchen:main").strip() or "home-ai-kitchen:main"
-    payload = {
-        "model": OPENCLAW_MODEL,
-        "user": kitchen_user,
-        "stream": False,
-        "messages": [{"role": "user", "content": build_kitchen_agent_prompt(transcript)}],
-    }
-    async with _openclaw_http_client(OPENCLAW_KITCHEN_TIMEOUT_SEC) as client:
-        r = await _post_with_retry(
-            client,
-            f"{OPENCLAW_BASE_URL}/v1/chat/completions",
-            headers=headers,
-            json=payload,
+    # KitchenTerminal owns a dedicated stable OpenClaw user/session, separate
+    # from Main HomeAgent and Agent Mini. Its synchronous answers participate in
+    # the same notification fence logic so later Kitchen reminders cannot replay
+    # the just-spoken answer as an async notification.
+    notification_target = _notification_target_for_user(OPENCLAW_KITCHEN_USER)
+    session_key = (
+        notification_target[0]
+        if notification_target is not None
+        else _openclaw_voice_session_key(OPENCLAW_KITCHEN_USER)
+    )
+    notification_state = None
+    if notification_target is not None:
+        notification_state = _notification_state(
+            session_key,
+            source_device_id=notification_target[1],
+            openclaw_user=notification_target[2],
         )
-        body = r.json()
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"OpenClaw returned no choices: {body}")
-    content = choices[0].get("message", {}).get("content", "")
-    if isinstance(content, list):
-        content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
-    answer = str(content).strip()
-    if not answer:
-        raise RuntimeError("OpenClaw returned empty KitchenTerminal answer")
-    return answer
+        notification_state.voice_inflight += 1
+
+    try:
+        headers = {"Content-Type": "application/json"}
+        if OPENCLAW_TOKEN:
+            headers["Authorization"] = f"Bearer {OPENCLAW_TOKEN}"
+        payload = {
+            "model": OPENCLAW_MODEL,
+            "user": OPENCLAW_KITCHEN_USER,
+            "stream": False,
+            "messages": [{"role": "user", "content": build_kitchen_agent_prompt(transcript)}],
+        }
+        async with _openclaw_http_client(OPENCLAW_KITCHEN_TIMEOUT_SEC) as client:
+            r = await _post_with_retry(
+                client,
+                f"{OPENCLAW_BASE_URL}/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            body = r.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"OpenClaw returned no choices: {body}")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+        answer = str(content).strip()
+        if not answer:
+            raise RuntimeError("OpenClaw returned empty KitchenTerminal answer")
+
+        if notification_target is not None:
+            _register_voice_reply_suppression(answer, session_key)
+            _register_voice_turn_fence(answer, session_key)
+        return answer
+    finally:
+        if notification_state is not None:
+            notification_state.voice_inflight = max(0, notification_state.voice_inflight - 1)
+
 
 
 async def _process_kitchen_qa(session: KitchenSession) -> None:
@@ -10817,6 +12141,141 @@ async def _process_kitchen_qa(session: KitchenSession) -> None:
         session.qa_audio.clear()
 
 
+def _security_peer_label(ws: Any) -> str:
+    peer = getattr(ws, "remote_address", None)
+    if isinstance(peer, tuple) and peer:
+        # Security throttling must key on the stable peer address, not the
+        # ephemeral TCP source port which changes on every reconnect.
+        return str(peer[0] or "unknown").strip()[:128]
+    return str(peer or "unknown")[:128]
+
+
+async def _security_begin_ws_session(
+    session: Any,
+    *,
+    role: str,
+) -> bool:
+    peer = _security_peer_label(session.ws)
+    outcome = DEVICE_AUTH.begin(
+        session.security,
+        device_id=session.device_id,
+        role=role,
+        peer=peer,
+    )
+    challenge = outcome.get("challenge")
+    if isinstance(challenge, dict):
+        await send_json(session.ws, challenge)
+    if outcome.get("status") == "denied":
+        await send_json(session.ws, {
+            "type": "security.denied",
+            "protocol": "homeai-auth/1",
+            "device_id": session.device_id,
+            "reason": str(outcome.get("reason") or "denied"),
+        })
+        await session.ws.close(code=1008, reason="device authentication denied")
+        return False
+    if DEVICE_AUTH.mode == "observe" and not session.security.authenticated:
+        print(
+            f"[SECURITY-OBSERVE] unauthenticated allowed "
+            f"device={session.device_id} role={role} "
+            f"reason={outcome.get('reason') or session.security.state} peer={peer}"
+        )
+    return True
+
+
+async def _security_verify_ws_session(session: Any, msg: dict[str, Any]) -> bool:
+    peer = _security_peer_label(session.ws)
+    ok, reason = DEVICE_AUTH.verify(session.security, msg, peer=peer)
+    if ok:
+        await send_json(session.ws, {
+            "type": "security.auth.ok",
+            "protocol": "homeai-auth/1",
+            "device_id": session.device_id,
+            "scopes": sorted(session.security.scopes),
+        })
+        print(
+            f"[SECURITY] authenticated device={session.device_id} "
+            f"role={session.security.role} peer={peer}"
+        )
+        return True
+
+    await send_json(session.ws, {
+        "type": "security.auth.failed",
+        "protocol": "homeai-auth/1",
+        "device_id": session.device_id,
+        "reason": reason,
+    })
+    print(
+        f"[SECURITY-WARN] auth failed device={session.device_id} "
+        f"reason={reason} peer={peer}"
+    )
+    if DEVICE_AUTH.mode == "enforce":
+        await session.ws.close(code=1008, reason="device authentication failed")
+    return False
+
+
+async def _finish_kitchen_hello(session: KitchenSession) -> None:
+    if session.security.ready_sent:
+        return
+    await send_json(session.ws, {
+        "type": "kitchen.ready",
+        "protocol": KITCHEN_PROTOCOL,
+        "device_id": session.device_id,
+        "security": {
+            "mode": DEVICE_AUTH.mode,
+            "authenticated": session.security.authenticated,
+        },
+    })
+    await send_json(session.ws, {
+        "type": "kitchen.sync",
+        "protocol": KITCHEN_PROTOCOL,
+        "view": KITCHEN_CURRENT_VIEW,
+    })
+    session.security.ready_sent = True
+    print(
+        f"[KITCHEN] hello id={session.device_id} "
+        f"auth={session.security.state}"
+    )
+
+
+async def _finish_device_hello(session: ClientSession) -> None:
+    if session.security.ready_sent:
+        return
+    ws = session.ws
+    if _is_speaker_session(session):
+        print(
+            f"[DEVICE] hello id={session.device_id} role=speaker "
+            f"parent={session.parent_device_id or '-'} "
+            f"priority={session.audio_priority} auth={session.security.state}"
+        )
+        await send_json(ws, _device_ready_payload(session))
+        session.security.ready_sent = True
+        if not session.parent_device_id:
+            await send_json(ws, {
+                "type": "speaker.error",
+                "message": "parent_device_id required",
+            })
+        return
+
+    print(
+        f"[DEVICE] hello id={session.device_id} role=companion "
+        f"openclaw_user={session.openclaw_user} auth={session.security.state}"
+    )
+    await send_json(ws, _device_ready_payload(session))
+    session.security.ready_sent = True
+    await send_state(ws, "idle")
+
+    if _supports_display_policy(session):
+        start_display_policy_task(session, reason="device_hello")
+    else:
+        _vlog(f"[DISPLAY] policy unsupported; skip id={session.device_id}")
+
+    if _supports_info_feed(session):
+        await send_info_sync(session)
+    else:
+        _vlog(f"[INFO] feed unsupported; skip id={session.device_id}")
+
+
 async def handle_kitchen_connection(ws: Any) -> None:
     session = KitchenSession(ws=ws)
     KITCHEN_SESSIONS.append(session)
@@ -10824,6 +12283,15 @@ async def handle_kitchen_connection(ws: Any) -> None:
     try:
         async for raw in ws:
             if isinstance(raw, bytes):
+                if DEVICE_AUTH.mode == "enforce" and not session.security.authenticated:
+                    DEVICE_AUTH.audit(
+                        "AUTH_PREAUTH_BINARY",
+                        device_id=session.device_id,
+                        peer=_security_peer_label(ws),
+                        role="kitchen",
+                    )
+                    await ws.close(code=1008, reason="authentication required")
+                    break
                 if session.qa_receiving and not session.qa_processing:
                     if len(session.qa_audio) + len(raw) > KITCHEN_QA_MAX_BYTES:
                         session.qa_receiving = False
@@ -10845,21 +12313,56 @@ async def handle_kitchen_connection(ws: Any) -> None:
             except json.JSONDecodeError:
                 continue
             kind = str(msg.get("type") or "")
+            if kind == "security.auth":
+                if not session.hello_received:
+                    if DEVICE_AUTH.mode == "enforce":
+                        await ws.close(code=1008, reason="hello required before authentication")
+                        break
+                    continue
+                ok = await _security_verify_ws_session(session, msg)
+                if ok and not session.security.ready_sent:
+                    await _finish_kitchen_hello(session)
+                continue
+
+            if (
+                DEVICE_AUTH.mode == "enforce"
+                and kind != "kitchen.hello"
+                and not session.security.authenticated
+            ):
+                DEVICE_AUTH.audit(
+                    "AUTH_PREAUTH_MESSAGE",
+                    device_id=session.device_id,
+                    peer=_security_peer_label(ws),
+                    role="kitchen",
+                    reason=kind or "unknown",
+                )
+                await ws.close(code=1008, reason="authentication required")
+                break
+
             if kind == "kitchen.hello":
                 device_id = str(msg.get("device_id") or KITCHEN_DEVICE_ID).strip()
-                session.device_id = device_id or KITCHEN_DEVICE_ID
+                new_device_id = device_id or KITCHEN_DEVICE_ID
+                if (
+                    session.hello_received
+                    and session.security.authenticated
+                    and new_device_id != session.device_id
+                ):
+                    DEVICE_AUTH.audit(
+                        "AUTH_IDENTITY_SWITCH",
+                        device_id=new_device_id,
+                        peer=_security_peer_label(ws),
+                        role="kitchen",
+                        reason=f"from={session.device_id}",
+                    )
+                    await ws.close(code=1008, reason="authenticated identity cannot change")
+                    break
+                session.device_id = new_device_id
                 session.hello_received = True
-                await send_json(ws, {
-                    "type": "kitchen.ready",
-                    "protocol": KITCHEN_PROTOCOL,
-                    "device_id": session.device_id,
-                })
-                await send_json(ws, {
-                    "type": "kitchen.sync",
-                    "protocol": KITCHEN_PROTOCOL,
-                    "view": KITCHEN_CURRENT_VIEW,
-                })
-                print(f"[KITCHEN] hello id={session.device_id}")
+                if not session.security.authenticated:
+                    if not await _security_begin_ws_session(session, role="kitchen"):
+                        break
+                if DEVICE_AUTH.should_allow_application(session.security):
+                    await _finish_kitchen_hello(session)
             elif kind == "kitchen.food.scan.start":
                 if session.food_scan_processing:
                     await _food_scan_notify(session, {"type": "kitchen.food.scan.error", "ok": False, "message": "上一张图片还在识别中"})
@@ -10954,6 +12457,7 @@ async def handle_kitchen_connection(ws: Any) -> None:
             print(f"[FOOD-SCAN-WARN] abandoned upload reset id={abandoned_id or 'unknown'}")
         if session in KITCHEN_SESSIONS:
             KITCHEN_SESSIONS.remove(session)
+        DEVICE_AUTH.mark_disconnected(session.security)
         print(f"[KITCHEN] terminal disconnected id={session.device_id}")
 
 
@@ -11121,7 +12625,19 @@ async def handle_connection(ws) -> None:
     try:
         async for raw in ws:
             if isinstance(raw, bytes):
-                if session.recording and len(session.audio) < MAX_INPUT_BYTES:
+                if DEVICE_AUTH.mode == "enforce" and not session.security.authenticated:
+                    DEVICE_AUTH.audit(
+                        "AUTH_PREAUTH_BINARY",
+                        device_id=session.device_id,
+                        peer=_security_peer_label(ws),
+                        role=session.device_role,
+                    )
+                    await ws.close(code=1008, reason="authentication required")
+                    break
+                if session.wake_probe_recording and len(session.wake_probe_audio) < MAX_WAKE_PROBE_BYTES:
+                    remaining = MAX_WAKE_PROBE_BYTES - len(session.wake_probe_audio)
+                    session.wake_probe_audio.extend(raw[:remaining])
+                elif session.recording and len(session.audio) < MAX_INPUT_BYTES:
                     remaining = MAX_INPUT_BYTES - len(session.audio)
                     session.audio.extend(raw[:remaining])
                 continue
@@ -11132,48 +12648,62 @@ async def handle_connection(ws) -> None:
                 continue
 
             kind = msg.get("type")
-            if kind == "device.hello":
-                _apply_device_hello(session, msg)
-
-                if _is_speaker_session(session):
-                    print(
-                        f"[DEVICE] hello id={session.device_id} role=speaker "
-                        f"parent={session.parent_device_id or '-'} "
-                        f"priority={session.audio_priority}"
-                    )
-                    await send_json(ws, _device_ready_payload(session))
-                    if not session.parent_device_id:
-                        await send_json(ws, {
-                            "type": "speaker.error",
-                            "message": "parent_device_id required",
-                        })
+            if kind == "security.auth":
+                if not session.hello_received:
+                    if DEVICE_AUTH.mode == "enforce":
+                        await ws.close(code=1008, reason="hello required before authentication")
+                        break
                     continue
+                ok = await _security_verify_ws_session(session, msg)
+                if ok and not session.security.ready_sent:
+                    await _finish_device_hello(session)
+                continue
 
-                print(
-                    f"[DEVICE] hello id={session.device_id} role=companion "
-                    f"openclaw_user={session.openclaw_user}"
+            if (
+                DEVICE_AUTH.mode == "enforce"
+                and kind != "device.hello"
+                and not session.security.authenticated
+            ):
+                DEVICE_AUTH.audit(
+                    "AUTH_PREAUTH_MESSAGE",
+                    device_id=session.device_id,
+                    peer=_security_peer_label(ws),
+                    role=session.device_role,
+                    reason=str(kind or "unknown"),
                 )
-                await send_json(ws, _device_ready_payload(session))
-                await send_state(ws, "idle")
+                await ws.close(code=1008, reason="authentication required")
+                break
 
-                if _supports_display_policy(session):
-                    # Do not await here: this coroutine must keep receiving so
-                    # the device's display.ack can be processed.
-                    start_display_policy_task(
-                        session,
-                        reason="device_hello",
+            if kind == "device.hello":
+                old_device_id = session.device_id
+                old_role = session.device_role
+                old_parent = session.parent_device_id
+                old_hello = session.hello_received
+                _apply_device_hello(session, msg)
+                identity_changed = (
+                    session.device_id != old_device_id
+                    or session.device_role != old_role
+                    or session.parent_device_id != old_parent
+                )
+                if old_hello and session.security.authenticated and identity_changed:
+                    DEVICE_AUTH.audit(
+                        "AUTH_IDENTITY_SWITCH",
+                        device_id=session.device_id,
+                        peer=_security_peer_label(ws),
+                        role=session.device_role,
+                        reason=(
+                            f"from={old_device_id}/{old_role}/{old_parent or '-'} "
+                            f"to={session.device_id}/{session.device_role}/{session.parent_device_id or '-'}"
+                        ),
                     )
-                else:
-                    _vlog(
-                        f"[DISPLAY] policy unsupported; skip id={session.device_id}"
-                    )
+                    await ws.close(code=1008, reason="authenticated identity cannot change")
+                    break
 
-                if _supports_info_feed(session):
-                    await send_info_sync(session)
-                else:
-                    _vlog(
-                        f"[INFO] feed unsupported; skip id={session.device_id}"
-                    )
+                if not session.security.authenticated:
+                    if not await _security_begin_ws_session(session, role=session.device_role):
+                        break
+                if DEVICE_AUTH.should_allow_application(session.security):
+                    await _finish_device_hello(session)
 
             elif kind == "speaker.volume.ack":
                 if not _is_speaker_session(session):
@@ -11253,6 +12783,44 @@ async def handle_connection(ws) -> None:
             elif kind == "info.ack":
                 _vlog(f"[INFO] device ack revision={FEED_REVISION}")
 
+            elif kind == "wake.probe.start":
+                if (
+                    session.device_id != HOMEAI_MINI_DEVICE_ID
+                    or _is_speaker_session(session)
+                    or session.processing
+                    or session.recording
+                    or session.wake_probe_processing
+                ):
+                    session.wake_probe_recording = False
+                    session.wake_probe_audio.clear()
+                    await send_json(ws, {"type": "wake.rejected", "text": ""})
+                    continue
+                session.wake_probe_audio.clear()
+                session.wake_probe_recording = True
+                _vlog(f"[WAKE-PROBE] start device={session.device_id}")
+
+            elif kind == "wake.probe.stop":
+                if session.device_id != HOMEAI_MINI_DEVICE_ID or _is_speaker_session(session):
+                    continue
+                if not session.wake_probe_recording:
+                    await send_json(ws, {"type": "wake.rejected", "text": ""})
+                    continue
+                session.wake_probe_recording = False
+                pcm_probe = bytes(session.wake_probe_audio)
+                session.wake_probe_audio.clear()
+                _vlog(
+                    f"[WAKE-PROBE] stop device={session.device_id} "
+                    f"bytes={len(pcm_probe)}"
+                )
+                asyncio.create_task(process_mini_wake_probe(session, pcm_probe))
+
+            elif kind == "wake.probe.abort":
+                if session.device_id != HOMEAI_MINI_DEVICE_ID or _is_speaker_session(session):
+                    continue
+                session.wake_probe_recording = False
+                session.wake_probe_audio.clear()
+                _vlog(f"[WAKE-PROBE] abort device={session.device_id}")
+
             elif kind == "ptt.start":
                 if _is_speaker_session(session):
                     await send_json(ws, {
@@ -11301,6 +12869,8 @@ async def handle_connection(ws) -> None:
                     session.followup.reset_chain("explicit_ptt")
                     session.followup_candidate_authorized = False
 
+                session.wake_probe_recording = False
+                session.wake_probe_audio.clear()
                 session.audio.clear()
                 session.context = dict(msg.get("context") or {})
                 session.diag_glass_mode = str(msg.get("diag_glass_mode") or "GLASS NORMAL")
@@ -11388,6 +12958,7 @@ async def handle_connection(ws) -> None:
             session.display_policy_task.cancel()
         if session in ACTIVE_SESSIONS:
             ACTIVE_SESSIONS.remove(session)
+        DEVICE_AUTH.mark_disconnected(session.security)
         print(
             f"[WS] client disconnected id={session.device_id} "
             f"role={session.device_role}"
@@ -11396,6 +12967,28 @@ async def handle_connection(ws) -> None:
 
 async def preflight(*, require_openclaw: bool = True) -> int:
     print("=== HomeAIAgent Gateway persistent-config preflight ===")
+    security_summary = DEVICE_AUTH.startup_summary()
+    print(
+        f"[SECURITY] mode={security_summary['mode']} "
+        f"registered={security_summary['registered']} "
+        f"enabled={security_summary['enabled']} secrets={security_summary['secrets']}"
+    )
+    for warning in security_summary["warnings"]:
+        print(f"[SECURITY-WARN] {warning}")
+    if DEVICE_AUTH.mode == "enforce":
+        ready, problems = DEVICE_AUTH.enforcement_ready()
+        if not HOMEAI_SECURITY_ALLOW_ENFORCE:
+            print(
+                "[FAIL] HOMEAI_SECURITY_MODE=enforce is deployment-fused in A6.0. "
+                "Finish client/web credential rollout first, then explicitly set "
+                "HOMEAI_SECURITY_ALLOW_ENFORCE=true."
+            )
+            return 6
+        if not ready:
+            print("[FAIL] security registry is not ready for enforcement")
+            for problem in problems:
+                print(f"[FAIL] security: {problem}")
+            return 6
     if (
         VOLCENGINE_TTS_RESOURCE_ID != STANDARD_TTS_RESOURCE_ID
         or VOLCENGINE_TTS_VOICE != STANDARD_TTS_VOICE
@@ -11409,6 +13002,29 @@ async def preflight(*, require_openclaw: bool = True) -> int:
             "voice=zh_female_vv_uranus_bigtts"
         )
         return 4
+    core_device_ids = {HOMEAI_PRIMARY_DEVICE_ID, HOMEAI_MINI_DEVICE_ID, KITCHEN_DEVICE_ID}
+    core_users = {OPENCLAW_USER, OPENCLAW_MINI_USER, OPENCLAW_KITCHEN_USER}
+    if len(core_device_ids) != 3:
+        print(
+            "[FAIL] terminal routing requires three distinct device domains: "
+            f"main={HOMEAI_PRIMARY_DEVICE_ID} mini={HOMEAI_MINI_DEVICE_ID} "
+            f"kitchen={KITCHEN_DEVICE_ID}"
+        )
+        return 5
+    if len(core_users) != 3:
+        print(
+            "[FAIL] terminal routing requires three distinct OpenClaw users: "
+            f"main={OPENCLAW_USER} mini={OPENCLAW_MINI_USER} "
+            f"kitchen={OPENCLAW_KITCHEN_USER}"
+        )
+        return 5
+    if OPENCLAW_KITCHEN_TOOL_USER in core_users:
+        print(
+            "[FAIL] Kitchen background-tool user must not share a terminal session: "
+            f"tool={OPENCLAW_KITCHEN_TOOL_USER}"
+        )
+        return 5
+
     print(f"[CFG] persistent_config={PERSISTENT_ENV}")
     print(f"[CFG] persistent_exists={PERSISTENT_ENV.exists()}")
     print(f"[CFG] mode={MODE}")
@@ -11451,6 +13067,7 @@ async def preflight(*, require_openclaw: bool = True) -> int:
     print(
         f"[CFG] device router primary={HOMEAI_PRIMARY_DEVICE_ID}->{OPENCLAW_USER} "
         f"mini={HOMEAI_MINI_DEVICE_ID}->{OPENCLAW_MINI_USER} "
+        f"kitchen={KITCHEN_DEVICE_ID}->{OPENCLAW_KITCHEN_USER} "
         f"auto_isolate_unknown={HOMEAI_AUTO_ISOLATE_UNKNOWN_COMPANIONS}"
     )
     print(f"[CFG] info_skill_protocol={INFO_SKILL_PROTOCOL}")
@@ -11480,18 +13097,27 @@ async def preflight(*, require_openclaw: bool = True) -> int:
     )
     print(
         f"[CFG] gold_status=24K spot CNY/g "
-        f"refresh={GOLD_REFRESH_SEC}s"
+        f"refresh={GOLD_REFRESH_SEC}s 429_backoff={GOLD_RATE_LIMIT_BACKOFF_SEC}s"
     )
     print(
         "[CFG] screen_protection=01:05-09:00 "
         f"timezone={INFO_SCHEDULE_TIMEZONE}"
     )
     print(f"[CFG] gold_quote_url={GOLD_QUOTE_URL}")
+    notification_targets = _notification_listener_targets()
     print(
         f"[CFG] notification_listener enabled={NOTIFICATION_LISTENER_ENABLED} "
-        f"session={_openclaw_voice_session_key()} "
-        f"transport=gateway-ws-outbound"
+        f"sessions={len(notification_targets)} transport=gateway-ws-outbound"
     )
+    print(
+        f"[CFG] notification_keepalive ping={NOTIFICATION_PING_INTERVAL_SEC:.0f}s "
+        f"timeout={NOTIFICATION_PING_TIMEOUT_SEC:.0f}s"
+    )
+    for session_key, device_id, openclaw_user in notification_targets:
+        print(
+            f"[CFG] notification_session device={device_id} "
+            f"user={openclaw_user} session={session_key}"
+        )
     print(f"[CFG] notification_queue={REMINDER_QUEUE_FILE}")
     print(f"[CFG] notification_state={NOTIFICATION_STATE_FILE}")
 
@@ -11623,6 +13249,8 @@ async def main() -> None:
         f"revision={FEED_REVISION}; next refresh follows wall-clock schedule"
     )
 
+    DEVICE_AUTH.mark_gateway_start()
+
     if MODE == "full":
         print(f"[MODE] full: {ASR_PROVIDER} ASR2 streaming -> OpenClaw -> {TTS_PROVIDER} TTS")
         if TTS_PROVIDER == "volcengine":
@@ -11630,6 +13258,10 @@ async def main() -> None:
     else:
         print("[MODE] loopback: Mic -> Gateway -> StickS3 speaker")
     print(f"[WS] listening on ws://{HOST}:{PORT}{WS_PATH}")
+    print(
+        f"[SECURITY] HomeAgent device auth={DEVICE_AUTH.mode} "
+        f"protocol=homeai-auth/1 registry={DEVICE_AUTH.registry_file}"
+    )
     print(f"[KITCHEN] UI http://<gateway-lan-ip>:{PORT}{KITCHEN_HTTP_PATH}")
     print(f"[KITCHEN] WS ws://<gateway-lan-ip>:{PORT}{KITCHEN_WS_PATH}")
     async with websockets.serve(

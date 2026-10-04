@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from context.followup import FollowUpState
+from security.device_auth import AuthContext
 
 
 @dataclass
@@ -24,7 +25,17 @@ class ClientSession:
     hello_received: bool = False
     connected_at: float = field(default_factory=time.time)
 
+    # A6.0 device authentication state. Observe mode keeps legacy clients
+    # working while recording which connections have migrated to signed auth.
+    security: AuthContext = field(default_factory=AuthContext)
+
     audio: bytearray = field(default_factory=bytearray)
+
+    # Mini dock voice-wake probe. This buffer is deliberately isolated from
+    # normal PTT audio so a wake phrase can never enter OpenClaw/history.
+    wake_probe_audio: bytearray = field(default_factory=bytearray)
+    wake_probe_recording: bool = False
+    wake_probe_processing: bool = False
     context: dict[str, Any] = field(default_factory=dict)
     diag_glass_mode: str = "GLASS NORMAL"
     ptt_trigger: str = "unknown"

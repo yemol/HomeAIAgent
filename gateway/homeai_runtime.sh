@@ -1,5 +1,7 @@
 #!/bin/zsh
-set -euo pipefail
+# NOTE: this file is intentionally safe to source from an interactive shell.
+# Do not enable global shell options such as `set -u` here; doing so leaks
+# nounset/errexit into the caller (e.g. VS Code zsh prompt hooks).
 
 export HOMEAI_DATA_DIR="${HOMEAI_DATA_DIR:-$HOME/.local/share/HomeAIAgent}"
 export HOMEAI_VENV="${HOMEAI_VENV:-$HOMEAI_DATA_DIR/venv}"

@@ -4,6 +4,8 @@ import companion_gateway as g
 
 PREFIXED_SAMPLES = {
     "厨房显示今天的菜单。": "menu.today",
+    "小K显示今天的菜单。": "menu.today",
+    "逐光，小K加载今日菜单": "menu.today",
     "逐光，厨房加载今日菜单": "menu.today",
     "厨房推送菜单。": "menu.today",
     "厨房推送今日菜单": "menu.today",

@@ -4,6 +4,11 @@
 #define COMPANION_GATEWAY_ENABLE 1
 #define COMPANION_AUDIO_ENABLE 1
 
+// A6.1 authenticated device identity. This is public identity, not a secret.
+#define HOMEAI_DEVICE_ID "homeai-agent-main-01"
+#define HOMEAI_DEVICE_ROLE "companion"
+#define HOMEAI_AUTH_PROTOCOL "homeai-auth/1"
+
 // Glass2 (Grove / HY2.0-4P).
 #define GLASS2_SDA_PIN 9
 #define GLASS2_SCL_PIN 10

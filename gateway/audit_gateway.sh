@@ -34,6 +34,8 @@ echo "[AUDIT] test_config_helpers.sh"
 
 TESTS=(
   protocol_selftest.py
+  test_security_auth.py
+  test_security_gateway_integration.py
   test_audio_route_sticky.py
   test_followup_context.py
   test_followup_gateway_integration.py
@@ -66,13 +68,19 @@ TESTS=(
   test_kitchen_voice_fastpath.py
   test_long_tts_segmentation.py
   test_multi_device_router.py
+  test_terminal_domain_routing.py
   test_networkspeaker_transport_profile.py
   test_notification_listener_offline.py
+  test_reminder_device_routing.py
   test_openclaw_loopback_proxy_bypass.py
   test_runtime_artifact_paths.py
 )
 
 for f in "${TESTS[@]}"; do
+  if [[ "$f" = "test_followup_gateway_integration.py" && ! -f ../src/main.cpp ]]; then
+    echo "[AUDIT] SKIP $f (companion firmware ../src/main.cpp not included in Gateway-only package)"
+    continue
+  fi
   echo "[AUDIT] $f"
   "$PY" "$f"
 done

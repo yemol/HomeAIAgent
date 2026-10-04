@@ -33,6 +33,7 @@ echo "[A5-AUDIT] existing voice/audio/device paths"
 "$PY" ./test_multi_device_router.py
 "$PY" ./test_networkspeaker_transport_profile.py
 "$PY" ./test_notification_listener_offline.py
+"$PY" ./test_reminder_device_routing.py
 "$PY" ./test_openclaw_loopback_proxy_bypass.py
 
 echo "[A5-AUDIT] OpenClaw transient-session isolation"

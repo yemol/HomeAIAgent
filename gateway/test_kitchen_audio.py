@@ -47,12 +47,19 @@ async def main_async() -> None:
         assert event["url"].startswith("/kitchen/audio?id=")
         assert event["event_id"] in cg.KITCHEN_AUDIO_CACHE
         assert cg.KITCHEN_AUDIO_CACHE[event["event_id"]][:4] == b"RIFF"
-        assert cg._is_kitchen_related_utterance("逐光，显示今天的菜谱")
+        kitchen = cg.KitchenSession(ws=None, device_id="KitchenTerminal-iPadMini-test")
+        assert cg._is_kitchen_related_utterance("逐光，显示今天的菜谱", session=kitchen)
         cg.KITCHEN_CURRENT_MENU = {"recipes": [{"name": "葱姜盐水河虾"}]}
         cg.KITCHEN_CURRENT_STATE = {"screen": "recipe", "dish": "葱姜盐水河虾", "step": 3}
-        assert cg._is_kitchen_related_utterance("这个还要煮多久")
-        assert cg._is_kitchen_related_utterance("河虾怎么做")
-        assert not cg._is_kitchen_related_utterance("明天天气怎么样")
+        assert cg._is_kitchen_related_utterance("这个还要煮多久", session=kitchen)
+        assert cg._is_kitchen_related_utterance("河虾怎么做", session=kitchen)
+        assert not cg._is_kitchen_related_utterance("明天天气怎么样", session=kitchen)
+
+        # Companion terminals never become Kitchen audio sources by semantics.
+        main = cg.ClientSession(ws=None, device_id=cg.HOMEAI_PRIMARY_DEVICE_ID)
+        mini = cg.ClientSession(ws=None, device_id=cg.HOMEAI_MINI_DEVICE_ID)
+        assert not cg._is_kitchen_related_utterance("厨房显示今天的菜谱", session=main)
+        assert not cg._is_kitchen_related_utterance("小K计时5分钟", session=mini)
     finally:
         cg.synthesize_speech = old
     print("KitchenTerminal R16 HTML-media/AirPlay audio self-test: PASS")
